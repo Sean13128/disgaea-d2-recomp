@@ -28,7 +28,7 @@ ctest --test-dir port/build --output-on-failure
 ```
 
 [SDK.lock](patches/SDK.lock) pins upstream base `a679051`, audited local revision
-`5b24f49`, the patched Git tree and combined patch SHA256. Bootstrap clones a new
+(see `revision` in the lock), the patched Git tree and combined patch SHA256. Bootstrap clones a new
 SDK, checks the checksum, checks out the exact base and applies only that patch.
 It verifies the resulting tree without creating a commit. Existing destination
 directories and mismatches are errors. Later SDK changes require an audited patch
@@ -68,6 +68,23 @@ The maintained [asset-free test suite](port/tests/README.md) also runs without
 any game files or configured game build. CTest reports unavailable Metal checks
 as **Skipped** (exit 77), separately from CPU passes. Test headers come from the
 selected SDK and editor schema; both 1.00 and 1.40 editor profiles are exercised.
+
+## Playing
+
+Build the app with `cmake --build port/build --target DisgaeaD2Dist` and open
+`port/dist/Disgaea D2.app` (or run `port/play.sh`). Saves, settings, logs and flags
+live under `~/Library/Application Support/DisgaeaD2Recomp/` and
+`~/Library/Logs/DisgaeaD2Recomp/`. The macOS menu bar holds graphics (1×–3×
+internal resolution, filter, aspect, VSync, frame cap, FPS), window, audio and
+save import/export options. **F1** opens the cheat/character/item editor. **F2**
+flags an issue: a screenshot plus fps, map, per-thread CPU and an optional note go to
+`flags/flags.jsonl`; summarize with `.venv/bin/python tools/d2_flags.py <file>`.
+
+macOS keys privacy grants (e.g. external-drive access) to the code signature.
+Ad-hoc signatures change every build, so run `tools/make_signing_identity.sh` once
+and import `signing/d2-signing.p12` into your login keychain (command printed by
+the script). Packaging then signs with that stable identity automatically, and
+falls back to ad-hoc signing without it.
 
 Play with `port/play.sh`; diagnose with `port/capture.sh`. Build an app bundle
 explicitly with `cmake --build port/build --target DisgaeaD2Dist`. Content and

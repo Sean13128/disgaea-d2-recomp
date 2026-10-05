@@ -27,9 +27,9 @@
 
 ---
 
-## 📊 Progress dashboard (updated Oct 4, 11:55pm CT)
+## 📊 Progress dashboard (updated Oct 5, 7:10pm CT)
 
-**Overall: ~80% of the way to "playable start to finish"** (12 of 15 checkpoints done; see below).
+**Overall: goal met: v1.40 + DLC plays natively at 60 fps with audio, music, movies and saves.** The user has played full battles ("buttery smooth"), the post-game Baal map (60 fps), and character menus (60 fps). Remaining work is polish, post-goal features and stretch goals (see Next actions). The tables below are kept for history.
 
 ### Code translation
 | Metric | Done | Total | % |
@@ -107,12 +107,12 @@ The 28 unhandled imports are mostly PRX loaders, sockets, keyboard, the movie co
 | Loading progress | ✅ (Codex E) stable: 4/4 runs × 55 s keep presenting (~2,500 frames), no SPU faults, reused cache OK |
 | Input (keyboard/gamepad on macOS) | ✅ (Codex I) AppKit keyboard monitor + SDL2 gamepads on main thread; scripted input verified on real Metal |
 | New Game → story → in-engine map | ✅ real Metal, scripted input (`port/runs/milestones/story-intro.png`, `ingame-flonne-garden.png`) |
-| Stability in long play | ❌ host memory corruption → SIGSEGV in pad_poll_sdl2 at ~6.5 min; timing-dependent GCM ref hang (Codex J) |
+| Stability in long play | ✅ multi-hour user sessions; the PAD_SCRIPT overflow crash is fixed; music-loop dropout fixed (AP) |
 | Intro movie (PAMF) | ✅ **plays in-game on the real Mac**: 2,793/2,793 pictures, 2,733/2,733 audio blocks, full 296 MB stream, clean close. Movies are on by default again (`D2_MOVIE_SKIP=1` to skip) |
 | NisGraphics + synth2 SPU lifted | ✅ `port/spu/` (152 + 560 funcs); 6 NisGraphics threads run and DMA-poll for work |
 | synth2 SPU audio | ✅ running |
 | Title screen | ✅ **D2 logo → full title menu (New Game / Continue / Settings) on real Metal, ~52 fps** (`port/runs/milestones/title-screen.png`) |
-| Playable | ⏳ |
+| Playable | ✅ user playtests: story, battles, post-game save, DLC, cheats, menus, save/load |
 
 ## Layout
 ```
@@ -139,6 +139,8 @@ cmake -S port -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=
 
 ## Controls
 
+- **Menu bar** (click the game window first; in fullscreen move the mouse to the top edge): Graphics (internal resolution 1×–3×, filter, aspect, VSync, frame cap, Show FPS), Window (sizes, ⌃⌘F fullscreen, borderless), Audio (⌘M mute, volume, mute when unfocused), Game (Import/Export save, Open Save Folder, Open Log, Cheats…, Flag Issue…), Controls.
+- **F1 / ⌘⇧C**: cheat and character/item editor overlay. **F2**: Flag Issue (saves a screenshot, guest/display fps, worst frame, map/stage, per-thread CPU, RSS and an optional note to `~/Library/Application Support/DisgaeaD2Recomp/flags/flags.jsonl`; read them with `.venv/bin/python tools/d2_flags.py <flags.jsonl>`).
 - Click the Metal game window to focus it. Keyboard controls use physical macOS key positions: arrows = D-pad (also left stick); Z = Cross; X / Esc / Backspace = Circle; A = Square; S = Triangle; Q / W = L1 / R1; 1 / 2 = L2 / R2; Space = Start; either Shift = Select. Return / keypad Enter presses **both Cross and Start**; use Z or Space for separate actions.
 - Port 0 falls back to keyboard when no real controller occupies it. A connected SDL2 GameController takes precedence; unplugging restores keyboard. Focus loss releases held keys. `PAD_NO_KEYBOARD=1` disables the keyboard monitor (the existing neutral virtual port 0 remains connected). `PAD_TRACE=1` logs guest button transitions.
 - SDL initializes and polls controller drivers on the AppKit main thread, without initializing SDL video. SDL's standard A/B/X/Y positions map to Cross/Circle/Square/Triangle for Xbox, PlayStation and MFi mappings. Hot-plug tracks device instance IDs, including when an unmapped joystick precedes a controller. SDL2's [JOYSTICK_THREAD hint](https://wiki.libsdl.org/SDL2/SDL_HINT_JOYSTICK_THREAD) is Windows-only; macOS uses main-thread initialization/polling. Physical pads still need real-host verification.
@@ -370,15 +372,14 @@ cmake -S port -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=
 - 2026-10-05 INTEGRATION 2: AM+AN+AO+AP merged; port/build ctest 47/47; SDK committed d2-macos 731e755, patch re-exported, SDK.lock updated, fresh bootstrap + build 47/47. Dist app rebuilt and signed with the stable "Disgaea D2 Local Signing" identity (DR pinned to cert leaf).
 
 ## Next actions
-- [x] ~~User: reproduce the stage-select black screen~~ (no longer happens; battle works)
-- [ ] **User:** play a full battle turn (move, attack, end turn, enemy turn) and report anything odd.
-- [ ] **User:** double-click `port/dist/Disgaea D2.app`, Allow file access (macOS privacy), and confirm it launches.
-- [x] ~~review + push~~ (pushed Oct 5)
-- [x] ~~approve the GameFAQs save~~ → imported as slot 01
-- [ ] **User:** playtest the post-game save (slot 01): full-map battles, check the ATTACK ENTRY portrait has no white box
-- [x] (Codex A) Frame clock / Metal init on macOS: get the FIFO drained and a window open.
-- [x] (Codex B) Lift `NisGraphics.spu.elf` (and `synth2`) with spu_lifter + build_spu_workloads; register in the port.
-- [x] (Codex C) cellResc unresolved NIDs + map /dev_hdd1 to a writable dir.
+- [ ] **User:** play normally; press **F2** on anything odd (stutter, glitch, audio). Say "check my flags" afterwards.
+- [ ] **User:** confirm the rebuilt app (signed with the local identity) asks for external-drive access once, then never again after rebuilds.
+- [ ] Watch for the new always-on `[cellAtrac]` stall/error warnings in `~/Library/Logs/DisgaeaD2Recomp/latest.log`.
+- [ ] Post-game party character screen at 30-40 fps (reported once, not reproduced with slot 00); retest with slot 01 when the machine is idle.
+- [ ] Remaining read-side TLS lookup in PPU accessors (AM); further SPU/PPU lifter speedups (AO's register caching covers leaf functions only).
+- [ ] Debug warp: scripted input doesn't advance the Baal pre-battle dialogue (warp-only).
+- [ ] Backlog: key remapping UI; Vulkan for Windows/Linux; upstream SDK fixes to sp00nznet/ps3recomp; characters from other Disgaea games.
+- [x] ~~Build review R01-R12~~ (AJ/AK/AL, pushed). ~~Music dropout~~ (AP). ~~Audio CPU~~ (AO, -42%). ~~Flag tool~~ (AN). ~~Portrait white box~~ (V, user-confirmed). ~~Full battle turn~~ (user). ~~Post-game full-map battle~~ (user, Baal 50-60 fps; 60.00 in a profile).
 
 ## AD: update 1.40 and DLC (Oct 5)
 
