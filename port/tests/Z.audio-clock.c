@@ -12,6 +12,8 @@
 #include Z_AUDIO_SOURCE
 #include <assert.h>
 
+void cellAtracHostCheckStalls(uint64_t n, int running) { (void)n; (void)running; }
+
 uint8_t* vm_base;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;

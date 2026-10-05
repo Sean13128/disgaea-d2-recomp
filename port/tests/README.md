@@ -40,3 +40,19 @@ that build's runtime library; 1.40 builds also register synthetic runner failure
 checks. These additions require the usual `cmake --build ... --target
 DisgaeaD2Recomp` before CTest, and do not read real ELFs during testing. The locked
 5b24f49 export predates these new SDK fixtures.
+
+Issue bookmarks: `ctest --test-dir port/build-an -R 'd2.AN-' --output-on-failure`
+covers JSONL writing, the table summarizer, rolling guest/display rates, Mach CPU
+sampling, versioned map/stage reads, and asynchronous PNG capture (skip 77
+without Metal). Run `bash codex/AN.host-check.sh` on the real Mac for F2/menu,
+note and toast verification; `auto` creates a timed bookmark. Read captured
+bookmarks with `.venv/bin/python tools/d2_flags.py port/flags/flags.jsonl`.
+Each `flag` line is complete immediately; `note` and `screenshot` lines update
+the same `(session, number)` without rewriting history.
+
+AP audio regressions: `ctest --test-dir port/build-ap -R 'd2.AP-' --output-on-failure`
+covers output-only gain, delayed SurMixer queue publication, same-handle ATRAC
+switches, disjoint seek/prefetch ranges, looping EOF queries, and warnings.
+`codex/AP.atrac-check.py <scratch-directory>` repeats streaming checks with the
+three real BGM files read from the dump (ASan/UBSan; outside asset-free CTest).
+`bash codex/AP.host-check.sh` checks CoreAudio on copied saves.

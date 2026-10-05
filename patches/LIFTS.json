@@ -63,5 +63,7 @@
   },
   "python": ">=3.11 (verified with 3.14.5)",
   "dependencies": "tools/requirements-lifts.txt",
-  "spu_extraction": "All embedded SPU ELFs; extractor names retained; builder invokes spu_lifter.py --auto-functions with distinct symbol prefixes and registers full-image/text fingerprints."
+  "spu_extraction": "All embedded SPU ELFs; extractor names retained; builder invokes spu_lifter.py --auto-functions with distinct symbol prefixes and registers full-image/text fingerprints.",
+  "spu_register_cache": "Default leaf register promotion; --trace or spu_lifter.py --no-register-cache retains uncached reference emission.",
+  "development_regeneration": "tools/generate_lifts.sh --spu-only --allow-sdk-worktree --port-dir <fresh directory>; verifies ELF SHA256 and records SDK HEAD + diff SHA256. Release generation still requires SDK.lock."
 }

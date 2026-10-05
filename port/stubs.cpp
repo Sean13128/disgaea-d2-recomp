@@ -28,6 +28,7 @@
  * -----------------------------------------------------------------------*/
 
 extern "C" void d2_register_psn_offline(void);
+extern "C" void d2_register_audio(void);
 extern "C" void d2_register_debug_warp(void);
 extern "C" void d2_register_cheats(void);
 
@@ -37,6 +38,7 @@ extern "C" void ps3_load_prx_modules(void)
     setenv("PS3_GAME_UPDATE_ID", "BLUS31313", 0);
 #endif
     d2_register_psn_offline();
+    d2_register_audio();
     d2_register_debug_warp();
     d2_register_cheats();
 }

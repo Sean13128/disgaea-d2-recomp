@@ -36,7 +36,7 @@ if brew.exists():
 flags = ['-O1', '-g', '-ffunction-sections', '-fdata-sections', '-pthread']
 flags += [f'-I{p}' for p in inc]
 flags += ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-lm']
-gpu = name in ('metal', 'metal-overlay', 'hotkey', 'AL-metal')
+gpu = name in ('metal', 'metal-overlay', 'hotkey', 'AL-metal', 'AN-metal')
 if not gpu:
     flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 video = [sdk/'libs/video'/f'{n}.c' for n in ('rsx_dispatch', 'rsx_vertex_compact', 'rsx_texture_layout', 'rsx_vp_decompiler', 'rsx_fp_decompiler')]
@@ -56,6 +56,15 @@ cmd = [cc, '-std=gnu17', *flags]
 run_args = []
 if name == 'repro-guards':
     sys.exit(subprocess.run([sys.executable, source('repro-test.py'), '--sdk', sdk, '--work', work], env=env).returncode)
+elif name == 'AN-summary':
+    sys.exit(subprocess.run([sys.executable, source('AN.summary-test.py')], cwd=work, env=env).returncode)
+elif name == 'AN-flags':
+    cmd += ['-fobjc-arc', source('AN.flags-test.m'), '-framework', 'AppKit']
+    run_args = [work]
+elif name.startswith('AN-location-'):
+    emit_ppu_header()
+    version = int(name.rsplit('-', 1)[1])
+    cmd = [cxx, '-std=c++20', *flags, f'-DD2_GAME_VERSION={version}', source('AN.location-test.cpp')]
 elif name == 'AL-scripts':
     sys.exit(subprocess.run([sys.executable, source('AL.scripts-test.py')], cwd=work, env=env).returncode)
 elif name == 'edat-cache':
@@ -73,6 +82,13 @@ elif name in ('draw', 'AG2-engine'):
 elif name in ('hash', 'vertex', 'cache'):
     fixture = {'hash':'X.hash-test.c', 'vertex':'AA.vertex-test.c', 'cache':'AA.cache-test.c'}[name]
     cmd += [source(fixture), *video]
+elif name == 'AP-atrac-stream':
+    cmd += [sdk/'libs/codec/tests/test_atrac_stream_switch.c']
+elif name == 'AP-audio-gain':
+    cmd += [sdk/'libs/audio/tests/test_audio_host_gain.c', f'-L{brew}/lib', '-lSDL2']
+elif name == 'AP-audio-init':
+    emit_ppu_header()
+    cmd = [cxx, '-std=c++20', *flags, '-DD2_GAME_VERSION=140', source('AP.audio-init-test.cpp')]
 elif name == 'audio-clock':
     cmd += [source('Z.audio-clock.c'), f'-L{brew}/lib', '-lSDL2']
 elif name == 'filesystem':
@@ -116,13 +132,19 @@ elif name == 'loader-validation':
     run_args = [work/'synthetic.elf']
 elif name == 'guest-poll':
     cmd += [sdk/'runtime/platform/tests/test_guest_poll.c', sdk/'runtime/platform/guest_poll.c']
+elif name == 'spu-cache':
+    sys.exit(subprocess.run([sys.executable, sdk/'runtime/spu/tests/test_spu_register_cache.py', '--work', work], env=env).returncode)
+elif name == 'spu-lanes':
+    cmd += [sdk/'runtime/spu/tests/test_spu_vector_lanes.c']
 elif name in ('spu-vectors', 'spu-shuffle'):
     fixture = 'test_spu_vectors.c' if name == 'spu-vectors' else 'test_spu_shufb.c'
     cmd += [sdk/'runtime/spu/tests'/fixture]
-elif name in ('metal', 'AL-metal'):
-    fixture = source('AG.metal-test.m' if name == 'metal' else 'AL.metal-test.m')
+elif name in ('metal', 'AL-metal', 'AN-metal'):
+    fixture = source({'metal': 'AG.metal-test.m', 'AL-metal': 'AL.metal-test.m', 'AN-metal': 'AN.metal-test.m'}[name])
     cmd += ['-fobjc-arc', fixture, sdk/'libs/video/rsx_texture_layout.c']
     cmd += ['-framework', 'Metal', '-framework', 'Cocoa', '-framework', 'QuartzCore', '-framework', 'CoreText']
+    if name == 'AN-metal':
+        run_args = [work]
 elif name == 'metal-overlay':
     cmd += ['-fobjc-arc', sdk/'libs/video/tests/test_metal_overlay.m', sdk/'libs/video/rsx_metal_overlay.m', sdk/'libs/system/sys_overlay.c']
     cmd += ['-framework', 'Metal', '-framework', 'AppKit', '-framework', 'QuartzCore', '-framework', 'CoreText']

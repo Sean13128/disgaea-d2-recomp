@@ -8,6 +8,11 @@
 #include "cellAudio_host.h"
 
 extern void d2_cheats_toggle_menu(void) __attribute__((weak_import));
+/* Standalone settings fixtures need no issue recorder. The port overrides these. */
+void __attribute__((weak)) d2_flags_init(void) {}
+void __attribute__((weak)) d2_flags_configure(double scale, unsigned cap) { (void)scale; (void)cap; }
+void __attribute__((weak)) d2_flags_attach_window(void* window) { (void)window; }
+void __attribute__((weak)) d2_flags_request(void) {}
 static NSMutableDictionary* s_settings;
 static NSWindow* s_window;
 static NSTextField* s_fps;
@@ -16,6 +21,7 @@ static NSRect s_regular_frame;
 static NSWindowStyleMask s_regular_style;
 static NSArray* s_observers;
 static NSTimer* s_geometry_timer;
+static int s_audio_test_focus = -1;
 static void message(NSString* title, NSString* detail);
 
 static NSDictionary* defaults(void)
@@ -123,13 +129,16 @@ void d2_settings_flush(void)
 static void apply_settings(void)
 {
     assert(NSThread.isMainThread);
+    d2_flags_configure([s_settings[@"scale"] doubleValue], [s_settings[@"frame_cap"] unsignedIntValue]);
     unsigned filter = [s_settings[@"filter"] isEqual:@"linear"] ? 0 :
                       [s_settings[@"filter"] isEqual:@"nearest"] ? 1 : 2;
     rsx_metal_backend_configure((unsigned)([s_settings[@"scale"] doubleValue] * 2), filter,
         [s_settings[@"aspect"] isEqual:@"stretch"], [s_settings[@"vsync"] boolValue],
         [s_settings[@"frame_cap"] unsignedIntValue]);
+    BOOL unfocused = s_audio_test_focus >= 0 ? !s_audio_test_focus :
+        (s_window && !s_window.isKeyWindow);
     BOOL muted = [s_settings[@"mute"] boolValue] ||
-        ([s_settings[@"mute_unfocused"] boolValue] && s_window && !s_window.isKeyWindow);
+        ([s_settings[@"mute_unfocused"] boolValue] && unfocused);
     cellAudioHostSetGain([s_settings[@"volume"] floatValue], muted);
     if (s_window) {
         s_window.level = [s_settings[@"always_on_top"] boolValue] ? NSFloatingWindowLevel : NSNormalWindowLevel;
@@ -245,6 +254,9 @@ static void install_menu(void)
     command(game, @"Open Save Folder", @"saves", @"");
     command(game, @"Open Log", @"log", @"");
     command(game, @"Cheats…", @"cheats", @"");
+    unichar f2 = NSF2FunctionKey;
+    NSMenuItem* flag = command(game, @"Flag Issue…", @"flag", [NSString stringWithCharacters:&f2 length:1]);
+    flag.keyEquivalentModifierMask = 0;
     NSMenu* controls = submenu(menu, @"Controls");
     command(controls, @"Keyboard Mapping…", @"controls", @"");
     NSApp.mainMenu = menu;
@@ -310,6 +322,7 @@ static void toggle_borderless(void)
     } else if ([name isEqual:@"controls"]) {
         message(@"Keyboard Mapping", @"Arrows: D-pad / left stick\nZ: Cross   X / Esc / Backspace: Circle\nA: Square   S: Triangle\nQ / W: L1 / R1   1 / 2: L2 / R2\nSpace: Start   Shift: Select\nReturn: Cross + Start\n\nClick the game window to focus. A connected gamepad takes precedence.");
     } else if ([name isEqual:@"cheats"]) { if (d2_cheats_toggle_menu) d2_cheats_toggle_menu(); }
+    else if ([name isEqual:@"flag"]) d2_flags_request();
     else if ([name isEqual:@"saves"]) open_save_folder();
     else if ([name isEqual:@"log"]) {
         char file[PATH_MAX] = {0}; const char* env = getenv("D2_LOG_PATH");
@@ -374,6 +387,7 @@ void d2_settings_init(void)
 {
     @autoreleasepool {
         assert(NSThread.isMainThread);
+        d2_flags_init();
         assert(!python_crypto_available(@"/nonexistent/python3"));
         assert(!python_crypto_available(@"/usr/bin/false"));
         const char* test_python = getenv("D2_SETTINGS_TEST_PYTHON");
@@ -384,6 +398,25 @@ void d2_settings_init(void)
         const char* override = getenv("D2_SETTINGS_OVERRIDE");
         if (override) merge_settings(s_settings, json_data([[NSString stringWithUTF8String:override] dataUsingEncoding:NSUTF8StringEncoding]));
         s_controller = [D2SettingsController new]; apply_settings();
+        // Opt-in audio regression: seconds:volume:mute:mute_unfocused[:focus].
+        const char* audio_script = getenv("D2_AUDIO_SETTINGS_SCRIPT");
+        if (audio_script) {
+            for (NSString* entry in [@(audio_script) componentsSeparatedByString:@","]) {
+                NSArray* fields = [entry componentsSeparatedByString:@":"];
+                if (fields.count != 4 && fields.count != 5) continue;
+                NSTimer* timer = [NSTimer timerWithTimeInterval:MAX(0.01, [fields[0] doubleValue]) repeats:NO block:^(NSTimer* t) {
+                    (void)t;
+                    s_audio_test_focus = fields.count == 5 ? [fields[4] boolValue] : -1;
+                    s_settings[@"volume"] = @([fields[1] doubleValue]);
+                    s_settings[@"mute"] = @([fields[2] boolValue]);
+                    s_settings[@"mute_unfocused"] = @([fields[3] boolValue]);
+                    apply_settings();
+                    fprintf(stderr, "[D2 audio test] settings=%s effective_gain=%.3f\n",
+                        entry.UTF8String, cellAudioHostGetGain());
+                }];
+                [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
+            }
+        }
         fprintf(stderr, "[D2 settings] loaded scale=%s filter=%s volume=%.2f cap=%u from %s\n",
             [s_settings[@"scale"] description].UTF8String, [s_settings[@"filter"] UTF8String],
             [s_settings[@"volume"] doubleValue], [s_settings[@"frame_cap"] unsignedIntValue], settings_path().UTF8String);
@@ -404,6 +437,7 @@ void ps3_host_window_created(void* window)
     assert(NSThread.isMainThread);
     if (s_observers) for (id observer in s_observers) [NSNotificationCenter.defaultCenter removeObserver:observer];
     s_window = (__bridge NSWindow*)window;
+    d2_flags_attach_window(window);
     if (!s_window) { d2_settings_flush(); s_fps = nil; s_observers = nil; return; }
     if ([s_settings[@"remember_window"] boolValue]) {
         NSRect frame = [s_window frameRectForContentRect:NSMakeRect(0, 0,

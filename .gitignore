@@ -96,6 +96,7 @@
 !/codex/AH.elf-test.c
 !/codex/AH.launcher-test.m
 !/codex/AI.host-check.sh
+!/codex/AN.host-check.sh
 
 # Maintained asset-free regression suite and reproducibility tools.
 !/port/tests/
@@ -110,3 +111,8 @@
 !/tools/*.sh
 !/tools/*.py
 !/tools/requirements-lifts.txt
+
+!/codex/AO.host-check.sh
+
+!/codex/AP.host-check.sh
+!/codex/AP.atrac-check.py

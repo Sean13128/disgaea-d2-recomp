@@ -75,15 +75,16 @@ index 4ef4dfa..015a95a 100644
      # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
      #
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index b51fb7c..f33d63d 100644
+index b51fb7c..256e9d1 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
-@@ -20,6 +20,24 @@
+@@ -20,6 +20,25 @@
  #include <stdlib.h>
  #include <stdint.h>
  #include <math.h>
 +#include <stdatomic.h>
 +#include "cellAudio_host.h"
++#include "../codec/cellAtrac_host.h"
 +
 +static _Atomic unsigned s_host_gain = 1000;
 +
@@ -103,7 +104,7 @@ index b51fb7c..f33d63d 100644
  
  /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
   * rather than including sys_event.h to avoid pulling PPU context/syscall
-@@ -163,6 +181,7 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+@@ -163,6 +182,7 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  #if AUDIO_BACKEND_SDL2
  
  static SDL_AudioDeviceID s_sdl_audio_dev = 0;
@@ -111,7 +112,7 @@ index b51fb7c..f33d63d 100644
  
  static int audio_backend_init(void)
  {
-@@ -187,7 +206,14 @@ static int audio_backend_init(void)
+@@ -187,7 +207,14 @@ static int audio_backend_init(void)
          return -1;
      }
  
@@ -126,7 +127,7 @@ index b51fb7c..f33d63d 100644
      return 0;
  }
  
-@@ -202,8 +228,11 @@ static void audio_backend_shutdown(void)
+@@ -202,8 +229,11 @@ static void audio_backend_shutdown(void)
  static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
  {
      if (s_sdl_audio_dev) {
@@ -140,7 +141,7 @@ index b51fb7c..f33d63d 100644
      }
  }
  
-@@ -215,16 +244,18 @@ static int audio_backend_room(void)
+@@ -215,16 +245,18 @@ static int audio_backend_room(void)
             CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
  }
  
@@ -166,7 +167,7 @@ index b51fb7c..f33d63d 100644
  #endif /* AUDIO_BACKEND_SDL2 */
  
  #if AUDIO_BACKEND_WASAPI
-@@ -380,6 +411,19 @@ static int audio_backend_room(void)
+@@ -380,6 +412,19 @@ static int audio_backend_room(void)
      return (int)(s_wasapi_buf_frames - padding);
  }
  
@@ -186,7 +187,7 @@ index b51fb7c..f33d63d 100644
  /* Block until the device has consumed some of its buffer. */
  static void audio_backend_wait(void)
  {
-@@ -508,11 +552,10 @@ static void audio_mix_one_block(void)
+@@ -508,11 +553,10 @@ static void audio_mix_one_block(void)
  
      mutex_unlock(&s_audio_mutex);
  
@@ -202,10 +203,21 @@ index b51fb7c..f33d63d 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -534,34 +577,71 @@ static void audio_notify_event_queues(void)
+@@ -525,6 +569,7 @@ static void audio_notify_event_queues(void)
+      * registered notify queue, so the game's audio loop (blocked on
+      * sys_event_queue_receive) wakes once per block and writes the next one.
+      * Resolve the queue by its ipc_key (set via cellAudioSetNotifyEventQueue). */
++    mutex_lock(&s_audio_mutex);
+     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+         if (!s_notify_queues[i].in_use) continue;
+         uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
+@@ -532,6 +577,50 @@ static void audio_notify_event_queues(void)
+             sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+                                        0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
      }
- }
- 
++    mutex_unlock(&s_audio_mutex);
++}
++
 +/* A deadline is a guest render opportunity, not a debt to the host device.
 + * Reserve a render window after every notification, including after a stall.
 + * Missed periods are discarded; device starvation is repaired with silence. */
@@ -247,11 +259,10 @@ index b51fb7c..f33d63d 100644
 +        fprintf(stderr, "[audio-recovery] block#%llu lag=%.3fms missed=%llu silence-prime=%u frames\n",
 +                (unsigned long long)blocks, lag / 1000000.0,
 +                (unsigned long long)(lag / AUDIO_PERIOD_NS), primed);
-+}
-+
+ }
+ 
  #ifdef _WIN32
- static unsigned __stdcall audio_mix_thread_func(void* arg)
- {
+@@ -540,28 +629,22 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      (void)arg;
      printf("[cellAudio] Mixing thread started\n");
  
@@ -292,10 +303,16 @@ index b51fb7c..f33d63d 100644
          blocks++;
          /* Mix and submit one block */
          audio_mix_one_block();
-@@ -597,28 +677,78 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -597,28 +680,90 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
  
          /* Notify event queues */
          audio_notify_event_queues();
++        mutex_lock(&s_audio_mutex);
++        int audio_running = 0;
++        for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++)
++            audio_running |= s_ports[p].in_use && s_ports[p].running;
++        mutex_unlock(&s_audio_mutex);
++        cellAtracHostCheckStalls(audio_now_ns(), audio_running);
 +        deadline += AUDIO_PERIOD_NS;
 +        const u64 earliest = audio_now_ns() + AUDIO_RENDER_NS;
 +        if (deadline < earliest) deadline = earliest;
@@ -372,12 +389,35 @@ index b51fb7c..f33d63d 100644
 -        } else {
 -            usleep(2000);
 -        }
++        mutex_lock(&s_audio_mutex);
++        int audio_running = 0;
++        for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++)
++            audio_running |= s_ports[p].in_use && s_ports[p].running;
++        mutex_unlock(&s_audio_mutex);
++        cellAtracHostCheckStalls(audio_now_ns(), audio_running);
 +        deadline += AUDIO_PERIOD_NS;
 +        const u64 earliest = audio_now_ns() + AUDIO_RENDER_NS;
 +        if (deadline < earliest) deadline = earliest;
      }
  
      printf("[cellAudio] Mixing thread stopped\n");
+@@ -999,8 +1144,16 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
+     if (!s_audio_initialized)
+         return CELL_AUDIO_ERROR_NOT_INIT;
+ 
++    if (!key) return CELL_AUDIO_ERROR_EVENT_QUEUE;
++
+     mutex_lock(&s_audio_mutex);
+ 
++    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
++        if (s_notify_queues[i].in_use && s_notify_queues[i].key == key) {
++            mutex_unlock(&s_audio_mutex);
++            return CELL_AUDIO_ERROR_EVENT_QUEUE;
++        }
++    }
+     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+         if (!s_notify_queues[i].in_use) {
+             s_notify_queues[i].in_use = 1;
 diff --git a/libs/audio/cellAudio_host.h b/libs/audio/cellAudio_host.h
 new file mode 100644
 index 0000000..ec0ddf1
@@ -404,6 +444,60 @@ index 0000000..ec0ddf1
 +}
 +#endif
 +#endif
+diff --git a/libs/audio/tests/test_audio_host_gain.c b/libs/audio/tests/test_audio_host_gain.c
+new file mode 100644
+index 0000000..86e51eb
+--- /dev/null
++++ b/libs/audio/tests/test_audio_host_gain.c
+@@ -0,0 +1,48 @@
++/* Muting must change only host samples, never guest consumption or events. */
++#include "../cellAudio.c"
++#include <assert.h>
++uint8_t* vm_base;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t a) { (void)a; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void guest_poll_notify(uint32_t a, uint32_t n) { (void)a; (void)n; }
++void cellAtracHostCheckStalls(uint64_t n, int running) { (void)n; (void)running; }
++static unsigned events;
++uint32_t sys_event_find_queue_by_key(uint64_t key) { return key==0x1234 ? 7 : 0; }
++int sys_event_queue_push_by_id(uint32_t q, uint64_t s, uint64_t a, uint64_t b, uint64_t c)
++{ assert(q==7 && s==0x1234 && !a && !b && !c); events++; return 0; }
++int main(void)
++{
++    vm_base=calloc(1,0x100000); assert(vm_base);
++    mutex_init(&s_audio_mutex); s_audio_initialized=1;
++    AudioPortSlot* p=&s_ports[0]; p->in_use=p->running=1;
++    p->buffer=(float*)(vm_base+0x10000); p->read_idx_addr=0x100;
++    p->param.nChannel=2; p->param.nBlock=8; p->param.level=1;
++    assert(cellAudioSetNotifyEventQueue(0)==CELL_AUDIO_ERROR_EVENT_QUEUE);
++    assert(cellAudioSetNotifyEventQueue(0x1234)==CELL_OK);
++    assert(cellAudioSetNotifyEventQueue(0x1234)==CELL_AUDIO_ERROR_EVENT_QUEUE); // no duplicate notifications
++    const float volumes[]={0,1,1,0.3f,0,1,1,1};
++    const int mutes[]={0,0,1,0,0,0,1,0};
++    for (unsigned mode=0;mode<8;mode++) {
++        cellAudioHostSetGain(volumes[mode],mutes[mode]);
++        for (unsigned block=0;block<400;block++) {
++            uint64_t before=p->read_index;
++            uint32_t offset=0x10000+(before%8)*256*2*4;
++            for (unsigned i=0;i<512;i++) vm_write32(offset+i*4,0x3e800000); // .25
++            audio_mix_one_block(); audio_notify_event_queues();
++            assert(p->read_index==before+1 && vm_read64(0x100)==p->read_index%8);
++            for (unsigned i=0;i<512;i++) {
++                assert(!vm_read32(offset+i*4));
++                assert(fabsf(s_mix_buffer[i]-.25f*(mutes[mode]?0:volumes[mode]))<1e-6f);
++            }
++        }
++    }
++    assert(events==3200 && p->read_index==3200);
++    mutex_destroy(&s_audio_mutex); free(vm_base);
++    puts("[AP audio gain] muted/zero start + live volume/mute/focus gain: 3200 guest blocks/events, output-only scaling: PASS");
++}
 diff --git a/libs/codec/avc_decoder.cpp b/libs/codec/avc_decoder.cpp
 new file mode 100644
 index 0000000..94091c3
@@ -1372,7 +1466,7 @@ index 2282b24..b9a53d0 100644
  
  /* NOT a host function pointer. The guest's cbFunc is a guest EA naming an OPD,
 diff --git a/libs/codec/cellAtrac.c b/libs/codec/cellAtrac.c
-index 6138658..fb59dc6 100644
+index 6138658..7dc0052 100644
 --- a/libs/codec/cellAtrac.c
 +++ b/libs/codec/cellAtrac.c
 @@ -1,8 +1,8 @@
@@ -1401,12 +1495,19 @@ index 6138658..fb59dc6 100644
   */
  
  #include "cellAtrac.h"
-@@ -25,13 +25,15 @@
+@@ -25,21 +25,41 @@
  #include "../../third_party/at3_standalone/at3_bridge.h"
  #include <stdio.h>
  #include <string.h>
 +#include <stdlib.h>
 +#include <limits.h>
++#include <stdatomic.h>
++#include "cellAtrac_host.h"
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <time.h>
++#endif
  
  #define AT3P_SAMPLES   2048
  #define AT3P_DELAY     0x170
@@ -1418,15 +1519,19 @@ index 6138658..fb59dc6 100644
      u32 data_off, data_bytes;  /* the data chunk, relative to the file start */
      s32 first, end;            /* decoder-stream indices; end is exclusive   */
      s32 loop_start, loop_end;  /* same space, loop_end exclusive; -1 = none  */
-@@ -39,7 +41,14 @@ typedef struct {
+ } AtracTrackInfo;
  
++typedef struct { u32 start, end; } AtracRange;
++
  typedef struct {
      u32 handle_ea;             /* 0 = free */
 -    const u8* file;
 +    u8* file;                 /* owned compressed data, not a guest pointer */
 +    u32 buffer_ea, buffer_bytes, file_bytes;
 +    u32 read_pos, buffered_from, write_off;
-+    u32 prefix, range_start, range_end; /* submitted file ranges */
++    u32 prefix;                /* contiguous submitted file prefix */
++    AtracRange* ranges;        /* retained disjoint seek/prefetch ranges */
++    u32 range_count, range_capacity;
 +    u32 reset_sample, reset_min;
 +    u32 decode_calls, refill_calls;
 +    int reset_pending, all_on_memory;
@@ -1434,7 +1539,85 @@ index 6138658..fb59dc6 100644
      AtracTrackInfo t;
      void* dec;
      s32 pos;                   /* next decoder-stream index to output */
-@@ -66,15 +75,22 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
+@@ -51,6 +71,77 @@ typedef struct {
+ 
+ static AtracSlot s_slots[ATRAC_MAX_SLOTS];
+ 
++/* The mixer watchdog reads only atomic telemetry, never decoder/cache state. */
++static struct {
++    _Atomic u32 handle;
++    _Atomic u64 last_decode, last_warning;
++    _Atomic s32 pos, result;
++} s_watch[ATRAC_MAX_SLOTS];
++
++static u64 atrac_now_ns(void)
++{
++#ifdef _WIN32
++    LARGE_INTEGER f, c;
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (u64)(c.QuadPart / f.QuadPart) * 1000000000ULL +
++           (u64)(c.QuadPart % f.QuadPart) * 1000000000ULL / (u64)f.QuadPart;
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
++#endif
++}
++
++void cellAtracHostCheckStalls(u64 now, int audio_running)
++{
++    if (!audio_running) return;
++    for (int i = 0; i < ATRAC_MAX_SLOTS; i++) {
++        const u32 handle = atomic_load(&s_watch[i].handle);
++        const u64 last = atomic_load(&s_watch[i].last_decode);
++        const u64 warned = atomic_load(&s_watch[i].last_warning);
++        if (handle && last && now > last + 2000000000ULL &&
++            (!warned || now > warned + 30000000000ULL)) {
++            atomic_store(&s_watch[i].last_warning, now);
++            fprintf(stderr, "[cellAtrac] WARNING handle=0x%08X no Decode for %.2fs while audio port RUN pos=%d last_rc=0x%08X\n",
++                    handle, (now - last) / 1000000000.0,
++                    atomic_load(&s_watch[i].pos), (u32)atomic_load(&s_watch[i].result));
++        }
++    }
++}
++
++static s32 remain_frames(const AtracSlot* s);
++
++static s32 decode_result(AtracSlot* s, u32 handle, s32 rc)
++{
++    const u64 now = atrac_now_ns();
++    if (s) {
++        const int i = (int)(s - s_slots);
++        atomic_store(&s_watch[i].pos, s->pos - s->t.first);
++        atomic_store(&s_watch[i].result, rc);
++        atomic_store(&s_watch[i].last_decode, now);
++        if (rc == (s32)CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED ||
++            (rc == CELL_OK && !s->loop_num && s->pos >= s->t.end))
++            atomic_store(&s_watch[i].handle, 0);
++        else
++            atomic_store(&s_watch[i].handle, handle);
++    }
++    if (rc != CELL_OK) {
++        /* Per-handle rate limit; invalid handles share a separate limiter. */
++        static _Atomic u64 invalid_warning;
++        _Atomic u64* warning = s ? &s_watch[s - s_slots].last_warning : &invalid_warning;
++        const u64 last = atomic_load(warning);
++        if (!last || now > last + 2000000000ULL) {
++            atomic_store(warning, now);
++            fprintf(stderr, "[cellAtrac] WARNING Decode handle=0x%08X rc=0x%08X pos=%d read=%u/%u remain=%d internal=%d\n",
++                    handle, (u32)rc, s ? s->pos - s->t.first : -1,
++                    s ? s->read_pos : 0, s ? s->file_bytes : 0,
++                    s ? remain_frames(s) : 0, s ? s->internal_error : 0);
++        }
++    }
++    return rc;
++}
++
+ static u32 le32(const u8* p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
+ static u16 le16(const u8* p) { return (u16)(p[0] | p[1] << 8); }
+ 
+@@ -66,15 +157,22 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
      if (bytes < 12 || memcmp(f, "RIFF", 4) || memcmp(f + 8, "WAVE", 4))
          return (int)CELL_ATRAC_ERROR_UNKNOWN_FORMAT;
      u32 total = 0, off1 = 0, off2 = 0, has_fact = 0, lstart = 0, lend = 0, has_loop = 0;
@@ -1458,7 +1641,7 @@ index 6138658..fb59dc6 100644
              t->block_align = le16(c + 20);
          } else if (!memcmp(c, "fact", 4) && cs >= 8 && o + 16 <= bytes) {
              has_fact = 1;
-@@ -90,10 +106,16 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
+@@ -90,10 +188,16 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
              t->data_off = o + 8;
              t->data_bytes = cs;
          }
@@ -1476,7 +1659,7 @@ index 6138658..fb59dc6 100644
      const s32 stream = (s32)(t->data_bytes / t->block_align) * AT3P_SAMPLES;
      t->first = (s32)off1 + AT3P_DELAY;
      t->end = has_fact ? t->first + (s32)total : stream;
-@@ -103,6 +125,7 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
+@@ -103,6 +207,7 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
          t->loop_end = t->first + (s32)(lend - off2) + 1;
          if (t->loop_end > t->end) t->loop_end = t->end;
      }
@@ -1484,41 +1667,80 @@ index 6138658..fb59dc6 100644
      return 0;
  }
  
-@@ -113,24 +136,86 @@ static AtracSlot* slot_of(u32 handle_ea)
+@@ -113,24 +218,124 @@ static AtracSlot* slot_of(u32 handle_ea)
      return NULL;
  }
  
-+/* A prefix plus the latest seek range covers normal streaming, loops, and
-+ * discontinuous resets without treating unsubmitted cache bytes as audio. */
++/* Every submitted range survives staging-ring reuse AND subsequent seeks.
++ * A latest-range-only cache loses the still-playing tail during loop prefetch. */
++static u32 cached_end(const AtracSlot* s, u32 at)
++{
++    if (at <= s->prefix) return s->prefix;
++    for (u32 i = 0; i < s->range_count; i++)
++        if (at >= s->ranges[i].start && at <= s->ranges[i].end)
++            return s->ranges[i].end;
++    return at;
++}
++
 +static int cached(const AtracSlot* s, u32 at, u32 bytes)
 +{
 +    return at <= s->file_bytes && bytes <= s->file_bytes - at &&
-+           (at + bytes <= s->prefix ||
-+            (at >= s->range_start && at + bytes <= s->range_end));
++           at + bytes <= cached_end(s, at);
 +}
 +
-+static void submit_data(AtracSlot* s, u32 at, u32 ea, u32 bytes)
++static int submit_data(AtracSlot* s, u32 at, u32 ea, u32 bytes)
 +{
-+    memcpy(s->file + at, vm_base + ea, bytes);
-+    if (at <= s->prefix) {
-+        if (at + bytes > s->prefix) s->prefix = at + bytes;
-+        if (s->range_start <= s->prefix && s->range_end > s->prefix)
-+            s->prefix = s->range_end;
-+    } else if (at >= s->range_start && at <= s->range_end) {
-+        if (at + bytes > s->range_end) s->range_end = at + bytes;
-+    } else {
-+        s->range_start = at;
-+        s->range_end = at + bytes;
++    if (!bytes) return 0;
++    if (s->range_count == s->range_capacity) {
++        const u32 capacity = s->range_capacity ? s->range_capacity * 2 : 4;
++        AtracRange* ranges = (AtracRange*)realloc(s->ranges, capacity * sizeof(*ranges));
++        if (!ranges) return (s32)CELL_ATRAC_ERROR_API_FAIL;
++        s->ranges = ranges;
++        s->range_capacity = capacity;
 +    }
++    memcpy(s->file + at, vm_base + ea, bytes);
++    u32 end = at + bytes, i = 0;
++    while (i < s->range_count) {
++        AtracRange* r = &s->ranges[i];
++        if (at <= r->end && end >= r->start) {
++            if (r->start < at) at = r->start;
++            if (r->end > end) end = r->end;
++            s->ranges[i] = s->ranges[--s->range_count];
++            i = 0; /* the expanded interval may join an earlier interval */
++        } else i++;
++    }
++    if (at <= s->prefix) {
++        if (end > s->prefix) s->prefix = end;
++        i = 0;
++        while (i < s->range_count) {
++            if (s->ranges[i].start <= s->prefix) {
++                if (s->ranges[i].end > s->prefix) s->prefix = s->ranges[i].end;
++                s->ranges[i] = s->ranges[--s->range_count];
++                i = 0;
++            } else i++;
++        }
++    } else {
++        s->ranges[s->range_count++] = (AtracRange){at, end};
++    }
++    return 0;
 +}
 +
 +static s32 remain_frames(const AtracSlot* s)
 +{
 +    if (s->all_on_memory) return CELL_ATRAC_ALLDATA_IS_ON_MEMORY;
 +    const u32 at = s->t.data_off + (u32)s->next_frame * s->t.block_align;
-+    const u32 end = at <= s->prefix ? s->prefix :
-+                    at >= s->range_start && at <= s->range_end ? s->range_end : at;
-+    if (end == s->file_bytes) return CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY;
++    const u32 end = cached_end(s, at);
++    if (end == s->file_bytes) {
++        if (s->t.loop_start < 0 || !s->loop_num)
++            return CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY;
++        const u32 first = (u32)s->t.loop_start / AT3P_SAMPLES;
++        const u32 loop_at = s->t.data_off + (first ? first - 1 : 0) * s->t.block_align;
++        const u32 loop_end = s->t.data_off +
++            ((u32)s->t.loop_end + AT3P_SAMPLES - 1) / AT3P_SAMPLES * s->t.block_align;
++        if (cached(s, loop_at, loop_end - loop_at))
++            return CELL_ATRAC_LOOP_STREAM_DATA_IS_ON_MEMORY;
++        /* Tail resident after a seek does not imply the loop is resident. */
++    }
 +    return (s32)((end - at) / s->t.block_align);
 +}
 +
@@ -1544,8 +1766,7 @@ index 6138658..fb59dc6 100644
 +        /* A loop after a discontinuous seek may revisit an uncached range.
 +         * Redirect the next guest refill to its first missing byte. */
 +        u32 missing = start;
-+        if (missing < s->prefix) missing = s->prefix;
-+        if (missing >= s->range_start && missing < s->range_end) missing = s->range_end;
++        missing = cached_end(s, missing);
 +        if (s->read_pos != missing) {
 +            s->read_pos = s->buffered_from = missing;
 +            s->write_off = 0;
@@ -1576,7 +1797,7 @@ index 6138658..fb59dc6 100644
          s->next_frame++;
      }
      s->pcm_frame = k;
-@@ -143,6 +228,7 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
+@@ -143,6 +348,7 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
                                    u32 uiBufferByte, u32 puiWorkMemByte)
  {
      if (!pHandle || !pucBufferAddr) return (s32)CELL_ATRAC_ERROR_API_FAIL;
@@ -1584,7 +1805,7 @@ index 6138658..fb59dc6 100644
      AtracSlot* s = slot_of(pHandle);
      if (!s) s = slot_of(0);
      if (!s) return (s32)CELL_ATRAC_ERROR_API_FAIL;
-@@ -153,23 +239,32 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
+@@ -153,23 +359,36 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
          fprintf(stderr, "[cellAtrac] SetData: not an ATRAC3plus file (0x%08X)\n", (u32)rc);
          return rc;
      }
@@ -1598,8 +1819,12 @@ index 6138658..fb59dc6 100644
 +    u8* copy = (u8*)malloc(file_bytes);
 +    if (!copy) return (s32)CELL_ATRAC_ERROR_API_FAIL;
 +    memcpy(copy, file, uiReadByte);
++    atomic_store(&s_watch[s - s_slots].handle, 0);
++    atomic_store(&s_watch[s - s_slots].last_decode, 0);
++    atomic_store(&s_watch[s - s_slots].last_warning, 0);
      if (s->dec) at3p_close(s->dec);
 +    free(s->file);
++    free(s->ranges);
      memset(s, 0, sizeof(*s));
      s->handle_ea = pHandle;
 -    s->file = file;
@@ -1625,34 +1850,49 @@ index 6138658..fb59dc6 100644
      return CELL_OK;
  }
  
-@@ -197,6 +292,7 @@ s32 cellAtracDeleteDecoder(u32 pHandle)
+@@ -196,7 +415,12 @@ s32 cellAtracDeleteDecoder(u32 pHandle)
+ {
      AtracSlot* s = slot_of(pHandle);
      if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    atomic_store(&s_watch[s - s_slots].handle, 0);
++    atomic_store(&s_watch[s - s_slots].last_decode, 0);
++    atomic_store(&s_watch[s - s_slots].last_warning, 0);
      if (s->dec) at3p_close(s->dec);
 +    free(s->file);
++    free(s->ranges);
      memset(s, 0, sizeof(*s));
      return CELL_OK;
  }
-@@ -210,6 +306,8 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
-     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
-     if (!s->dec) return (s32)CELL_ATRAC_ERROR_NO_DECODER;
+@@ -207,13 +431,15 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
+                     u32 piRemainFrame)
+ {
+     AtracSlot* s = slot_of(pHandle);
+-    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+-    if (!s->dec) return (s32)CELL_ATRAC_ERROR_NO_DECODER;
++    if (!s) return decode_result(NULL, pHandle, (s32)CELL_ATRAC_ERROR_UNSET_DATA);
++    if (!s->dec) return decode_result(s, pHandle, (s32)CELL_ATRAC_ERROR_NO_DECODER);
      if (puiSamples) vm_write32(puiSamples, 0);
 +    if (puiFinishflag) vm_write32(puiFinishflag, 0);
 +    if (piRemainFrame) vm_write32(piRemainFrame, (u32)remain_frames(s));
      if (s->pos >= (looping(s) ? s->t.loop_end : s->t.end)) {
          if (!looping(s)) {
              if (puiFinishflag) vm_write32(puiFinishflag, 1);
-@@ -222,7 +320,8 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
+-            return (s32)CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED;
++            return decode_result(s, pHandle, (s32)CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED);
+         }
+         s->pos = s->t.loop_start;
+         if (s->loop_num > 0) s->loop_num--;
+@@ -222,7 +448,8 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
      const s32 k = s->pos / AT3P_SAMPLES, at = s->pos - k * AT3P_SAMPLES;
      s32 n = AT3P_SAMPLES - at;
      if (n > limit - s->pos) n = limit - s->pos;
 -    decode_frame(s, k);
 +    const int rc = decode_frame(s, k);
-+    if (rc) return rc;
++    if (rc) return decode_result(s, pHandle, rc);
      const u32 ch = s->t.channels;
      for (s32 i = 0; i < n; i++)
          for (u32 c = 0; c < ch; c++) {
-@@ -231,16 +330,28 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
+@@ -231,16 +458,28 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
              vm_write32(pfOutAddr + ((u32)i * ch + c) * 4, bits);
          }
      s->pos += n;
@@ -1670,8 +1910,9 @@ index 6138658..fb59dc6 100644
      if (puiSamples) vm_write32(puiSamples, (u32)n);
      if (puiFinishflag) vm_write32(puiFinishflag, !looping(s) && s->pos >= s->t.end);
 -    if (piRemainFrame) vm_write32(piRemainFrame, (u32)CELL_ATRAC_ALLDATA_IS_ON_MEMORY);
+-    return CELL_OK;
 +    if (piRemainFrame) vm_write32(piRemainFrame, (u32)remain_frames(s));
-     return CELL_OK;
++    return decode_result(s, pHandle, CELL_OK);
  }
  
  s32 cellAtracGetRemainFrame(u32 pHandle, u32 piRemainFrame)
@@ -1684,7 +1925,34 @@ index 6138658..fb59dc6 100644
      return CELL_OK;
  }
  
-@@ -294,8 +405,8 @@ s32 cellAtracGetBitrate(u32 pHandle, u32 puiBitrate)
+@@ -264,8 +503,11 @@ s32 cellAtracGetNextSample(u32 pHandle, u32 puiNextSample)
+ {
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+-    const s32 k = s->pos / AT3P_SAMPLES;
+-    vm_write32(puiNextSample, (u32)(AT3P_SAMPLES - (s->pos - k * AT3P_SAMPLES)));
++    const s32 pos = looping(s) && s->pos >= s->t.loop_end ? s->t.loop_start : s->pos;
++    const s32 limit = looping(s) ? s->t.loop_end : s->t.end;
++    const s32 k = pos / AT3P_SAMPLES;
++    const s32 n = AT3P_SAMPLES - (pos - k * AT3P_SAMPLES);
++    vm_write32(puiNextSample, (u32)(n < limit - pos ? n : limit - pos));
+     return CELL_OK;
+ }
+ 
+@@ -285,8 +527,10 @@ s32 cellAtracGetNextDecodePosition(u32 pHandle, u32 puiSamplePosition)
+ {
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+-    if (s->pos >= s->t.end) return (s32)CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED;
+-    vm_write32(puiSamplePosition, (u32)(s->pos - s->t.first));
++    if (!looping(s) && s->pos >= s->t.end)
++        return (s32)CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED;
++    const s32 pos = looping(s) && s->pos >= s->t.loop_end ? s->t.loop_start : s->pos;
++    vm_write32(puiSamplePosition, (u32)(pos - s->t.first));
+     return CELL_OK;
+ }
+ 
+@@ -294,8 +538,8 @@ s32 cellAtracGetBitrate(u32 pHandle, u32 puiBitrate)
  {
      AtracSlot* s = slot_of(pHandle);
      if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
@@ -1695,7 +1963,14 @@ index 6138658..fb59dc6 100644
      return CELL_OK;
  }
  
-@@ -317,13 +428,98 @@ s32 cellAtracSetLoopNum(u32 pHandle, s32 iLoopNum)
+@@ -313,17 +557,126 @@ s32 cellAtracSetLoopNum(u32 pHandle, s32 iLoopNum)
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+     if (s->t.loop_start < 0 && iLoopNum != 0) return (s32)CELL_ATRAC_ERROR_UNSET_LOOP_NUM;
++    if (getenv("PS3RECOMP_ATRAC_TRACE"))
++        fprintf(stderr, "[cellAtrac] SetLoopNum handle=0x%08X loops=%d -> %d\n",
++                pHandle, s->loop_num, iLoopNum);
+     s->loop_num = iLoopNum;
      return CELL_OK;
  }
  
@@ -1704,6 +1979,19 @@ index 6138658..fb59dc6 100644
 +{
 +    AtracSlot* s = slot_of(pHandle);
 +    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    /* Prefetch a missing loop range before Decode reaches the seam. D2 treats
++     * NODATA as fatal, so redirecting only inside Decode is too late. */
++    if (s->read_pos == s->file_bytes && looping(s)) {
++        const u32 first = (u32)s->t.loop_start / AT3P_SAMPLES;
++        u32 missing = s->t.data_off + (first ? first - 1 : 0) * s->t.block_align;
++        const u32 end = s->t.data_off +
++            ((u32)s->t.loop_end + AT3P_SAMPLES - 1) / AT3P_SAMPLES * s->t.block_align;
++        missing = cached_end(s, missing);
++        if (missing < end) {
++            s->read_pos = s->buffered_from = missing;
++            s->write_off = 0;
++        }
++    }
 +    vm_write32(ppucWritePointer, s->buffer_ea + s->write_off);
 +    vm_write32(puiWritableByte, writable_bytes(s));
 +    vm_write32(puiReadPosition, s->read_pos);
@@ -1716,7 +2004,8 @@ index 6138658..fb59dc6 100644
 +    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
 +    if (s->all_on_memory) return (s32)CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY;
 +    if (uiAddByte > writable_bytes(s)) return (s32)CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG;
-+    submit_data(s, s->read_pos, s->buffer_ea + s->write_off, uiAddByte);
++    const int rc = submit_data(s, s->read_pos, s->buffer_ea + s->write_off, uiAddByte);
++    if (rc) return rc;
 +    s->read_pos += uiAddByte;
 +    s->write_off = (s->write_off + uiAddByte) % s->buffer_bytes;
 +    if ((++s->refill_calls <= 4 || s->refill_calls % 32 == 1) && getenv("PS3RECOMP_ATRAC_TRACE"))
@@ -1754,6 +2043,9 @@ index 6138658..fb59dc6 100644
 +    s->reset_sample = uiSample;
 +    s->reset_min = min;
 +    s->reset_pending = 1;
++    if (getenv("PS3RECOMP_ATRAC_TRACE"))
++        fprintf(stderr, "[cellAtrac] GetBufferInfoForResetting handle=0x%08X sample=%u read=%u writable=%u min=%u\n",
++                pHandle, uiSample, at, n, min);
 +    return CELL_OK;
 +}
 +
@@ -1775,7 +2067,8 @@ index 6138658..fb59dc6 100644
 +            uiWriteByte < s->reset_min || uiWriteByte > s->buffer_bytes ||
 +            uiWriteByte > s->file_bytes - at)
 +            return (s32)CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE;
-+        submit_data(s, at, s->buffer_ea, uiWriteByte);
++        const int rc = submit_data(s, at, s->buffer_ea, uiWriteByte);
++        if (rc) return rc;
 +        s->buffered_from = at;
 +        s->read_pos = at + uiWriteByte;
 +        s->write_off = uiWriteByte % s->buffer_bytes;
@@ -1786,6 +2079,9 @@ index 6138658..fb59dc6 100644
 +    s->pcm_frame = -1;
      s->pos = p;
 +    s->reset_pending = 0;
++    if (getenv("PS3RECOMP_ATRAC_TRACE"))
++        fprintf(stderr, "[cellAtrac] ResetPlayPosition handle=0x%08X sample=%u bytes=%u read=%u remain=%d\n",
++                pHandle, uiSample, uiWriteByte, s->read_pos, remain_frames(s));
 +    return CELL_OK;
 +}
 +
@@ -1797,10 +2093,10 @@ index 6138658..fb59dc6 100644
      return CELL_OK;
  }
 diff --git a/libs/codec/cellAtrac.h b/libs/codec/cellAtrac.h
-index 3a473eb..e9cb94a 100644
+index 3a473eb..8398493 100644
 --- a/libs/codec/cellAtrac.h
 +++ b/libs/codec/cellAtrac.h
-@@ -22,16 +22,21 @@ extern "C" {
+@@ -22,16 +22,22 @@ extern "C" {
  #define CELL_ATRAC_ERROR_READSIZE_OVER_BUFFER  0x80610311
  #define CELL_ATRAC_ERROR_UNKNOWN_FORMAT        0x80610312
  #define CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL 0x80610313
@@ -1819,10 +2115,11 @@ index 3a473eb..e9cb94a 100644
  
  #define CELL_ATRAC_ALLDATA_IS_ON_MEMORY  (-1)
 +#define CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY (-2)
++#define CELL_ATRAC_LOOP_STREAM_DATA_IS_ON_MEMORY (-3)
  
  s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte,
                                    u32 uiBufferByte, u32 puiWorkMemByte);
-@@ -43,6 +48,12 @@ s32 cellAtracDeleteDecoder(u32 pHandle);
+@@ -43,6 +49,12 @@ s32 cellAtracDeleteDecoder(u32 pHandle);
  s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishflag,
                      u32 piRemainFrame);
  s32 cellAtracGetRemainFrame(u32 pHandle, u32 piRemainFrame);
@@ -1835,6 +2132,24 @@ index 3a473eb..e9cb94a 100644
  s32 cellAtracGetChannel(u32 pHandle, u32 puiChannel);
  s32 cellAtracGetMaxSample(u32 pHandle, u32 puiMaxSample);
  s32 cellAtracGetNextSample(u32 pHandle, u32 puiNextSample);
+diff --git a/libs/codec/cellAtrac_host.h b/libs/codec/cellAtrac_host.h
+new file mode 100644
+index 0000000..06bfd8a
+--- /dev/null
++++ b/libs/codec/cellAtrac_host.h
+@@ -0,0 +1,12 @@
++/* Host diagnostics; does not mutate guest decoder state. */
++#ifndef PS3RECOMP_CELL_ATRAC_HOST_H
++#define PS3RECOMP_CELL_ATRAC_HOST_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++void cellAtracHostCheckStalls(uint64_t now_ns, int audio_running);
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
 index b055385..c218a55 100644
 --- a/libs/codec/cellDmux.c
@@ -4226,6 +4541,190 @@ index 0000000..90bb9f4
 +}
 +#endif
 +#endif
+diff --git a/libs/codec/tests/test_atrac_stream_switch.c b/libs/codec/tests/test_atrac_stream_switch.c
+new file mode 100644
+index 0000000..5005b80
+--- /dev/null
++++ b/libs/codec/tests/test_atrac_stream_switch.c
+@@ -0,0 +1,178 @@
++/* Guest-style proactive refill: D2 retires a line on ANY Decode error.
++ * Default uses synthetic RIFF/decoder; AP_REAL_ATRAC uses read-only real files. */
++#include <assert.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++uint8_t* vm_base;
++#ifndef ATRAC_SOURCE
++#define ATRAC_SOURCE "../cellAtrac.c"
++#endif
++#include ATRAC_SOURCE
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t a) { (void)a; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void guest_poll_notify(uint32_t a, uint32_t n) { (void)a; (void)n; }
++#ifndef AP_REAL_ATRAC
++void* at3p_open(int ch, int* ba) { (void)ch; (void)ba; return malloc(1); }
++void at3p_close(void* p) { free(p); }
++void at3p_flush(void* p) { (void)p; }
++int at3p_decode(void* p, float* l, float* r, int* n, const uint8_t* b, int bytes)
++{ (void)p; (void)b; (void)bytes; *n = 2048; for (int i=0;i<2048;i++) l[i]=r[i]=0.25f; return 0; }
++static void putle(uint8_t* p, uint32_t v)
++{ p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
++#endif
++
++enum { H=0x100, ARGS=0x200, OUT=0x10000, BUFFER=0x100000, CAP=262144, INITIAL=102400 };
++typedef struct { uint8_t* bytes; uint32_t size; AtracTrackInfo t; } Track;
++static Track tracks[3];
++static unsigned refills, laps;
++static Track* playing;
++
++static void load_track(Track* t, const char* path, unsigned frames)
++{
++#ifdef AP_REAL_ATRAC
++    FILE* f=fopen(path,"rb"); assert(f);
++    fseek(f,0,SEEK_END); t->size=(uint32_t)ftell(f); rewind(f);
++    t->bytes=malloc(t->size); assert(fread(t->bytes,1,t->size,f)==t->size); fclose(f);
++#else
++    (void)path;
++    t->size=156+frames*1024;
++    t->bytes=calloc(1,t->size); uint8_t* b=t->bytes;
++    memcpy(b,"RIFF",4); putle(b+4,t->size-8); memcpy(b+8,"WAVEfmt ",8);
++    putle(b+16,40); b[20]=0xfe; b[21]=0xff; b[22]=2;
++    putle(b+24,48000); b[32]=0; b[33]=4; memcpy(b+44,k_at3p_guid,16);
++    memcpy(b+60,"fact",4); putle(b+64,12); putle(b+68,frames*2048-4047);
++    putle(b+72,4047-AT3P_DELAY); putle(b+76,0);
++    memcpy(b+80,"smpl",4); putle(b+84,60); putle(b+116,1);
++    putle(b+132,frames*2048/3); putle(b+136,frames*2048-4048);
++    memcpy(b+148,"data",4); putle(b+152,frames*1024);
++#endif
++    assert(!atrac_parse_riff(t->bytes,t->size,&t->t));
++    assert(t->t.loop_start>=0 && t->t.loop_end==t->t.end);
++}
++
++static void start(Track* t)
++{
++    playing=t;
++    memset(vm_base+BUFFER,0xa5,CAP);
++    memcpy(vm_base+BUFFER,t->bytes,INITIAL);
++    assert(cellAtracSetDataAndGetMemSize(H,BUFFER,INITIAL,CAP,ARGS)==CELL_OK);
++    assert(slot_of(H)->read_pos==INITIAL && slot_of(H)->write_off==INITIAL);
++    assert(slot_of(H)->prefix==INITIAL && slot_of(H)->pcm_frame==-1);
++    assert(cellAtracCreateDecoder(H,0x1000,0,0)==CELL_OK);
++    assert(cellAtracSetLoopNum(H,-1)==CELL_OK);
++}
++
++static void fill_if_needed(void)
++{
++    assert(cellAtracGetRemainFrame(H,ARGS+8)==CELL_OK);
++    int32_t remain=(int32_t)vm_read32(ARGS+8);
++#ifndef AP_BASELINE
++    assert(remain!=CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY);
++#else
++    if (remain==CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY) return;
++#endif
++    if (remain==CELL_ATRAC_ALLDATA_IS_ON_MEMORY || remain>64) return;
++    assert(cellAtracGetStreamDataInfo(H,ARGS+12,ARGS+16,ARGS+20)==CELL_OK);
++    uint32_t ea=vm_read32(ARGS+12), n=vm_read32(ARGS+16), at=vm_read32(ARGS+20);
++    assert(ea>=BUFFER && ea+n<=BUFFER+CAP && at<=playing->size && n<=playing->size-at);
++    if (!n) { assert(remain==CELL_ATRAC_LOOP_STREAM_DATA_IS_ON_MEMORY); return; }
++    memcpy(vm_base+ea,playing->bytes+at,n);
++    assert(cellAtracAddStreamData(H,n)==CELL_OK); refills++;
++}
++
++static void drive(unsigned calls)
++{
++    for (unsigned i=0;i<calls;i++) {
++        fill_if_needed();
++        int32_t old=slot_of(H)->pos;
++#ifndef AP_BASELINE
++        assert(cellAtracGetNextDecodePosition(H,ARGS+24)==CELL_OK);
++#else
++        if (cellAtracGetNextDecodePosition(H,ARGS+24)!=CELL_OK)
++            fprintf(stderr,"baseline falsely reports ALLDATA at looping EOF\n");
++#endif
++        int32_t rc=cellAtracDecode(H,OUT,ARGS,ARGS+4,ARGS+8);
++        if (rc) fprintf(stderr,"persistent guest line termination rc=%08x call=%u pos=%d read=%u/%u\n",
++                        (uint32_t)rc,i,old,slot_of(H)->read_pos,slot_of(H)->file_bytes);
++        assert(rc==CELL_OK && vm_read32(ARGS)>0 && !vm_read32(ARGS+4));
++        if (slot_of(H)->pos<old) laps++;
++        for (unsigned j=0;j<vm_read32(ARGS)*2;j++) {
++            uint32_t bits=vm_read32(OUT+j*4); float x; memcpy(&x,&bits,4); assert(isfinite(x));
++        }
++    }
++}
++
++static void seek_tail(void)
++{
++    uint32_t sample=(playing->t.end-playing->t.first)*9/10;
++    assert(cellAtracGetBufferInfoForResetting(H,sample,ARGS+32)==CELL_OK);
++    uint32_t ea=vm_read32(ARGS+32), n=vm_read32(ARGS+36), min=vm_read32(ARGS+40), at=vm_read32(ARGS+44);
++    assert(min && n>=min && at+n<=playing->size);
++    memcpy(vm_base+ea,playing->bytes+at,n);
++    assert(cellAtracResetPlayPosition(H,sample,n)==CELL_OK);
++    assert(slot_of(H)->buffered_from==at && slot_of(H)->read_pos==at+n);
++}
++
++int main(int argc, char** argv)
++{
++#ifdef AP_REAL_ATRAC
++    assert(argc==4);
++#else
++    (void)argc;
++#endif
++    vm_base=calloc(1,16u<<20); assert(vm_base);
++    for (unsigned i=0;i<3;i++) load_track(&tracks[i],argc==4 ? argv[i+1] : NULL,700+i*31);
++    // Switch while streaming on the SAME handle, including the user's final pair.
++    start(&tracks[0]); drive(90);
++    start(&tracks[1]); drive(110);
++    start(&tracks[0]); drive(80);
++    start(&tracks[2]); drive(95);
++    start(&tracks[0]); drive(100); seek_tail();
++    unsigned frames=playing->t.data_bytes/playing->t.block_align;
++    drive(frames*3); assert(laps>=2);
++    assert(cellAtracGetRemainFrame(H,ARGS+8)==CELL_OK);
++    assert((int32_t)vm_read32(ARGS+8)==CELL_ATRAC_LOOP_STREAM_DATA_IS_ON_MEMORY);
++    // Cached reset and exact EOF queries must remain playable with infinite looping.
++    uint32_t loop=(uint32_t)(playing->t.loop_start-playing->t.first);
++    assert(cellAtracGetBufferInfoForResetting(H,loop,ARGS+32)==CELL_OK);
++    assert(!vm_read32(ARGS+40));
++    assert(cellAtracResetPlayPosition(H,loop,0)==CELL_OK); drive(frames);
++    assert(cellAtracResetPlayPosition(H,playing->t.end-playing->t.first-1,0)==CELL_OK);
++    drive(1); assert(slot_of(H)->pos==playing->t.end);
++    assert(cellAtracGetNextDecodePosition(H,ARGS+24)==CELL_OK);
++    assert(vm_read32(ARGS+24)==loop);
++    assert(cellAtracGetNextSample(H,ARGS+24)==CELL_OK);
++    assert(vm_read32(ARGS+24)==2048-(uint32_t)playing->t.loop_start%2048);
++    drive(3);
++#ifndef AP_BASELINE
++    unsigned index=(unsigned)(slot_of(H)-s_slots);
++    uint64_t last=atomic_load(&s_watch[index].last_decode);
++    cellAtracHostCheckStalls(last+2100000000ULL,0);
++    assert(!atomic_load(&s_watch[index].last_warning));
++    cellAtracHostCheckStalls(last+2100000000ULL,1);
++    uint64_t warned=atomic_load(&s_watch[index].last_warning); assert(warned);
++    cellAtracHostCheckStalls(last+3100000000ULL,1);
++    assert(atomic_load(&s_watch[index].last_warning)==warned);
++#endif
++    assert(cellAtracDeleteDecoder(H)==CELL_OK);
++    // A real underrun remains retryable and records an always-on warning.
++    start(&tracks[0]);
++    int32_t rc=0;
++    for (unsigned i=0;i<200 && rc==CELL_OK;i++) rc=cellAtracDecode(H,OUT,ARGS,ARGS+4,ARGS+8);
++    assert(rc==(int32_t)CELL_ATRAC_ERROR_NODATA_IN_BUFFER);
++    int32_t pos=slot_of(H)->pos;
++    assert(cellAtracDecode(H,OUT,ARGS,ARGS+4,ARGS+8)==rc && slot_of(H)->pos==pos);
++    assert(cellAtracDeleteDecoder(H)==CELL_OK);
++    for (unsigned i=0;i<3;i++) free(tracks[i].bytes);
++    free(vm_base);
++    printf("[AP atrac] same-handle switches, uncached/cached resets, EOF queries, %u loop wraps, %u proactive refills, watchdog: PASS\n",laps,refills);
++}
 diff --git a/libs/codec/tests/test_avc_packets.cpp b/libs/codec/tests/test_avc_packets.cpp
 new file mode 100644
 index 0000000..626d1eb
@@ -14276,10 +14775,10 @@ index 0000000..636dfa1
 +#endif
 +#endif
 diff --git a/libs/video/rsx_metal_backend.h b/libs/video/rsx_metal_backend.h
-index aee795c..30e678c 100644
+index aee795c..d767a85 100644
 --- a/libs/video/rsx_metal_backend.h
 +++ b/libs/video/rsx_metal_backend.h
-@@ -35,6 +35,11 @@ int  rsx_metal_backend_pump_messages(void);
+@@ -35,6 +35,14 @@ int  rsx_metal_backend_pump_messages(void);
  /* Present one frame: clear the drawable to the colour last received through the
   * RSX clear method, then hand it to the compositor. */
  void rsx_metal_backend_present(void);
@@ -14288,11 +14787,14 @@ index aee795c..30e678c 100644
 +int rsx_metal_backend_submission_ok(void);
 +void rsx_metal_backend_set_vsync(int enabled);
 +void rsx_metal_backend_set_flip_buffer(u32 buffer);
++/* Asynchronously copy the preserved presented frame and encode a PNG. No GPU
++ * wait or disk I/O on the caller. Callback runs off main, including failure. */
++void rsx_metal_backend_capture_png(const char* path, void (*done)(void*, int), void* user);
  
  /* --- test hooks ---------------------------------------------------------- */
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index d04b34e..856cea9 100644
+index d04b34e..d542042 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
 @@ -46,13 +46,16 @@
@@ -14312,7 +14814,7 @@ index d04b34e..856cea9 100644
  #include "rsx_metal_backend.h"
  #include "rsx_vertex_fetch.h"
  #include "rsx_primitives.h"
-@@ -63,15 +66,43 @@
+@@ -63,15 +66,45 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
@@ -14339,6 +14841,8 @@ index d04b34e..856cea9 100644
 +void __attribute__((weak)) ps3_host_frame_rate(double fps) { (void)fps; }
 +void __attribute__((weak)) ps3_host_frame_rates(double guest, double display)
 +{ (void)guest; ps3_host_frame_rate(display); }
++void __attribute__((weak)) ps3_host_frame_event(double now, int guest, int display)
++{ (void)now; (void)guest; (void)display; }
  
  /* ------------------------------------------------------------------------- */
  
@@ -14356,7 +14860,7 @@ index d04b34e..856cea9 100644
  static int                 s_headless;
  static int                 s_closed;
  static int                 s_ready;
-@@ -360,7 +391,12 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
+@@ -360,7 +393,12 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
      u32 w = state->surface_clip_w, h = state->surface_clip_h;
      if (!w || !h || (w == s_width && h == s_height)) return;
      s_width = w; s_height = h;
@@ -14370,7 +14874,7 @@ index d04b34e..856cea9 100644
      if (s_depth && create_depth() != 0)
          fprintf(stderr, "[RSX metal] depth/stencil resize to %ux%u failed; "
                          "the old buffer stays bound\n", w, h);
-@@ -459,13 +495,81 @@ static int create_offscreen(void)
+@@ -459,13 +497,81 @@ static int create_offscreen(void)
  }
  
  #if !TARGET_OS_IPHONE
@@ -14453,7 +14957,7 @@ index d04b34e..856cea9 100644
          initWithContentRect:frame
                    styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
-@@ -474,18 +578,46 @@ static int create_window_impl(const char* title)
+@@ -474,18 +580,46 @@ static int create_window_impl(const char* title)
      if (!s_window) return -1;
  
      [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
@@ -14503,7 +15007,7 @@ index d04b34e..856cea9 100644
      [s_window makeKeyAndOrderFront:nil];
      [NSApp activateIgnoringOtherApps:YES];
      return 0;
-@@ -2060,6 +2192,13 @@ static u32 s_eng_obj_count;
+@@ -2060,6 +2194,13 @@ static u32 s_eng_obj_count;
  static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
  static u32 s_eng_obj_free_count;
  static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
@@ -14517,7 +15021,7 @@ index d04b34e..856cea9 100644
  
  typedef struct {
      id<MTLRenderPipelineState> pso;
-@@ -2086,7 +2225,7 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
+@@ -2086,7 +2227,7 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
  static u32 s_eng_view_count;
  
  typedef enum {
@@ -14526,7 +15030,7 @@ index d04b34e..856cea9 100644
  } EngRecKind;
  
  typedef struct {
-@@ -2099,6 +2238,7 @@ typedef struct {
+@@ -2099,6 +2240,7 @@ typedef struct {
      u32 pipeline;
      MTLPrimitiveType topology;
      u32 vb_off, stride, vertex_count;
@@ -14534,7 +15038,7 @@ index d04b34e..856cea9 100644
      u32 ib_off, index_count;
      u32 vs_cb_off, vs_cb_bytes;
      u32 ps_cb_off, ps_cb_bytes;
-@@ -2114,6 +2254,7 @@ typedef struct {
+@@ -2114,6 +2256,7 @@ typedef struct {
      float clear_depth;
      u8    clear_stencil;
      u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
@@ -14542,7 +15046,7 @@ index d04b34e..856cea9 100644
  } EngRecord;
  
  static EngRecord s_eng_rec[ENG_MAX_RECORDS];
-@@ -2132,11 +2273,20 @@ static id<MTLRenderPipelineState> s_eng_blit_pso;
+@@ -2132,11 +2275,20 @@ static id<MTLRenderPipelineState> s_eng_blit_pso;
  static MTLPixelFormat             s_eng_blit_pso_fmt;
  static id<MTLRenderPipelineState> s_eng_depth_pso;
  static id<MTLSamplerState>        s_eng_point_sampler;
@@ -14563,7 +15067,7 @@ index d04b34e..856cea9 100644
  "vertex BOut eng_fullscreen_vs(uint vid [[vertex_id]]) {\n"
  "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
  "    BOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
-@@ -2148,6 +2298,15 @@ static NSString* const kEngHelperMSL = @
+@@ -2148,6 +2300,15 @@ static NSString* const kEngHelperMSL = @
  "                            sampler s [[sampler(0)]]) {\n"
  "    return src.sample(s, i.uv);\n"
  "}\n"
@@ -14579,7 +15083,7 @@ index d04b34e..856cea9 100644
  "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
  "                            depth2d<float> src [[texture(0)]],\n"
  "                            sampler s [[sampler(0)]]) {\n"
-@@ -2164,6 +2323,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
+@@ -2164,6 +2325,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
          if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
          slot = s_eng_obj_count++;
      }
@@ -14587,7 +15091,7 @@ index d04b34e..856cea9 100644
      s_eng_obj[slot] = t;
      return slot + 1;
  }
-@@ -2193,6 +2353,8 @@ static void eng_obj_release(void* user, u32 handle)
+@@ -2193,6 +2355,8 @@ static void eng_obj_release(void* user, u32 handle)
      if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1] ||
          s_eng_obj_retired[handle - 1]) return;
      s_eng_obj_retired[handle - 1] = 1;
@@ -14596,7 +15100,7 @@ index d04b34e..856cea9 100644
      /* Any view cut from this object stops being valid with it. */
      for (u32 i = 0; i < s_eng_view_count; i++)
          if (s_eng_view[i].surface == handle) {
-@@ -2224,7 +2386,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+@@ -2224,7 +2388,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
  
  /* ---- staging ------------------------------------------------------------- */
  
@@ -14605,7 +15109,7 @@ index d04b34e..856cea9 100644
  
  static int eng_stage_reserve(u32 bytes, u32* out_off)
  {
-@@ -2262,6 +2424,9 @@ static int eng_init(void* user, u32 width, u32 height)
+@@ -2262,6 +2426,9 @@ static int eng_init(void* user, u32 width, u32 height)
  {
      (void)user; (void)width; (void)height;
      if (!s_dev) return -1;
@@ -14615,7 +15119,7 @@ index d04b34e..856cea9 100644
      NSError* err = nil;
      s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
      if (!s_eng_helper_lib) {
-@@ -2275,9 +2440,13 @@ static int eng_init(void* user, u32 width, u32 height)
+@@ -2275,9 +2442,13 @@ static int eng_init(void* user, u32 width, u32 height)
      sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
      sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
      s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
@@ -14630,7 +15134,7 @@ index d04b34e..856cea9 100644
  static void eng_shutdown(void* user)
  {
      (void)user;
-@@ -2292,13 +2461,17 @@ static void eng_shutdown(void* user)
+@@ -2292,13 +2463,17 @@ static void eng_shutdown(void* user)
      memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
      s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
      s_eng_rec_count = 0;
@@ -14648,7 +15152,7 @@ index d04b34e..856cea9 100644
  }
  
  static void eng_submit_and_wait(void* user, u32 reason)
-@@ -2353,7 +2526,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+@@ -2353,7 +2528,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
      if (!s_dev || !w || !h) return 0;
      MTLTextureDescriptor* td =
          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:eng_pixel_format(fmt)
@@ -14657,7 +15161,7 @@ index d04b34e..856cea9 100644
                                                         mipmapped:NO];
      /* PixelFormatView because a unit sampling this target wears its own
       * TEXTURE_CONTROL1 crossbar as a view swizzle. */
-@@ -2361,10 +2534,25 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+@@ -2361,10 +2536,25 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                 MTLTextureUsagePixelFormatView;
      id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
      if (!t) return 0;
@@ -14687,7 +15191,7 @@ index d04b34e..856cea9 100644
  }
  
  static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
-@@ -2403,13 +2591,15 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -2403,13 +2593,15 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
      if (!s_dev || !w || !h) return 0;
      MTLTextureDescriptor* td =
          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
@@ -14706,7 +15210,7 @@ index d04b34e..856cea9 100644
  }
  
  /* The sampleable copy of a depth target. The copy is a record in the stream,
-@@ -2435,14 +2625,15 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2435,14 +2627,15 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
      }
      MTLTextureDescriptor* td =
          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
@@ -14724,7 +15228,7 @@ index d04b34e..856cea9 100644
      r->kind = ENG_REC_DEPTH_RESOLVE;
      r->depth = depth;
      r->resolve_dst = dst;
-@@ -2463,7 +2654,28 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
+@@ -2463,7 +2656,28 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
      char name[64];
      snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
      dump_shader(name, hlsl);
@@ -14754,7 +15258,7 @@ index d04b34e..856cea9 100644
          fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
                  (unsigned long long)hash, s_log);
      } else {
-@@ -2709,6 +2921,70 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+@@ -2709,6 +2923,70 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
  static void eng_set_stencil_ref(void* user, u32 ref)
  { (void)user; s_eng_pending.stencil_ref = ref; }
  
@@ -14825,7 +15329,7 @@ index d04b34e..856cea9 100644
  static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                       u32 vertex_count, u32 stride, const u32* indices,
                       u32 index_count)
-@@ -2717,7 +2993,8 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -2717,7 +2995,8 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      if (!vertex_count || !stride) return;
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      u32 vb_off = 0, ib_off = 0;
@@ -14835,7 +15339,7 @@ index d04b34e..856cea9 100644
      if (indices && index_count &&
          !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
          return;
-@@ -2727,6 +3004,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -2727,6 +3006,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      r->kind         = ENG_REC_DRAW;
      r->topology     = topo_to_metal(topology);
      r->vb_off       = vb_off;
@@ -14843,7 +15347,7 @@ index d04b34e..856cea9 100644
      r->stride       = stride;
      r->vertex_count = vertex_count;
      r->ib_off       = ib_off;
-@@ -2744,7 +3022,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
+@@ -2744,7 +3024,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
                      (u32)(rgba[2] * 255.0f + 0.5f);
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -14852,7 +15356,7 @@ index d04b34e..856cea9 100644
      r->kind  = ENG_REC_CLEAR_COLOR;
      r->rt[0] = surface;
      r->nrt   = 1;
-@@ -2757,7 +3035,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2757,7 +3037,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
      (void)user;
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -14861,7 +15365,7 @@ index d04b34e..856cea9 100644
      r->kind = ENG_REC_CLEAR_DS;
      r->depth = depth;
      r->clear_flags = flags;
-@@ -2767,25 +3045,36 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2767,25 +3047,36 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
  
  /* ---- replay -------------------------------------------------------------- */
  
@@ -14912,7 +15416,7 @@ index d04b34e..856cea9 100644
          id<MTLTexture> t = eng_obj(r->tex[u]);
          [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
          [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
-@@ -2793,6 +3082,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -2793,6 +3084,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                               atIndex:(NSUInteger)u];
      }
      for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
@@ -14920,7 +15424,7 @@ index d04b34e..856cea9 100644
          id<MTLTexture> t = eng_obj(r->vtex[u]);
          [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
          [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
-@@ -2812,6 +3102,85 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -2812,6 +3104,85 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
      else
          [enc drawPrimitives:r->topology
                  vertexStart:0 vertexCount:r->vertex_count];
@@ -15006,7 +15510,7 @@ index d04b34e..856cea9 100644
  }
  
  /* Is this record aimed at exactly these colour attachments, in this order? */
-@@ -2830,6 +3199,19 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2830,6 +3201,19 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
  {
      u32 i = 0;
      while (i < s_eng_rec_count) {
@@ -15026,7 +15530,7 @@ index d04b34e..856cea9 100644
          if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
              const EngRecord* r = &s_eng_rec[i++];
              id<MTLTexture> src = eng_obj(r->depth);
-@@ -2861,13 +3243,20 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2861,13 +3245,20 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          float cdepth = 1.0f;
          u8 cstencil = 0;
          while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
@@ -15048,7 +15552,7 @@ index d04b34e..856cea9 100644
                      cc_surf[n_cc++] = r->rt[0];
                  }
                  memcpy(cc_rgba[k], r->clear_rgba, sizeof cc_rgba[k]);
-@@ -2922,10 +3311,21 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2922,10 +3313,21 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          }
          id<MTLTexture> zbuf = eng_obj(depth);
          if (!attach && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
@@ -15074,7 +15578,7 @@ index d04b34e..856cea9 100644
  
          MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
          for (u32 k = 0; k < attach; k++) {
-@@ -2947,15 +3347,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2947,15 +3349,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              rp.depthAttachment.texture       = zbuf;
              rp.depthAttachment.storeAction   = MTLStoreActionStore;
              rp.depthAttachment.loadAction    =
@@ -15094,7 +15598,7 @@ index d04b34e..856cea9 100644
          }
          if (!attach) {
              rp.renderTargetWidth  = [zbuf width];
-@@ -2972,11 +3372,12 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2972,11 +3374,12 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                     eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
              continue;
          }
@@ -15110,7 +15614,7 @@ index d04b34e..856cea9 100644
              i++;
          }
          [enc endEncoding];
-@@ -3012,11 +3413,45 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -3012,11 +3415,45 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
      if (!e) return;
      [e setRenderPipelineState:s_eng_blit_pso];
      [e setFragmentTexture:src atIndex:0];
@@ -15157,7 +15661,7 @@ index d04b34e..856cea9 100644
  /* Encode everything recorded so far and commit it.
   *
   * The staging arena is recycled the moment this returns, which is safe
-@@ -3027,7 +3462,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -3027,7 +3464,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
   * in-flight semaphore instead, the same bound the vtable path uses, because
   * waiting on every frame is the one pattern where a driver cannot hide its
   * encoding work. */
@@ -15170,7 +15674,7 @@ index d04b34e..856cea9 100644
  {
      @autoreleasepool {
          id<CAMetalDrawable> drawable = nil;
-@@ -3038,11 +3477,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3038,11 +3479,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              if (s_headless) {
                  dst = s_offscreen;
              } else {
@@ -15183,7 +15687,7 @@ index d04b34e..856cea9 100644
                  dst = [drawable texture];
              }
          }
-@@ -3052,8 +3487,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3052,8 +3489,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
                                        options:MTLResourceStorageModeShared];
          id<MTLCommandBuffer> cb = [s_queue commandBuffer];
@@ -15206,7 +15710,7 @@ index d04b34e..856cea9 100644
          if (drawable) [cb presentDrawable:drawable];
          if (windowed_present) {
              dispatch_semaphore_t sem = s_inflight;
-@@ -3064,17 +3512,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3064,17 +3514,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              [cb commit];
          } else {
              [cb commit];
@@ -15229,7 +15733,7 @@ index d04b34e..856cea9 100644
      }
  }
  
-@@ -3085,7 +3537,10 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3085,7 +3539,10 @@ static void eng_dump_frame(id<MTLTexture> src)
      const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
      if (!path || !*path) return;
      static unsigned frame;
@@ -15241,7 +15745,7 @@ index d04b34e..856cea9 100644
      if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
          [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
      size_t w = [src width], h = [src height];
-@@ -3099,6 +3554,8 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3099,6 +3556,8 @@ static void eng_dump_frame(id<MTLTexture> src)
      }
      [src getBytes:rgba bytesPerRow:w * 4
        fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
@@ -15250,7 +15754,7 @@ index d04b34e..856cea9 100644
      FILE* f = fopen(path, "wb");
      if (f) {
          fprintf(f, "P6\n%zu %zu\n255\n", w, h);
-@@ -3114,13 +3571,131 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3114,13 +3573,132 @@ static void eng_dump_frame(id<MTLTexture> src)
      free(rgba);
  }
  
@@ -15372,6 +15876,7 @@ index d04b34e..856cea9 100644
 +    int display = src && (!cap || now - last_display >= 1.0 / cap - 0.0005);
 +    s_eng_skip_display = !display && !s_headless;
 +    s_eng_last_submission = eng_encode_and_commit(display ? src : nil);
++    ps3_host_frame_event(now, s_eng_last_submission != 0, s_eng_last_submission == 2 && !s_headless);
 +    if (s_eng_last_submission == 2 && !s_headless) { last_display = now; display_frames++; }
 +    s_eng_skip_display = 0;
 +    if (!fps_start) fps_start = now;
@@ -15385,7 +15890,7 @@ index d04b34e..856cea9 100644
  }
  
  static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-@@ -3129,6 +3704,19 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -3129,6 +3707,19 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
      (void)user;
      id<MTLTexture> t = eng_obj(surface);
      if (!t || !out || !out_pitch || !w || !h) return;
@@ -15405,7 +15910,7 @@ index d04b34e..856cea9 100644
      if (x + w > [t width] || y + h > [t height]) return;
      [t getBytes:out bytesPerRow:out_pitch
       fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
-@@ -3162,6 +3750,7 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -3162,6 +3753,7 @@ static const rsx_draw_backend s_engine_backend = {
      .draw                 = eng_draw,
      .clear_color          = eng_clear_color,
      .clear_depth_stencil  = eng_clear_depth_stencil,
@@ -15413,7 +15918,7 @@ index d04b34e..856cea9 100644
      .present              = eng_present,
      .readback             = eng_readback,
  };
-@@ -3171,6 +3760,12 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -3171,6 +3763,12 @@ static const rsx_draw_backend s_engine_backend = {
  int rsx_metal_backend_init(u32 width, u32 height, const char* title)
  {
      @autoreleasepool {
@@ -15426,7 +15931,7 @@ index d04b34e..856cea9 100644
          if (width)  s_width  = width;
          if (height) s_height = height;
  
-@@ -3238,16 +3833,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+@@ -3238,16 +3836,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
           * instead of the rsx_state vtable. The vtable stays registered only on
           * the path that uses it: the FIFO walker feeds both models, so leaving
           * both live would record every draw twice. */
@@ -15450,7 +15955,7 @@ index d04b34e..856cea9 100644
          } else {
              rsx_set_backend(&s_backend_vtable);
          }
-@@ -3263,6 +3860,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+@@ -3263,6 +3863,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
  void rsx_metal_backend_shutdown(void)
  {
      @autoreleasepool {
@@ -15464,7 +15969,7 @@ index d04b34e..856cea9 100644
          if (s_ready) rsx_set_backend(NULL);
          if (s_eng_active) rsx_draw_engine_shutdown();
          rsx_draw_engine_set_backend(NULL);
-@@ -3279,7 +3883,15 @@ void rsx_metal_backend_shutdown(void)
+@@ -3279,7 +3886,15 @@ void rsx_metal_backend_shutdown(void)
              s_inflight = nil;
          }
  #if !TARGET_OS_IPHONE
@@ -15481,7 +15986,7 @@ index d04b34e..856cea9 100644
  #endif
          free(s_verts); s_verts = NULL;
          free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
-@@ -3339,10 +3951,9 @@ int rsx_metal_backend_pump_messages(void)
+@@ -3339,10 +3954,9 @@ int rsx_metal_backend_pump_messages(void)
  void rsx_metal_backend_present(void)
  {
      if (!s_ready) return;
@@ -15495,7 +16000,7 @@ index d04b34e..856cea9 100644
      /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
      if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
      @autoreleasepool {
-@@ -3420,6 +4031,7 @@ void rsx_metal_backend_present(void)
+@@ -3420,6 +4034,7 @@ void rsx_metal_backend_present(void)
              encode_draw(enc, &rec->u.draw, &ps);
          }
          if (enc) [enc endEncoding];
@@ -15503,7 +16008,7 @@ index d04b34e..856cea9 100644
  
          if (drawable) [cb presentDrawable:drawable];
  
-@@ -3436,6 +4048,8 @@ void rsx_metal_backend_present(void)
+@@ -3436,6 +4051,8 @@ void rsx_metal_backend_present(void)
              [cb commit];        /* no wait: the CPU goes on to the next frame */
          }
  
@@ -15512,7 +16017,7 @@ index d04b34e..856cea9 100644
          if (s_dropped_records) {
              fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
                      s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
-@@ -3478,3 +4092,6 @@ u32 rsx_metal_backend_guest_draws(void)
+@@ -3478,3 +4095,6 @@ u32 rsx_metal_backend_guest_draws(void)
  {
      return s_eng_active ? rsx_draw_engine_guest_draws() : s_last_guest_draws;
  }
@@ -15541,13 +16046,14 @@ index 0000000..90f87b5
 +#endif
 diff --git a/libs/video/rsx_metal_overlay.m b/libs/video/rsx_metal_overlay.m
 new file mode 100644
-index 0000000..dbf0a9a
+index 0000000..2ff24a6
 --- /dev/null
 +++ b/libs/video/rsx_metal_overlay.m
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,335 @@
 +/* CoreText rasterizes on model changes. A compositor timer keeps UI alive
 + * over the preserved guest frame while blocking SaveData stops guest flips. */
 +#import <CoreText/CoreText.h>
++#import <AppKit/AppKit.h>
 +#import "rsx_metal_overlay.h"
 +#include <pthread.h>
 +#include <stdlib.h>
@@ -15567,6 +16073,7 @@ index 0000000..dbf0a9a
 +static id<MTLTexture> s_background, s_composed, s_text;
 +static uint64_t s_revision;
 +static int s_was_active;
++static int s_has_frame;
 +static SysOverlaySnapshot s_snapshot; /* protected by compositor lock */
 +static unsigned s_capture_frame;
 +static uint64_t s_capture_revision;
@@ -15743,6 +16250,49 @@ index 0000000..dbf0a9a
 +        free(pixels);
 +    }];
 +}
++
++/* Reuse the compositor's preserved frame, including a blocking guest dialog.
++ * Queue ordering snapshots it before a later flip can replace its pixels. */
++void rsx_metal_backend_capture_png(const char* path, void (*done)(void*, int), void* user)
++{
++    NSString* filename = path ? [NSString stringWithUTF8String:path] : nil;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
++        pthread_mutex_lock(&s_lock);
++        id<MTLTexture> source = s_has_frame ? (s_was_active ? s_composed : s_background) : nil;
++        id<MTLTexture> image = source ? sized_texture(source.width, source.height) : nil;
++        id<MTLCommandBuffer> cb = image && filename ? [s_queue commandBuffer] : nil;
++        if (!cb) {
++            pthread_mutex_unlock(&s_lock);
++            if (done) done(user, 0);
++            return;
++        }
++        draw(cb, source, image, 0);
++        [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
++            BOOL gpu_ok = completed.status != MTLCommandBufferStatusError;
++            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
++                BOOL ok = NO;
++                NSBitmapImageRep* bitmap = gpu_ok ? [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
++                    pixelsWide:image.width pixelsHigh:image.height bitsPerSample:8 samplesPerPixel:4
++                    hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace
++                    bytesPerRow:image.width * 4 bitsPerPixel:32] : nil;
++                if (bitmap) {
++                    [image getBytes:bitmap.bitmapData bytesPerRow:bitmap.bytesPerRow
++                        fromRegion:MTLRegionMake2D(0, 0, image.width, image.height) mipmapLevel:0];
++                    unsigned char* pixels = bitmap.bitmapData;
++                    for (NSUInteger i = 0; i < image.width * image.height; i++) {
++                        unsigned char r = pixels[i*4]; pixels[i*4] = pixels[i*4+2]; pixels[i*4+2] = r;
++                    }
++                    NSData* png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
++                    ok = png && [png writeToFile:filename options:NSDataWritingAtomic error:nil];
++                }
++                fprintf(stderr, "[rsx metal] issue PNG %s: %s\n", ok ? "saved" : "failed", filename.UTF8String);
++                if (done) done(user, ok);
++            } });
++        }];
++        [cb commit];
++        pthread_mutex_unlock(&s_lock);
++    } });
++}
 +static void repaint(void)
 +{
 +    ps3_overlay_poll(); /* no renderer lock across main-queue pad polling */
@@ -15815,6 +16365,7 @@ index 0000000..dbf0a9a
 +        s_background = background; s_composed = composed;
 +    }
 +    draw(cb, guest, s_background, 0);
++    s_has_frame = 1;
 +    ps3_overlay_snapshot(&s_snapshot);
 +    if (s_snapshot.active) compose(cb, &s_snapshot);
 +    capture(cb, &s_snapshot, s_snapshot.active ? s_composed : guest);
@@ -15830,7 +16381,7 @@ index 0000000..dbf0a9a
 +    s_layer = nil; s_device = nil; s_queue = nil; s_inflight = nil;
 +    s_background = nil; s_composed = nil; s_text = nil;
 +    s_library = nil; s_copy = nil; s_blend = nil; s_display_copy = nil;
-+    s_was_active = 0; s_revision = 0;
++    s_was_active = 0; s_has_frame = 0; s_revision = 0;
 +    pthread_mutex_unlock(&s_lock);
 +    ps3_overlay_set_renderer(0);
 +}
@@ -16148,10 +16699,10 @@ index 704ccef..d567e3c 100644
      test_scissor();
 diff --git a/runtime/platform/guest_poll.c b/runtime/platform/guest_poll.c
 new file mode 100644
-index 0000000..9b6a03d
+index 0000000..c8b3b33
 --- /dev/null
 +++ b/runtime/platform/guest_poll.c
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,284 @@
 +/* Polling is a scheduling hint, never a substitute for a guest read/DMA.
 + * Notifications cover PPU stores and SPU writes. HLE/direct mapped writes
 + * need not notify: every wait is bounded to 100 us and callers re-read.
@@ -16173,8 +16724,9 @@ index 0000000..9b6a03d
 +#define POLL_BUCKETS 256
 +/* A finer line filter avoids broadcasting to unrelated waiters sharing a
 + * mutex bucket. Collisions only cause extra work, never missed wakeups. */
-+#define POLL_LINES 4096
-+static atomic_uint s_lines[POLL_LINES];
++#define POLL_LINES PS3_POLL_LINES
++unsigned ps3_poll_waiters;
++unsigned ps3_poll_lines[POLL_LINES];
 +typedef struct poll_bucket {
 +    pthread_mutex_t lock;
 +    pthread_cond_t changed;
@@ -16311,9 +16863,12 @@ index 0000000..9b6a03d
 +    poll_bucket* b = poll_slot(ea);
 +    pthread_mutex_lock(&b->lock);
 +    atomic_fetch_add_explicit(&b->waiters, 1, memory_order_seq_cst);
-+    atomic_fetch_add_explicit(&s_lines[(ea >> 7) & (POLL_LINES - 1)], 1, memory_order_seq_cst);
++    __atomic_fetch_add(&ps3_poll_lines[(ea >> 7) & (POLL_LINES - 1)], 1, __ATOMIC_SEQ_CST);
++    __atomic_fetch_add(&ps3_poll_waiters, 1, __ATOMIC_SEQ_CST);
 +    /* Register before checking the value, under the same lock as notify.
-+     * A store racing registration is either seen here or wakes the wait. */
++     * A store racing registration is seen here, wakes the wait, or (if the
++     * relaxed global guard missed registration) is seen after the bounded
++     * timeout. Guest memory and filters alone are not a Dekker handshake. */
 +    if (!memcmp(vm_base + ea, value, size)) {
 +#ifdef __APPLE__
 +        struct timespec delay = {0, 100000};
@@ -16326,18 +16881,19 @@ index 0000000..9b6a03d
 +        pthread_cond_timedwait(&b->changed, &b->lock, &deadline);
 +#endif
 +    }
-+    atomic_fetch_sub_explicit(&s_lines[(ea >> 7) & (POLL_LINES - 1)], 1, memory_order_seq_cst);
++    __atomic_fetch_sub(&ps3_poll_lines[(ea >> 7) & (POLL_LINES - 1)], 1, __ATOMIC_SEQ_CST);
 +    atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
++    __atomic_fetch_sub(&ps3_poll_waiters, 1, __ATOMIC_SEQ_CST);
 +    pthread_mutex_unlock(&b->lock);
 +}
-+void ps3_poll_notify(uint32_t ea, uint32_t size)
++void ps3_poll_notify_slow(uint32_t ea, uint32_t size)
 +{
 +    if (!size) return;
 +    uint32_t last = (uint32_t)(((uint64_t)ea + size - 1) >> 7);
 +    for (uint32_t line = ea >> 7; line <= last; line++) {
 +        /* Register the filter before the under-lock value recheck, just like
 +         * the bucket count. A racing store is observed or wakes the waiter. */
-+        if (!atomic_load_explicit(&s_lines[line & (POLL_LINES - 1)], memory_order_seq_cst)) continue;
++        if (!__atomic_load_n(&ps3_poll_lines[line & (POLL_LINES - 1)], __ATOMIC_SEQ_CST)) continue;
 +        poll_bucket* b = poll_slot(line << 7);
 +        if (!atomic_load_explicit(&b->waiters, memory_order_seq_cst)) continue;
 +        pthread_mutex_lock(&b->lock);
@@ -16425,7 +16981,6 @@ index 0000000..9b6a03d
 +    (void)ea; (void)value; (void)size;
 +    if (repeats >= 32) SwitchToThread();
 +}
-+void ps3_poll_notify(uint32_t ea, uint32_t size) { (void)ea; (void)size; }
 +void ps3_poll_thread_start(const char* name, int interactive) { (void)name; (void)interactive; }
 +void ps3_guest_worker_register(int joinable) { (void)joinable; }
 +void ps3_guest_workers_request_stop(void) {}
@@ -16434,10 +16989,10 @@ index 0000000..9b6a03d
 +#endif
 diff --git a/runtime/platform/guest_poll.h b/runtime/platform/guest_poll.h
 new file mode 100644
-index 0000000..39733e8
+index 0000000..3309324
 --- /dev/null
 +++ b/runtime/platform/guest_poll.h
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,44 @@
 +/* Bounded host waits for unchanged guest-memory polls. */
 +#ifndef PS3_GUEST_POLL_H
 +#define PS3_GUEST_POLL_H
@@ -16447,7 +17002,29 @@ index 0000000..39733e8
 +#endif
 +extern int ps3_poll_enabled;
 +void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
-+void ps3_poll_notify(uint32_t ea, uint32_t size);
++#ifndef _WIN32
++/* Atomic builtins keep this header usable by both C and C++ callers. The
++ * relaxed guard is only a scheduling hint: a racing registration can miss
++ * one notification, but the under-lock recheck / 100us timeout still applies.
++ * Do not use this guard for an unbounded condition wait (Dekker requires
++ * store->load ordering on BOTH sides, not just an acquire load here). */
++extern unsigned ps3_poll_waiters;
++#define PS3_POLL_LINES 4096
++extern unsigned ps3_poll_lines[PS3_POLL_LINES];
++void ps3_poll_notify_slow(uint32_t ea, uint32_t size);
++static inline void ps3_poll_notify(uint32_t ea, uint32_t size)
++{
++    if (!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_RELAXED) || !size) return;
++    /* Most stores touch one line. Unrelated active waiters need no call or
++     * bucket lookup either. Crossing stores use the complete slow scan. */
++    if (size <= 128 - (ea & 127) &&
++        !__atomic_load_n(&ps3_poll_lines[(ea >> 7) & (PS3_POLL_LINES - 1)], __ATOMIC_RELAXED)) return;
++    ps3_poll_notify_slow(ea, size);
++}
++#else
++static inline void ps3_poll_notify(uint32_t ea, uint32_t size)
++{ (void)ea; (void)size; }
++#endif
 +/* Register runtime-owned guest workers; host render/main threads are owned by
 + * the runner. Stop is deferred, after the host has quiesced persistent I/O.
 + * On POSIX, wait for stopped() while pumping host events, then join(). */
@@ -16462,14 +17039,15 @@ index 0000000..39733e8
 +#endif
 diff --git a/runtime/platform/tests/test_guest_poll.c b/runtime/platform/tests/test_guest_poll.c
 new file mode 100644
-index 0000000..97278e0
+index 0000000..d206981
 --- /dev/null
 +++ b/runtime/platform/tests/test_guest_poll.c
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,79 @@
 +/* Standalone: cc -std=c17 -pthread test_guest_poll.c ../guest_poll.c */
 +#include "../guest_poll.h"
 +#include <assert.h>
 +#include <pthread.h>
++#include <sched.h>
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <string.h>
@@ -16490,6 +17068,13 @@ index 0000000..97278e0
 +    __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
 +    /* Deliberately straddles two cache lines. */
 +    if (unused) ps3_poll_notify(127, 5);
++    return NULL;
++}
++static void* race_publish(void* unused)
++{
++    if ((uintptr_t)unused & 1) sched_yield();
++    __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
++    if ((uintptr_t)unused & 2) ps3_poll_notify(128, 4);
 +    return NULL;
 +}
 +int main(void)
@@ -16519,15 +17104,30 @@ index 0000000..97278e0
 +        }
 +        pthread_join(writer, NULL);
 +    }
-+    puts("guest poll: bounded wait, changed-before-wait, concurrent notified/unnotified writes PASS");
++    /* Race publication against zero->one waiter registration, including
++     * deliberately omitted notifications. The production 100us timeout must
++     * cover a relaxed-filter miss; no unbounded condition wait is permitted. */
++    for (unsigned i = 0; i < 10000; i++) {
++        __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
++        pthread_t writer;
++        assert(!pthread_create(&writer, NULL, race_publish, (void*)(uintptr_t)i));
++        start = now();
++        while (!__atomic_load_n((uint32_t*)(memory + 128), __ATOMIC_ACQUIRE)) {
++            ps3_poll_backoff(40, 128, &zero, 4);
++            assert(now() - start < 1.0);
++        }
++        pthread_join(writer, NULL);
++        assert(!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_RELAXED));
++    }
++    puts("guest poll: bounded wait, changed-before-wait, 10000 notified/unnotified registration races PASS");
 +    return 0;
 +}
 diff --git a/runtime/platform/tests/test_guest_poll_filter.c b/runtime/platform/tests/test_guest_poll_filter.c
 new file mode 100644
-index 0000000..0352cf2
+index 0000000..72b7875
 --- /dev/null
 +++ b/runtime/platform/tests/test_guest_poll_filter.c
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,116 @@
 +/* Standalone: clang -O2 -std=gnu17 -pthread test_guest_poll_filter.c -o test_guest_poll_filter
 + * Include the implementation to observe registration without production hooks.
 + * Extend only this test's wait to 200ms, so a missed notification cannot hide
@@ -16566,8 +17166,19 @@ index 0000000..0352cf2
 +#define pthread_cond_timedwait test_wait
 +#endif
 +#define pthread_cond_broadcast test_broadcast
++/* The header's inline guard calls this wrapper; rename only the implementation
++ * so the test can prove that empty/unrelated filters avoid the slow call. */
++#include "../guest_poll.h"
++#define ps3_poll_notify_slow poll_notify_impl
 +#include "../guest_poll.c"
++#undef ps3_poll_notify_slow
 +#undef pthread_cond_broadcast
++static atomic_uint slow_calls;
++void ps3_poll_notify_slow(uint32_t ea, uint32_t size)
++{
++    atomic_fetch_add(&slow_calls, 1);
++    poll_notify_impl(ea, size);
++}
 +static uint8_t memory[1024];
 +uint8_t* vm_base = memory;
 +static double now(void)
@@ -16585,6 +17196,13 @@ index 0000000..0352cf2
 +int main(void)
 +{
 +    ps3_poll_thread_start("poll filter test", 0);
++    /* Empty global filter must bypass even a positive/colliding line filter.
++     * No initializer, mutex or broadcast is needed on this path. */
++    __atomic_store_n(&ps3_poll_lines[1], 1, __ATOMIC_RELAXED);
++    for (unsigned i = 0; i < 1000000; i++) ps3_poll_notify(128, 4);
++    assert(!atomic_load(&broadcasts));
++    assert(!atomic_load(&slow_calls));
++    __atomic_store_n(&ps3_poll_lines[1], 0, __ATOMIC_RELAXED);
 +    uint32_t zero = 0;
 +    uint32_t collision = 256;
 +    while (poll_slot(collision) != poll_slot(128) ||
@@ -16594,17 +17212,25 @@ index 0000000..0352cf2
 +        pthread_t waiter;
 +        assert(!pthread_create(&waiter, NULL, wait_once, NULL));
 +        double start = now();
-+        while (!atomic_load(&s_lines[1])) { sched_yield(); assert(now() - start < 1); }
++        while (!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_ACQUIRE)) { sched_yield(); assert(now() - start < 1); }
++        /* Take the registration lock while the value is still zero. Returning
++         * from this acquisition means the waiter released it in cond_wait. */
++        pthread_mutex_lock(&poll_slot(128)->lock);
++        pthread_mutex_unlock(&poll_slot(128)->lock);
 +        /* Hash collision has no waiter on this line: no broadcast/lock. */
 +        unsigned old = atomic_load(&broadcasts);
++        unsigned old_calls = atomic_load(&slow_calls);
 +        ps3_poll_notify(collision, 4);
 +        assert(atomic_load(&broadcasts) == old);
++        assert(atomic_load(&slow_calls) == old_calls);
 +        __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
 +        start = now();
 +        ps3_poll_notify(127, 5); /* crosses into the watched line */
++        assert(atomic_load(&slow_calls) == old_calls + 1);
 +        pthread_join(waiter, NULL);
 +        assert(now() - start < 0.1); /* shorter than test timeout */
-+        assert(!atomic_load(&s_lines[1]));
++        assert(!__atomic_load_n(&ps3_poll_lines[1], __ATOMIC_RELAXED));
++        assert(!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_RELAXED));
 +        assert(!atomic_load(&poll_slot(128)->waiters));
 +    }
 +    /* Publication before registration must skip the condition wait. */
@@ -16615,7 +17241,7 @@ index 0000000..0352cf2
 +    start = now();
 +    ps3_poll_backoff(40, 127, &zero, 4);
 +    assert(now() - start < 0.1);
-+    puts("guest poll filter: 1000 registration races, hash collision, crossing store, prior publication PASS");
++    puts("guest poll filter: empty global fast path, 1000 registrations, hash collision, crossing store, prior publication PASS");
 +    return 0;
 +}
 diff --git a/runtime/platform/thread_lifecycle.h b/runtime/platform/thread_lifecycle.h
@@ -17096,7 +17722,7 @@ index acbaf12..1655114 100644
      /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
       * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index e73a151..558e187 100644
+index e73a151..e2861b8 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
 @@ -20,10 +20,12 @@
@@ -17180,7 +17806,7 @@ index e73a151..558e187 100644
      if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
          /* Report as two words: the watch window is word-granular, and a
           * doubleword CAS on a counter pair is exactly the case worth seeing. */
-@@ -1434,10 +1450,44 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
+@@ -1434,10 +1450,76 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
  static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
  static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
  
@@ -17188,15 +17814,47 @@ index e73a151..558e187 100644
 + * requires an unchanged value, and keeps detection active with tracing off.
 + * All widths share one sequence: return-address stack loads in otherwise
 + * active code are not spin waits. Any intervening store resets the sequence. */
-+static PPU_THREAD_LOCAL uint32_t ppu_poll_store_epoch;
++struct PpuPoll { uint32_t ea, size, repeats; uint64_t value; };
++static PPU_THREAD_LOCAL PpuPoll s_poll_state = {};
++/* Keep scheduling state together: one TLS lookup on a read, and no separate
++ * store epoch. A store invalidates the sequence even if the next value/address
++ * is identical, so active read/store loops never become spin waits. */
++static inline PpuPoll* ppu_poll_state()
++{
++    return &s_poll_state;
++}
++#ifdef __APPLE__
++/* Stores only need to invalidate the sequence. Darwin's public pthread key
++ * lookup is cheaper here than resolving Mach-O TLS on every store. Reads keep
++ * their single TLS lookup (benchmarks show it is faster for that larger path).
++ * Both paths refer to the same TLS object; only the first store resolves it. */
++static const pthread_key_t s_poll_key = [] {
++    pthread_key_t key;
++    if (pthread_key_create(&key, nullptr)) abort();
++    return key;
++}();
++static __attribute__((noinline)) PpuPoll* ppu_poll_store_init()
++{
++    PpuPoll* p = ppu_poll_state();
++    if (pthread_setspecific(s_poll_key, p)) abort();
++    return p;
++}
++static inline void ppu_poll_store()
++{
++    auto* p = (PpuPoll*)pthread_getspecific(s_poll_key);
++    if (__builtin_expect(p == nullptr, 0)) p = ppu_poll_store_init();
++    p->size = 0;
++}
++#else
++static inline void ppu_poll_store() { ppu_poll_state()->size = 0; }
++#endif
 +static inline void ppu_poll_read(uint32_t ea, void* value, uint32_t size)
 +{
-+    struct Poll { uint32_t ea, size, repeats, epoch; uint64_t value; };
-+    static PPU_THREAD_LOCAL Poll p = {};
++    PpuPoll& p = *ppu_poll_state();
 +    uint64_t v = 0;
 +    memcpy(&v, value, size);
-+    if (p.ea != ea || p.size != size || p.value != v || p.epoch != ppu_poll_store_epoch) {
-+        p.ea = ea; p.size = size; p.value = v; p.epoch = ppu_poll_store_epoch;
++    if (p.ea != ea || p.size != size || p.value != v) {
++        p.ea = ea; p.size = size; p.value = v;
 +        p.repeats = 0; return;
 +    }
 +    if (p.repeats < 264) p.repeats++;
@@ -17221,11 +17879,11 @@ index e73a151..558e187 100644
   * them, until SPU code runs) it is the plain memcpy it replaced. */
  #define VM_WRITE_COH(a, src, n)                                               \
      do {                                                                      \
-+        ppu_poll_store_epoch++;                                               \
++        ppu_poll_store();                                                     \
          if (spu_coh_is_reserved((uint32_t)(a))) {                             \
              spu_lockline_lock();                                              \
              memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
-@@ -1446,10 +1496,13 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
+@@ -1446,10 +1528,13 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
          } else {                                                              \
              memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
          }                                                                     \
@@ -17239,21 +17897,20 @@ index e73a151..558e187 100644
  static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
  {
      static int64_t s_lo = -2; static uint32_t s_len = 0x10;
-@@ -1517,6 +1570,13 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
+@@ -1517,6 +1602,12 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
      fflush(stderr);
  }
  
 +static int ppu_spinbt_enabled(void)
 +{
-+    static PPU_THREAD_LOCAL int enabled = -1;
-+    if (enabled < 0) enabled = getenv("PPU_SPINBT") != nullptr;
++    static const bool enabled = getenv("PPU_SPINBT") != nullptr;
 +    return enabled;
 +}
 +
  uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
      if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
  #ifdef VM_SAMPLE_READS
-@@ -1544,58 +1604,24 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
+@@ -1544,58 +1635,24 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
       *
       * Every width shares one window so a byte-at-a-time strcmp is caught as
       * readily as a word load. */
@@ -17324,7 +17981,7 @@ index e73a151..558e187 100644
      { static int64_t rw=-2; if (rw==-2) { const char* e=getenv("YDKJ_RWATCH"); rw=e?(int64_t)strtoul(e,0,0):-1; }
        if (rw>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)rw && ea<(uint32_t)rw+0x80) {
          static int _n=0; if (_n<40) {
-@@ -1636,8 +1662,8 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
+@@ -1636,8 +1693,8 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
            for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
      /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
       * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
@@ -17335,7 +17992,7 @@ index e73a151..558e187 100644
                /* A spin on the GCM control block is a fence/FIFO wait. Print the
                 * WHOLE block: put vs get says whether the RSX side is behind or
                 * whether the guest never submitted, which is the difference
-@@ -1653,7 +1679,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
+@@ -1653,7 +1710,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
                fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
                        "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
            } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
@@ -17344,7 +18001,7 @@ index e73a151..558e187 100644
  #ifdef _WIN32
          /* PPU_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
           * is on the watched address -- names the guest function containing the
-@@ -1669,14 +1695,66 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
+@@ -1669,14 +1726,66 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
  #endif
        } }
        else { last=(uint32_t)a; n=0; } }
@@ -17413,7 +18070,7 @@ index e73a151..558e187 100644
  #ifdef _WIN32
          { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
            if(wa>=0 && (uint32_t)a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
-@@ -1697,6 +1775,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
+@@ -1697,6 +1806,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
              if(bg&&(tgt-bh)<0x1400) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); }
            fprintf(stderr,"%s\n",ln); } } } }
  #endif
@@ -17421,7 +18078,7 @@ index e73a151..558e187 100644
      return __builtin_bswap64(v); }
  /* Self-arming write-watch on the Bink SPURS sync area (skip-freeze debug).
   * The barrier probe in the lifted code sets g_barrier_sync_watch = sync base;
-@@ -1731,7 +1810,7 @@ static void ww_arm_inline_window(uint32_t ww)
+@@ -1731,7 +1841,7 @@ static void ww_arm_inline_window(uint32_t ww)
      g_ww_lo = ww & ~15u;
      g_ww_hi = (ww & ~15u) + len;
  }
@@ -17430,7 +18087,7 @@ index e73a151..558e187 100644
  {
      /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
       * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
-@@ -1852,6 +1931,15 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
+@@ -1852,6 +1962,15 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
      }
  }
  
@@ -17446,7 +18103,7 @@ index e73a151..558e187 100644
  /* See the note on the forward declaration above ppu_stwcx32. */
  extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
  {
-@@ -3202,8 +3290,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+@@ -3202,8 +3321,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                      (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                      (unsigned)ctx->lr);
              fflush(stderr); } }
@@ -17457,7 +18114,7 @@ index e73a151..558e187 100644
              static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
              uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
              ULONGLONG _t0 = GetTickCount64();
-@@ -3270,65 +3358,98 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+@@ -3270,65 +3389,98 @@ extern "C" uint32_t ppu_load_elf(const char* path)
  {
      FILE* f = fopen(path, "rb");
      if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
@@ -17609,7 +18266,7 @@ index e73a151..558e187 100644
      free(file);
      fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
  
-@@ -3545,6 +3666,33 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
+@@ -3545,6 +3697,33 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
          s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
  }
  
@@ -17643,7 +18300,7 @@ index e73a151..558e187 100644
  extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
-@@ -3569,14 +3717,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3569,14 +3748,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                  vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
          return 0; }
  
@@ -17660,7 +18317,7 @@ index e73a151..558e187 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3595,7 +3740,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3595,7 +3771,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
      ctx.thread_id = saved_active ? saved_active->thread_id
                                   : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
  #else
@@ -17669,7 +18326,7 @@ index e73a151..558e187 100644
  #endif
      g_active_ctx = &ctx;
      fn(&ctx);
-@@ -3616,12 +3761,11 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3616,12 +3792,11 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      ppu_fn fn = ppu_lookup(code);
      if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
  
@@ -17684,7 +18341,7 @@ index e73a151..558e187 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3635,7 +3779,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3635,7 +3810,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      ctx.thread_id = saved_active ? saved_active->thread_id
                                   : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
  #else
@@ -17693,7 +18350,7 @@ index e73a151..558e187 100644
  #endif
      g_active_ctx = &ctx;
      fn(&ctx);
-@@ -3646,12 +3790,52 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3646,12 +3821,52 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
  
  extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
  {
@@ -17746,6 +18403,11 @@ index e73a151..558e187 100644
      g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
      uint32_t code = 0, toc = 0;
      ppu_opd_resolve(entry_opd, &code, &toc);
+@@ -3867,4 +4082,3 @@ extern "C" void ppu_guest_callstack(const char* tag)
+     (void)tag;
+ #endif
+ }
+-
 diff --git a/runtime/ppu/ppu_memory.h b/runtime/ppu/ppu_memory.h
 index b3bc534..171197b 100644
 --- a/runtime/ppu/ppu_memory.h
@@ -18262,10 +18924,10 @@ index 0000000..3d40ced
 +}
 diff --git a/runtime/ppu/tests/test_loader_validation.cpp b/runtime/ppu/tests/test_loader_validation.cpp
 new file mode 100644
-index 0000000..c23a84e
+index 0000000..c2fa5f0
 --- /dev/null
 +++ b/runtime/ppu/tests/test_loader_validation.cpp
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,103 @@
 +/* Asset-free production loader validation; invalid images must not write VM. */
 +#include "ppu_recomp.h"
 +#include <assert.h>
@@ -18273,6 +18935,7 @@ index 0000000..c23a84e
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#include <time.h>
 +#include <vector>
 +extern "C" {
 +uint8_t* vm_base;
@@ -18311,6 +18974,30 @@ index 0000000..c23a84e
 +    }
 +    printf("PASS: %s%s\n",name, valid ? "" : " rejected without guest writes");
 +}
++static void check_poll_store_reset()
++{
++    timespec begin, end;
++    clock_gettime(CLOCK_MONOTONIC, &begin);
++    /* Identical reads separated by stores are work, not a spin wait. This
++     * exercises the real loader's shared read state / cached Darwin store
++     * pointer at every width; forgetting a reset would cost seconds. */
++    for (unsigned i = 0; i < 10000; i++) {
++        vm_write8(0x10000, 7); assert(vm_read8(0x10000) == 7);
++    }
++    for (unsigned i = 0; i < 10000; i++) {
++        vm_write16(0x10000, 0x1234); assert(vm_read16(0x10000) == 0x1234);
++    }
++    for (unsigned i = 0; i < 10000; i++) {
++        vm_write32(0x10000, 0x12345678); assert(vm_read32(0x10000) == 0x12345678);
++    }
++    for (unsigned i = 0; i < 10000; i++) {
++        vm_write64(0x10000, 0x123456789abcdef0ull);
++        assert(vm_read64(0x10000) == 0x123456789abcdef0ull);
++    }
++    clock_gettime(CLOCK_MONOTONIC, &end);
++    assert(end.tv_sec - begin.tv_sec + (end.tv_nsec - begin.tv_nsec) / 1e9 < 1.0);
++    puts("PASS: identical read/store work resets poll state at all widths");
++}
 +int main(int argc,char** argv)
 +{
 +    assert(argc == 2); vm_base = (uint8_t*)malloc(0x500000); assert(vm_base);
@@ -18341,6 +19028,7 @@ index 0000000..c23a84e
 +    put(b,ph+40,0x1000000,8); check(argv[1],b,false,"TLS destination overflow");
 +    put(b,ph+40,4,8); put(b,ph+16,0x20000,8); check(argv[1],b,false,"unmapped TLS template");
 +    put(b,ph+16,0x10000,8); put(b,ph+32,8,8); check(argv[1],b,false,"TLS filesz greater than memsz");
++    check_poll_store_reset();
 +    free(vm_base); remove(argv[1]); return 0;
 +}
 diff --git a/runtime/ppu/tests/test_runner_failures.py b/runtime/ppu/tests/test_runner_failures.py
@@ -18595,7 +19283,7 @@ index 4b7df8c..3bd9fc9 100644
 +
  #endif /* PS3_LOG_H */
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 0b235d0..e6ef81e 100644
+index 0b235d0..6c0a71e 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -21,9 +21,9 @@
@@ -18741,7 +19429,21 @@ index 0b235d0..e6ef81e 100644
          return 1;
  
      default:
-@@ -2032,10 +2034,10 @@ static int spu_smc_microstep(spu_context* ctx)
+@@ -1507,10 +1509,11 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+  * a stack-switching routine without going through spu_indirect_branch. */
+ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+ {
+-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
++    if (!ctx->host_depth || ctx->policy_mode || !s_stack_reset_count) return;
+     for (unsigned i = 0; i < s_stack_reset_count; ++i)
+         if (ctx->pc == s_stack_reset[i].entry &&
+-            fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
++            fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id) &&
++            s_spu_halt_armed) {
+             g_spu_trampoline_fn = 0;
+             longjmp(s_spu_halt_env, 2);
+         }
+@@ -2032,10 +2035,10 @@ static int spu_smc_microstep(spu_context* ctx)
                        " microstep set -- handing to the interpreter (steps=%d)\n",
                        ctx->image_id, pc, w, steps); }
          ctx->pc = pc;
@@ -18811,6 +19513,98 @@ index 7ac619f..9399e9b 100644
      uint32_t line = ea & ~127u;
      for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
          spu_context* c = s_coh_ctxs[i];
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 8d8e4aa..213a246 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -16,6 +16,10 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_HELPERS_SCALAR)
++#include <arm_neon.h>
++#endif
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -530,6 +534,32 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
+     }
+ }
+ 
++/* Data-only LS access for register-cached leaves. The caller gates all LS
++ * probes/watchpoints before entry; these helpers cannot observe ctx->gpr.
++ * Retain address wrapping, quadword alignment and per-word BE conversion. */
++static inline u128 spu_ls_read128_data(const uint8_t* ls, uint32_t lsa)
++{
++    u128 v;
++    const uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
++#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_HELPERS_SCALAR)
++    vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));
++#else
++    uint32_t w[4]; memcpy(w, p, sizeof w);
++    for (int i = 0; i < 4; i++) v._u32[i] = SPU_BSWAP32(w[i]);
++#endif
++    return v;
++}
++static inline void spu_ls_write128_data(uint8_t* ls, uint32_t lsa, u128 v)
++{
++#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_HELPERS_SCALAR)
++    vst1q_u8(ls + (lsa & (SPU_LS_MASK & ~0xFu)), vrev32q_u8(vld1q_u8(v._u8)));
++#else
++    uint32_t w[4];
++    for (int i = 0; i < 4; i++) w[i] = SPU_BSWAP32(v._u32[i]);
++    memcpy(ls + (lsa & (SPU_LS_MASK & ~0xFu)), w, sizeof w);
++#endif
++}
++
+ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+ {
+     u128 v;
+@@ -539,20 +569,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+     const uint8_t* p = &ctx->ls[lsa];
+     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+-#if SPU_LS_FAST
+-    uint32_t w0, w1, w2, w3;
+-    memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+-    memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
+-    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);
+-    v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
+-#else
+-    for (int i = 0; i < 4; i++) {
+-        v._u32[i] = ((uint32_t)p[i*4]     << 24) |
+-                    ((uint32_t)p[i*4 + 1] << 16) |
+-                    ((uint32_t)p[i*4 + 2] <<  8) |
+-                    (uint32_t)p[i*4 + 3];
+-    }
+-#endif
++    v = spu_ls_read128_data(ctx->ls, lsa);
+     return v;
+ }
+ 
+@@ -621,20 +638,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+      * command (commandNum==5) names the code buffer set. */
+     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+         spu_ls_write_probe_pre(ctx, lsa, val);
+-#if SPU_LS_FAST
+-    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+-    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+-    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
+-    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
+-#else
+-    for (int i = 0; i < 4; i++) {
+-        uint32_t w = val._u32[i];
+-        p[i*4]     = (uint8_t)(w >> 24);
+-        p[i*4 + 1] = (uint8_t)(w >> 16);
+-        p[i*4 + 2] = (uint8_t)(w >>  8);
+-        p[i*4 + 3] = (uint8_t)w;
+-    }
+-#endif
++    spu_ls_write128_data(ctx->ls, lsa, val);
+     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+     if (__builtin_expect(g_spu_smc_watch != 0, 0))
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
 index 90f3221..c2792d8 100644
 --- a/runtime/spu/spu_dma.h
@@ -18945,8 +19739,24 @@ index 90f3221..c2792d8 100644
  
      /* Mark tag as in-progress */
      mfc->tag_completed &= ~(1u << tag);
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 931d3b3..8964ac9 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -59,7 +59,10 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+ 
+ void spu_task_launch_check(spu_context* ctx, void* fn)
+ {
+-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
++    /* Only policy-module post-mortems consume this ring. Avoid Darwin TLV
++     * resolution at every ordinary raw-SPU/audio transfer. */
++    if (ctx->policy_mode)
++        t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
 diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
-index 0fca7f5..b06e7ab 100644
+index 0fca7f5..0878c2a 100644
 --- a/runtime/spu/spu_helpers.h
 +++ b/runtime/spu/spu_helpers.h
 @@ -17,6 +17,11 @@
@@ -18961,7 +19771,95 @@ index 0fca7f5..b06e7ab 100644
  #ifdef __cplusplus
  extern "C" {
  #endif
-@@ -180,28 +185,7 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
+@@ -99,13 +104,37 @@ static inline u128 spu_splat_u8(uint8_t v) {
+ static inline u128 spu_zero(void) { u128 r; memset(&r,0,sizeof r); return r; }
+ 
+ /* ---- integer arithmetic (SIMD) ---- */
+-static inline u128 spu_a(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]; return r; }
+-static inline u128 spu_sf(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]-a._u32[i]; return r; }
++static inline u128 spu_a(u128 a, u128 b) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vaddq_u32(vld1q_u32(a._u32), vld1q_u32(b._u32))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]; return r;
++#endif
++}
++static inline u128 spu_sf(u128 a, u128 b) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vsubq_u32(vld1q_u32(b._u32), vld1q_u32(a._u32))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]-a._u32[i]; return r;
++#endif
++}
+ static inline u128 spu_ah(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]+b._u16[i]; return r; }
+ static inline u128 spu_sfh(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=b._u16[i]-a._u16[i]; return r; }
+-static inline u128 spu_ai(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+(uint32_t)imm; return r; }
++static inline u128 spu_ai(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vaddq_u32(vld1q_u32(a._u32), vdupq_n_u32((uint32_t)imm))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+(uint32_t)imm; return r;
++#endif
++}
+ static inline u128 spu_ahi(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]+(uint16_t)imm; return r; }
+-static inline u128 spu_sfi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)imm-a._u32[i]; return r; }
++static inline u128 spu_sfi(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vsubq_u32(vdupq_n_u32((uint32_t)imm), vld1q_u32(a._u32))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)imm-a._u32[i]; return r;
++#endif
++}
+ static inline u128 spu_sfhi(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)imm-a._u16[i]; return r; }
+ 
+ /* ---- multiply (low halfword of each word × ... -> 32-bit, per SPU mpy) ----
+@@ -155,7 +184,13 @@ static inline u128 spu_clz(u128 a)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(ui
+ static inline u128 spu_cntb(u128 a) { u128 r; for(int i=0;i<16;i++){ uint8_t v=a._u8[i],c=0; while(v){c+=v&1;v>>=1;} r._u8[i]=c; } return r; }
+ 
+ /* ---- compares: all-ones / all-zeros per lane ---- */
+-static inline u128 spu_ceq(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]==b._u32[i])?0xFFFFFFFFu:0; return r; }
++static inline u128 spu_ceq(u128 a, u128 b) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vceqq_u32(vld1q_u32(a._u32), vld1q_u32(b._u32))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]==b._u32[i])?0xFFFFFFFFu:0; return r;
++#endif
++}
+ static inline u128 spu_ceqh(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]==b._u16[i])?0xFFFFu:0; return r; }
+ static inline u128 spu_ceqb(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==b._u8[i])?0xFFu:0; return r; }
+ static inline u128 spu_cgt(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>b._s32[i])?0xFFFFFFFFu:0; return r; }
+@@ -164,9 +199,27 @@ static inline u128 spu_cgtb(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u
+ static inline u128 spu_clgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>b._u32[i])?0xFFFFFFFFu:0; return r; }
+ static inline u128 spu_clgth(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>b._u16[i])?0xFFFFu:0; return r; }
+ static inline u128 spu_clgtb(u128 a, u128 b){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>b._u8[i])?0xFFu:0; return r; }
+-static inline u128 spu_ceqi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]==imm)?0xFFFFFFFFu:0; return r; }
+-static inline u128 spu_cgti(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>imm)?0xFFFFFFFFu:0; return r; }
+-static inline u128 spu_clgti(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>(uint32_t)imm)?0xFFFFFFFFu:0; return r; }
++static inline u128 spu_ceqi(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vceqq_s32(vld1q_s32(a._s32), vdupq_n_s32(imm))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]==imm)?0xFFFFFFFFu:0; return r;
++#endif
++}
++static inline u128 spu_cgti(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vcgtq_s32(vld1q_s32(a._s32), vdupq_n_s32(imm))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>imm)?0xFFFFFFFFu:0; return r;
++#endif
++}
++static inline u128 spu_clgti(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u32(r._u32, vcgtq_u32(vld1q_u32(a._u32), vdupq_n_u32((uint32_t)imm))); return r;
++#else
++    u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>(uint32_t)imm)?0xFFFFFFFFu:0; return r;
++#endif
++}
+ 
+ /* ---- select / shuffle ---- */
+ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
+@@ -180,28 +233,7 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
   *   sel & 0xC0 == 0xC0 -> 0xFF
   *   sel & 0xC0 == 0x80 -> 0x00
   *   otherwise           -> concat{a,b}[sel & 0x1F] */
@@ -18991,7 +19889,7 @@ index 0fca7f5..b06e7ab 100644
      /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
       * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
       * control, and the result) through SPU_W so a control supplied as an immediate
-@@ -223,31 +207,43 @@ static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+@@ -223,31 +255,43 @@ static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
      }
      return r;
  }
@@ -19060,7 +19958,7 @@ index 0fca7f5..b06e7ab 100644
  
  /* ---- shift / rotate immediate (word lanes) ---- */
  static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
-@@ -257,8 +253,31 @@ static inline u128 spu_rothi(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i
+@@ -257,8 +301,31 @@ static inline u128 spu_rothi(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i
  static inline u128 spu_rotmi(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); return r; }
  static inline u128 spu_rotmai(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
  static inline u128 spu_rotmhi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
@@ -19094,7 +19992,7 @@ index 0fca7f5..b06e7ab 100644
  /* Bit-level quadword shifts/rotates operate on the WHOLE 128-bit big-endian
   * value. Our _u64[0]/_u64[1] are word-SCRAMBLED (host-LE: _u64[0] = word0 |
   * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
-@@ -287,10 +306,53 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
+@@ -287,10 +354,56 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
      for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
  static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
      for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
@@ -19103,21 +20001,21 @@ index 0fca7f5..b06e7ab 100644
 -static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
 -static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
 +#if defined(SPU_HELPERS_NEON)
-+/* Scalar FMADD and vector FMLA may select different NaN payloads when more
-+ * than one operand is NaN. Keep the reference result in those rare cases. */
-+static inline int spu_has_nan(u128 a, u128 b, u128 c) {
-+    uint32x4_t magnitude = vdupq_n_u32(0x7FFFFFFFu);
-+    uint32x4_t largest = vmaxq_u32(vandq_u32(vld1q_u32(a._u32), magnitude),
-+                                 vandq_u32(vld1q_u32(b._u32), magnitude));
-+    largest = vmaxq_u32(largest, vandq_u32(vld1q_u32(c._u32), magnitude));
-+    return vmaxvq_u32(largest) > 0x7F800000u;
++/* Scalar FMADD and vector FMLA may select different NaN payloads. Any NaN
++ * operand produces a NaN result, so classify the RESULT once rather than all
++ * operands. Recompute NaN lanes via the reference (including Inf invalid ops).
++ * This preserves the existing host-fmaf contract, not hardware extended SPU FP. */
++static inline int spu_result_has_nan(u128 r) {
++    uint32x4_t magnitude = vandq_u32(vld1q_u32(r._u32), vdupq_n_u32(0x7FFFFFFFu));
++    return vmaxvq_u32(magnitude) > 0x7F800000u;
 +}
 +#endif
 +static inline u128 spu_fm_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
 +static inline u128 spu_fm(u128 a, u128 b) {
 +#if defined(SPU_HELPERS_NEON)
-+    if (spu_has_nan(a, b, spu_zero())) return spu_fm_ref(a, b);
-+    u128 r; vst1q_f32(r._f32, vmulq_f32(vld1q_f32(a._f32), vld1q_f32(b._f32))); return r;
++    u128 r; vst1q_f32(r._f32, vmulq_f32(vld1q_f32(a._f32), vld1q_f32(b._f32)));
++    if (__builtin_expect(spu_result_has_nan(r), 0)) return spu_fm_ref(a, b);
++    return r;
 +#else
 +    return spu_fm_ref(a, b);
 +#endif
@@ -19125,8 +20023,9 @@ index 0fca7f5..b06e7ab 100644
 +static inline u128 spu_fma_ref(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
 +static inline u128 spu_fma(u128 a, u128 b, u128 c) {
 +#if defined(SPU_HELPERS_NEON)
-+    if (spu_has_nan(a, b, c)) return spu_fma_ref(a, b, c);
-+    u128 r; vst1q_f32(r._f32, vfmaq_f32(vld1q_f32(c._f32), vld1q_f32(a._f32), vld1q_f32(b._f32))); return r;
++    u128 r; vst1q_f32(r._f32, vfmaq_f32(vld1q_f32(c._f32), vld1q_f32(a._f32), vld1q_f32(b._f32)));
++    if (__builtin_expect(spu_result_has_nan(r), 0)) return spu_fma_ref(a, b, c);
++    return r;
 +#else
 +    return spu_fma_ref(a, b, c);
 +#endif
@@ -19134,8 +20033,9 @@ index 0fca7f5..b06e7ab 100644
 +static inline u128 spu_fms_ref(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
 +static inline u128 spu_fms(u128 a, u128 b, u128 c) {
 +#if defined(SPU_HELPERS_NEON)
-+    if (spu_has_nan(a, b, c)) return spu_fms_ref(a, b, c);
-+    u128 r; vst1q_f32(r._f32, vfmaq_f32(vnegq_f32(vld1q_f32(c._f32)), vld1q_f32(a._f32), vld1q_f32(b._f32))); return r;
++    u128 r; vst1q_f32(r._f32, vfmaq_f32(vnegq_f32(vld1q_f32(c._f32)), vld1q_f32(a._f32), vld1q_f32(b._f32)));
++    if (__builtin_expect(spu_result_has_nan(r), 0)) return spu_fms_ref(a, b, c);
++    return r;
 +#else
 +    return spu_fms_ref(a, b, c);
 +#endif
@@ -19143,8 +20043,9 @@ index 0fca7f5..b06e7ab 100644
 +static inline u128 spu_fnms_ref(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
 +static inline u128 spu_fnms(u128 a, u128 b, u128 c) {
 +#if defined(SPU_HELPERS_NEON)
-+    if (spu_has_nan(a, b, c)) return spu_fnms_ref(a, b, c);
-+    u128 r; vst1q_f32(r._f32, vfmaq_f32(vld1q_f32(c._f32), vld1q_f32(a._f32), vnegq_f32(vld1q_f32(b._f32)))); return r;
++    u128 r; vst1q_f32(r._f32, vfmaq_f32(vld1q_f32(c._f32), vld1q_f32(a._f32), vnegq_f32(vld1q_f32(b._f32))));
++    if (__builtin_expect(spu_result_has_nan(r), 0)) return spu_fnms_ref(a, b, c);
++    return r;
 +#else
 +    return spu_fnms_ref(a, b, c);
 +#endif
@@ -19152,7 +20053,7 @@ index 0fca7f5..b06e7ab 100644
  static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
  static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
  
-@@ -352,10 +414,10 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
+@@ -352,20 +465,45 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
      uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
      uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
      u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
@@ -19166,8 +20067,47 @@ index 0fca7f5..b06e7ab 100644
 +static inline u128 spu_rotqbybi(u128 a, u128 b){ return spu_rotqbyi(a, (int)(b._u32[0]>>3)); }
  
  /* ---- Phase 2: rotmahi ---- */
- static inline u128 spu_rotmahi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
-@@ -549,30 +611,70 @@ static inline u128 spu_fsmbi(int32_t imm) {
+-static inline u128 spu_rotmahi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
++static inline u128 spu_rotmahi(u128 a, int i7) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; int sh = (0-i7)&0x1F;
++    vst1q_s16(r._s16, vshlq_s16(vld1q_s16(a._s16), vdupq_n_s16((int16_t)-(sh > 15 ? 15 : sh)))); return r;
++#else
++    u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r;
++#endif
++}
+ 
+ /* ---- Phase 2: byte/half immediate compares ---- */
+-static inline u128 spu_ceqbi(u128 a, int32_t imm)  { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==v)?0xFFu:0; return r; }
+-static inline u128 spu_ceqhi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]==v)?0xFFFFu:0; return r; }
++static inline u128 spu_ceqbi(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u8(r._u8, vceqq_u8(vld1q_u8(a._u8), vdupq_n_u8((uint8_t)imm))); return r;
++#else
++    u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==v)?0xFFu:0; return r;
++#endif
++}
++static inline u128 spu_ceqhi(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u16(r._u16, vceqq_s16(vld1q_s16(a._s16), vdupq_n_s16((int16_t)imm))); return r;
++#else
++    u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]==v)?0xFFFFu:0; return r;
++#endif
++}
+ static inline u128 spu_clgtbi(u128 a, int32_t imm) { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>v)?0xFFu:0; return r; }
+ static inline u128 spu_clgthi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>v)?0xFFFFu:0; return r; }
+-static inline u128 spu_cgthi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>v)?0xFFFFu:0; return r; }
++static inline u128 spu_cgthi(u128 a, int32_t imm) {
++#if defined(SPU_HELPERS_NEON)
++    u128 r; vst1q_u16(r._u16, vcgtq_s16(vld1q_s16(a._s16), vdupq_n_s16((int16_t)imm))); return r;
++#else
++    u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>v)?0xFFFFu:0; return r;
++#endif
++}
+ static inline u128 spu_cgtbi(u128 a, int32_t imm)  { u128 r; int8_t v=(int8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>v)?0xFFu:0; return r; }
+ 
+ /* ---- Phase 2: misc one-offs ---- */
+@@ -549,30 +687,70 @@ static inline u128 spu_fsmbi(int32_t imm) {
   * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
   * the right host index. Verified to compose correctly with the fixed shufb for
   * both cbd-generated and immediate/LS-constant controls. */
@@ -19447,6 +20387,113 @@ index 326e421..ea1e7d1 100644
  /* cellSpurs owns this; 0 = "not a SPURS port", the plain lv2 event path. */
  uint32_t spurs_port_queue(uint32_t port)        { (void)port; return 0; }
  void sys_raw_spu_init(lv2_syscall_table* t) { (void)t; }
+diff --git a/runtime/spu/tests/test_spu_register_cache.c b/runtime/spu/tests/test_spu_register_cache.c
+new file mode 100644
+index 0000000..cfc0614
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_register_cache.c
+@@ -0,0 +1,50 @@
++#include "spu_helpers.h"
++#include <assert.h>
++void ref_spu_func_00000100(spu_context*);
++void opt_spu_func_00000100(spu_context*);
++SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
++int g_spu_ls_watch_n = 0;
++static unsigned watch_count;
++static const spu_context* watching;
++void spu_ls_watch_slow(uint32_t lsa, int wr, const uint8_t* p, uint32_t pc, uint32_t lr)
++{
++    (void)lsa; (void)wr; (void)p; (void)pc; (void)lr;
++    /* Every iteration increments r6 before reaching either watchpoint. */
++    assert(watching->gpr[6]._u32[0] >= 1);
++    watch_count++;
++}
++void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr; (void)fn; }
++void spu_indirect_branch(spu_context* ctx) { (void)ctx; }
++static unsigned seed = 1234567;
++static uint32_t word(void) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
++int main(void)
++{
++    spu_context* a = calloc(1, sizeof *a);
++    spu_context* b = calloc(1, sizeof *b);
++    assert(a && b);
++    for (unsigned i = 0; i < 1600; i++) {
++        spu_context_init(a, 0);
++        for (unsigned j = 0; j < 128; j++) for (unsigned k = 0; k < 4; k++) a->gpr[j]._u32[k] = word();
++        for (unsigned j = 0; j < SPU_LS_SIZE; j += 4) { uint32_t v = word(); memcpy(a->ls+j, &v, 4); }
++        a->gpr[6] = spu_zero(); a->gpr[85] = spu_splat_u32(1 + i % 31);
++        a->gpr[5] = spu_splat_u32((i % 17 == 0 ? 0x3ffe0u : 0x1000u) + i % 16);
++        a->gpr[12] = spu_splat_u32(i % 2);
++        a->host_depth = i % 2;
++        /* Exercise each fallback gate, including first-use (-1) probes. */
++        a->policy_mode = i % 5 == 1;
++        g_spu_ls_probe = i % 5 == 2 ? -1 : 0;
++        g_spu_smc_watch = i % 5 == 3 ? -1 : 0;
++        g_spu_ls_watch_n = i % 5 == 4 ? 1 : 0;
++        memcpy(b, a, sizeof *b); b->ls = b->ls_store;
++        int probe_gate = g_spu_ls_probe, smc_gate = g_spu_smc_watch;
++        watching = a; ref_spu_func_00000100(a); unsigned observed = watch_count;
++        g_spu_ls_probe = probe_gate; g_spu_smc_watch = smc_gate;
++        watching = b; opt_spu_func_00000100(b);
++        if (g_spu_ls_watch_n) { assert(watch_count == observed * 2); watch_count = 0; }
++        assert(memcmp(a->gpr, b->gpr, sizeof a->gpr) == 0);
++        assert(memcmp(a->ls, b->ls, SPU_LS_SIZE) == 0);
++        assert(a->pc == b->pc);
++    }
++    free(a); free(b);
++    puts("SPU register cache: 1600 random LS/GPR cases, wrapping, branches/returns, diagnostic gates PASS");
++}
+diff --git a/runtime/spu/tests/test_spu_register_cache.py b/runtime/spu/tests/test_spu_register_cache.py
+new file mode 100644
+index 0000000..c24db55
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_register_cache.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++"""Differentially execute cached/reference lifts, including diagnostic gates."""
++import argparse
++from pathlib import Path
++import subprocess
++import sys
++
++sdk = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(sdk / 'tools'))
++from spu_disasm import SPUInstruction
++from spu_lifter import SPULifter
++
++p = argparse.ArgumentParser()
++p.add_argument('--work', type=Path, required=True)
++a = p.parse_args()
++a.work.mkdir(parents=True, exist_ok=True)
++program = [
++    ('ai', '$r6, $r6, 1'), ('lqd', '$r10, 0($r5)'), ('cwd', '$r11, $r5, 0'),
++    ('ceq', '$r8, $r85, $r6'), ('shufb', '$r9, $r7, $r10, $r11'),
++    ('stqd', '$r9, 0($r5)'), ('ai', '$r5, $r5, 4'), ('brz', '$r8, 0x100'),
++    ('brnz', '$r12, 0x180'), ('rotqby', '$r13, $r10, $r5'),
++    ('fma', '$r14, $r13, $r15, $r16'), ('stqd', '$r14, 16($r5)'), ('bi', '$r0'),
++]
++insns = [SPUInstruction(0x100 + i*4, 0, mn, ops) for i, (mn, ops) in enumerate(program)]
++for cached, prefix in ((False, 'ref_'), (True, 'opt_')):
++    lifter = SPULifter(prefix=prefix, cache_registers=cached)
++    f = lifter.lift_function(insns, 0x100, 0x134)
++    assert bool(lifter._cached_leaf(f)) == cached
++    (a.work / f'{prefix}spu_recomp.h').write_text(lifter.emit_header().replace('../../runtime/spu/', ''))
++    (a.work / f'{prefix}spu_recomp.c').write_text(lifter.emit_source(f'{prefix}spu_recomp.h'))
++# Calls, blocking channels, traps, and traces must retain the register file.
++for mn, ops in [('rdch', '$r3, 29'), ('wrch', '28, $r3'), ('rchcnt', '$r3, 29'),
++                ('brsl', '0x200'), ('stop', '0'), ('heqi', '$r0, $r3, 0')]:
++    lifter = SPULifter()
++    assert lifter._cached_leaf(lifter.lift_function([SPUInstruction(0x100, 0, mn, ops)], 0x100, 0x104)) is None
++traced = SPULifter(trace=True)
++assert traced._cached_leaf(traced.lift_function(insns, 0x100, 0x134)) is None
++cmd = ['clang', '-std=gnu17', '-O2', '-fsanitize=address,undefined', '-g',
++       '-I' + str(sdk / 'runtime/spu'), '-I' + str(a.work),
++       str(a.work / 'ref_spu_recomp.c'), str(a.work / 'opt_spu_recomp.c'),
++       str(Path(__file__).with_suffix('.c')), '-o', str(a.work / 'cache-test')]
++if sys.platform != 'darwin':
++    cmd += ['-lm']
++subprocess.run(cmd, check=True)
++subprocess.run([str(a.work / 'cache-test')], check=True)
 diff --git a/runtime/spu/tests/test_spu_shufb.c b/runtime/spu/tests/test_spu_shufb.c
 index 98fa95f..bae3fc2 100644
 --- a/runtime/spu/tests/test_spu_shufb.c
@@ -19500,6 +20547,50 @@ index 98fa95f..bae3fc2 100644
      return 0;
 -#endif
  }
+diff --git a/runtime/spu/tests/test_spu_vector_lanes.c b/runtime/spu/tests/test_spu_vector_lanes.c
+new file mode 100644
+index 0000000..5241148
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_vector_lanes.c
+@@ -0,0 +1,38 @@
++#include "spu_helpers.h"
++#include <assert.h>
++static uint32_t seed = 0x13579bdf;
++static uint32_t random_word(void) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
++static void same(u128 a, u128 b) { assert(!memcmp(&a, &b, sizeof a)); }
++int main(void)
++{
++    uint8_t* ls = malloc(SPU_LS_SIZE);
++    assert(ls);
++    for (unsigned i = 0; i < 100000; i++) {
++        u128 a, b, r;
++        for (int k = 0; k < 4; k++) { a._u32[k] = random_word(); b._u32[k] = random_word(); }
++        int32_t imm = (int32_t)random_word();
++        for (int k = 0; k < 4; k++) r._u32[k] = a._u32[k] + b._u32[k]; same(spu_a(a, b), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = b._u32[k] - a._u32[k]; same(spu_sf(a, b), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = a._u32[k] + (uint32_t)imm; same(spu_ai(a, imm), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = (uint32_t)imm - a._u32[k]; same(spu_sfi(a, imm), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = a._u32[k] == b._u32[k] ? ~0u : 0; same(spu_ceq(a, b), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = a._s32[k] == imm ? ~0u : 0; same(spu_ceqi(a, imm), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = a._s32[k] > imm ? ~0u : 0; same(spu_cgti(a, imm), r);
++        for (int k = 0; k < 4; k++) r._u32[k] = a._u32[k] > (uint32_t)imm ? ~0u : 0; same(spu_clgti(a, imm), r);
++        for (int k = 0; k < 8; k++) r._u16[k] = a._s16[k] == (int16_t)imm ? 0xffffu : 0; same(spu_ceqhi(a, imm), r);
++        for (int k = 0; k < 8; k++) r._u16[k] = a._s16[k] > (int16_t)imm ? 0xffffu : 0; same(spu_cgthi(a, imm), r);
++        for (int k = 0; k < 16; k++) r._u8[k] = a._u8[k] == (uint8_t)imm ? 0xffu : 0; same(spu_ceqbi(a, imm), r);
++        int shift = (int)(i % 256) - 128;
++        int right = (-shift) & 31; if (right > 15) right = 15;
++        for (int k = 0; k < 8; k++) r._s16[k] = a._s16[k] >> right;
++        same(spu_rotmahi(a, shift), r);
++        /* Exact BE bytes, alignment and wrap, including UINT32_MAX. */
++        uint32_t address = i < 32 ? UINT32_MAX - i : random_word();
++        uint32_t aligned = address & (SPU_LS_MASK & ~15u);
++        spu_ls_write128_data(ls, address, a);
++        for (int k = 0; k < 16; k++) assert(ls[aligned + k] == a._u8[SPU_W(k)]);
++        same(spu_ls_read128_data(ls, address), a);
++    }
++    free(ls);
++    puts("SPU SIMD lanes: 100000 random arithmetic/compare/shift cases + BE LS alignment/wrap PASS");
++}
 diff --git a/runtime/spu/tests/test_spu_vectors.c b/runtime/spu/tests/test_spu_vectors.c
 new file mode 100644
 index 0000000..f576adb
@@ -20529,10 +21620,25 @@ index 7917a9d..bfa329a 100644
          past 16,777,215 lines (C4049/C1088), which a large game exceeds in a
          single file; splitting also lets the build compile chunks in parallel
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index bfc9af4..181ea88 100644
+index bfc9af4..7ab2cf2 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
-@@ -610,6 +610,11 @@ class SPULifter:
+@@ -457,12 +457,13 @@ def compute_link_returns(insns, bounds) -> set:
+ 
+ 
+ class SPULifter:
+-    def __init__(self, trace: bool = False, prefix: str = ""):
++    def __init__(self, trace: bool = False, prefix: str = "", cache_registers: bool = True):
+         self.functions: list[LiftedFunction] = []
+         self.call_targets: set[int] = set()
+         self.branch_targets: set[int] = set()
+         self.unsupported: dict[str, int] = {}
+         self.trace = trace
++        self.cache_registers = cache_registers and not trace
+         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
+         # Lets multiple lifted SPU images link into one binary without collisions
+         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
+@@ -610,6 +611,11 @@ class SPULifter:
          if mn == "stop":
              # Preserve the 14-bit stop-and-signal code: SPURS leaf tasks use
              # `stop <code>` to invoke kernel syscalls (EXIT/YIELD/WAIT_SIGNAL/...).
@@ -20544,3 +21650,90 @@ index bfc9af4..181ea88 100644
              return (f"ctx->stop_code = 0x{insn.raw & 0x3FFF:X}u; "
                      f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
  
+@@ -1009,11 +1015,66 @@ class SPULifter:
+         lines.append("")
+         return "\n".join(lines)
+ 
++    def _cached_leaf(self, func: LiftedFunction):
++        """Keep leaf registers in SSA-friendly locals until the next transfer.
++
++        Calls/channels/stops can observe or replace the register file, or unwind
++        without returning. Leave those functions alone. LS diagnostics observe
++        live registers too: retain the original body behind an entry-time gate.
++        The data-only LS helpers never observe registers or change the LS base.
++        """
++        if not self.cache_registers:
++            return None
++        body = "\n".join(func.body_lines)
++        calls = re.findall(r"\b(\w+)\(ctx(?:[,\)])", body)
++        if any(c not in ("spu_ls_read128", "spu_ls_write128", "SPU_RET",
++                         "SPU_RET_REG") for c in calls):
++            return None
++        if "spu_unsupported" in body or "extern " in body:
++            return None
++        registers = sorted({int(r) for r in re.findall(r"ctx->gpr\[(\d+)\]", body)})
++        written = sorted({int(r) for r in re.findall(r"ctx->gpr\[(\d+)\] =", body)})
++        if not registers or not written:
++            return None
++        spill = " ".join(f"ctx->gpr[{r}] = _r{r};" for r in written)
++        transformed = []
++        for line in func.body_lines:
++            line = re.sub(r"ctx->gpr\[(\d+)\]", lambda m: f"_r{m[1]}", line)
++            line = line.replace("spu_ls_read128(ctx,", "spu_ls_read128_data(_ls,")
++            line = line.replace("spu_ls_write128(ctx,", "spu_ls_write128_data(_ls,")
++            # Preserve conditional scope: return and SPU_RET already live in
++            # braces when conditional. The spill must precede the return macro.
++            line = line.replace("return;", spill + " return;")
++            line = line.replace("SPU_RET(", spill + " SPU_RET(")
++            line = line.replace("SPU_RET_REG(", spill + " SPU_RET_REG(")
++            transformed.append(line)
++        transformed.append("    " + spill)
++        has_ls = "spu_ls_read128" in body or "spu_ls_write128" in body
++        return registers, transformed, has_ls
++
+     def emit_source(self,header_name: str) -> str:
+         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+         for f in self.functions:
++            cached = self._cached_leaf(f)
++            if cached and cached[2]:
++                lines.append(f"static void {f.name}_uncached(spu_context* ctx) {{")
++                for b in f.body_lines:
++                    lines.append(b if b.endswith(":") else f"    {b}")
++                lines.append("}")
+             lines.append(f"void {f.name}(spu_context* ctx) {{")
+-            for b in f.body_lines:
++            body = f.body_lines
++            if cached:
++                registers, body, has_ls = cached
++                if has_ls:
++                    lines.append("    if (__builtin_expect(ctx->policy_mode || "
++                                 "g_spu_ls_probe != 0 || g_spu_smc_watch != 0 || "
++                                 "g_spu_ls_watch_n != 0, 0)) {")
++                    lines.append(f"        {f.name}_uncached(ctx); return;")
++                    lines.append("    }")
++                    lines.append("    uint8_t* const _ls = ctx->ls;")
++                for r in registers:
++                    lines.append(f"    u128 _r{r} = ctx->gpr[{r}];")
++            for b in body:
+                 lines.append(b if b.endswith(":") else f"    {b}")
+             lines.append("}")
+             lines.append("")
+@@ -1108,6 +1169,8 @@ def main() -> None:
+                         "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
+                         "dispatched blocks later -- classified as a return, which "
+                         "silently skipped every job-command handler).")
++    p.add_argument("--no-register-cache", action="store_true",
++                   help="Disable leaf register promotion (reference/debug builds).")
+     args = p.parse_args()
+ 
+     if args.auto_functions:
+@@ -1199,7 +1262,8 @@ def main() -> None:
+ 
+     insns = disassemble_spu(data, base)
+ 
+-    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
++    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix,
++                      cache_registers=not args.no_register_cache)
+     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
+     if lifter.bi_r0_jump:
+         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

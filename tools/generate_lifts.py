@@ -14,6 +14,9 @@ parser.add_argument('--sdk', type=Path, default=ROOT / 'ps3recomp')
 parser.add_argument('--version', choices=['100', '140', 'all'], default='all')
 parser.add_argument('--elf', type=Path, help='ELF input override (requires one version)')
 parser.add_argument('--port-dir', type=Path, default=ROOT / 'port', help='output tree, also supports external storage')
+parser.add_argument('--spu-only', action='store_true', help='Regenerate only embedded SPU extraction/lifts')
+parser.add_argument('--allow-sdk-worktree', action='store_true',
+                    help='Development only: record the current SDK revision/diff instead of requiring SDK.lock')
 args = parser.parse_args()
 if args.elf and args.version == 'all':
     parser.error('--elf requires --version 100 or 140')
@@ -23,7 +26,12 @@ sdk = args.sdk.resolve()
 # Require exactly the audited tracked tree, including its patched worktree.
 # A bootstrap has base HEAD plus staged patch; the local audited revision also works.
 git = lambda *a: subprocess.check_output(['git', '-C', str(sdk), *a], text=True).strip()
-if git('write-tree') != lock['tree'] or git('diff', '--name-only'):
+sdk_receipt = lock
+if args.allow_sdk_worktree:
+    diff = subprocess.check_output(['git', '-C', str(sdk), 'diff', 'HEAD', '--binary'])
+    sdk_receipt = dict(head=git('rev-parse', 'HEAD'),
+                       diff_sha256=hashlib.sha256(diff).hexdigest(), development_worktree=True)
+elif git('write-tree') != lock['tree'] or git('diff', '--name-only'):
     sys.exit('SDK differs from SDK.lock; use tools/bootstrap_sdk.sh with a new directory')
 versions = list(manifest['versions']) if args.version == 'all' else [args.version]
 inputs = {}
@@ -42,13 +50,15 @@ for version, elf in inputs.items():
     if paths['spu'].exists() and any(paths['spu'].rglob('*.elf')):
         sys.exit(f'SPU extraction already exists: {paths["spu"]}; use a fresh --port-dir or remove that generated tree')
     values = dict(paths, elf=elf, stem=elf.stem)
-    for command in manifest['commands']:
+    commands = [c for c in manifest['commands'] if not args.spu_only or c[0] in ('extract_spu_images.py', 'build_spu_workloads.py')]
+    for command in commands:
         cmd = [sys.executable, str(sdk / 'tools' / command[0])]
         cmd += [arg.format(**values) for arg in command[1:]]
         print('+ ' + ' '.join(cmd), flush=True)
         subprocess.run(cmd, env=env, check=True)
     # Generated files are intentionally not tracked; retain provenance beside them.
-    receipt = dict(version=version, elf_sha256=config['elf_sha256'], sdk=lock,
-                   environment=manifest['environment'], commands=manifest['commands'])
-    (paths['out'] / 'generation.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    receipt = dict(version=version, elf_sha256=config['elf_sha256'], sdk=sdk_receipt,
+                   environment=manifest['environment'], commands=commands)
+    receipt_path = paths['spu'] / 'generation.json' if args.spu_only else paths['out'] / 'generation.json'
+    receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
     print(f'Lift generation PASS: version={version} sha256={config["elf_sha256"]}', flush=True)

@@ -234,6 +234,7 @@ add_executable(${PROJECT_NAME}
     src/d2_movie.cpp
     src/d2_shader_trace.cpp
     src/d2_draw_trace.cpp
+    src/d2_audio.cpp
     src/d2_debug_warp.cpp
     src/d2_cheats.cpp
     ${PS3RECOMP_SCAFFOLD}
@@ -371,6 +372,9 @@ install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
 
 if(APPLE)
     include(src/d2_bundle.cmake)
+    target_sources(${PROJECT_NAME} PRIVATE src/d2_flags.cpp src/d2_flags.m)
+    set_source_files_properties(src/d2_flags.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+        INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/video")
 endif()
 
 include(CTest)

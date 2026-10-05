@@ -49,4 +49,5 @@ with tempfile.TemporaryDirectory(prefix='repro-', dir=args.work) as temp:
     command = [project/'tools/generate_lifts.sh', '--sdk', sdk, '--version', '100', '--elf', elf, '--port-dir', Path(temp)/'lifts']
     dirty = subprocess.check_output(['git', '-C', str(sdk), 'diff', '--name-only'], text=True).strip()
     rejected(command, 'SDK differs from SDK.lock' if dirty else 'ELF 100 SHA256 mismatch')
+    rejected([*command, '--allow-sdk-worktree', '--spu-only'], 'ELF 100 SHA256 mismatch')
     assert not (Path(temp)/'lifts').exists()

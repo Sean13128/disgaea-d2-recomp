@@ -1,16 +1,35 @@
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(D2Regressions NONE)
+    project(D2Regressions C)
     include(CTest)
     if(NOT DEFINED PS3RECOMP_DIR)
         get_filename_component(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../ps3recomp" ABSOLUTE)
     endif()
 endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+foreach(test IN ITEMS AN-summary AN-flags AN-metal AN-location-100 AN-location-140)
+    if(APPLE OR test STREQUAL "AN-summary" OR test MATCHES "AN-location")
+        add_test(NAME d2.${test} COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
+            "${test}" --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/${test}")
+        set_tests_properties(d2.${test} PROPERTIES LABELS "asset-free;cpu" TIMEOUT 120)
+        if(test STREQUAL "AN-metal")
+            set_tests_properties(d2.${test} PROPERTIES LABELS "asset-free;gpu" SKIP_RETURN_CODE 77)
+        endif()
+    endif()
+endforeach()
+if(NOT WIN32)
+    add_executable(d2_guest_poll_filter
+        "${PS3RECOMP_DIR}/runtime/platform/tests/test_guest_poll_filter.c")
+    target_compile_features(d2_guest_poll_filter PRIVATE c_std_17)
+    target_compile_options(d2_guest_poll_filter PRIVATE -UNDEBUG)
+    target_link_libraries(d2_guest_poll_filter PRIVATE pthread)
+    add_test(NAME d2.guest-poll-filter COMMAND d2_guest_poll_filter)
+    set_tests_properties(d2.guest-poll-filter PROPERTIES LABELS "asset-free;cpu" TIMEOUT 30)
+endif()
 set(D2_CPU_TESTS Q-sync T-sync Y-sync AA-sync AB-sync AG2-fifo
-    draw AG2-engine hash vertex cache audio-clock filesystem edat save-import
+    draw AG2-engine hash vertex cache audio-clock AP-atrac-stream AP-audio-gain AP-audio-init filesystem edat save-import
     savedata-io savedata-fixed overlay system-overlay editor-100 editor-140
-    guest-poll spu-vectors spu-shuffle repro-guards)
+    guest-poll spu-vectors spu-shuffle spu-cache spu-lanes repro-guards)
 foreach(test IN LISTS D2_CPU_TESTS)
     add_test(NAME d2.${test}
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"

@@ -1,8 +1,8 @@
 {
   "repository": "https://github.com/sp00nznet/ps3recomp.git",
   "base": "a679051ef304555291de2eb3ec8a3dbf64a761a8",
-  "revision": "cac3ded6c1e0d4869946838f32a5d62b757655f1",
-  "tree": "bcb40e6f5c8b5c49fce35dbf2640d750b0891824",
+  "revision": "731e75547447d679037366d204499d3019cba45a",
+  "tree": "9ca0a0394ffd22041bedcae89a256204f889ad33",
   "patch": "ps3recomp-d2-macos.diff",
-  "patch_sha256": "92ae223d6dc8f98e32bae3be5bdb932421f0f43675cbef52bdd2516edcc352b5"
+  "patch_sha256": "327edf0db40e1f2efaeb3e13b2435b49e741332a8c8c08a66bb8c62a93ec3dcf"
 }

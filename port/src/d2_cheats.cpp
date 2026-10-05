@@ -2,6 +2,9 @@
  * resolution, snapshots and writes, once per observed vblank. */
 #include "ppu_recomp.h"
 #include "d2_cheats.h"
+#ifdef __APPLE__
+extern "C" __attribute__((weak)) int d2_flags_key_event(unsigned, int, int) { return 0; }
+#endif
 #include "d2_cheats_data.h"
 #include "sys_overlay.h"
 #include "cellSaveData.h"
@@ -481,6 +484,9 @@ void action(uint16_t buttons, unsigned pick)
 extern "C" void d2_cheats_toggle_menu(void) { requests.fetch_add(1,std::memory_order_relaxed); }
 extern "C" int ps3_host_key_event(unsigned code, unsigned modifiers, int down, int repeat)
 {
+#ifdef __APPLE__
+    if (d2_flags_key_event(code, down, repeat)) return 1;
+#endif
     bool hotkey = code == 122 || (code == 8 && (modifiers & (1u << 20)) && (modifiers & (1u << 17)));
     if (!hotkey) return 0;
     if (down && !repeat) d2_cheats_toggle_menu();
