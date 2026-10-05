@@ -33,6 +33,7 @@
 !/port/run.sh
 !/port/play.sh
 !/port/capture.sh
+!/port/script-common.sh
 !/port/src/
 /port/src/*
 !/port/src/d2_*
@@ -95,3 +96,17 @@
 !/codex/AH.elf-test.c
 !/codex/AH.launcher-test.m
 !/codex/AI.host-check.sh
+
+# Maintained asset-free regression suite and reproducibility tools.
+!/port/tests/
+/port/tests/*
+!/port/tests/*.c
+!/port/tests/*.cpp
+!/port/tests/*.m
+!/port/tests/*.py
+!/port/tests/*.sh
+!/port/tests/*.md
+!/port/tests/CMakeLists.txt
+!/tools/*.sh
+!/tools/*.py
+!/tools/requirements-lifts.txt

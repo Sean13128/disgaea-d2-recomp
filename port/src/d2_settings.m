@@ -15,6 +15,8 @@ static BOOL s_borderless;
 static NSRect s_regular_frame;
 static NSWindowStyleMask s_regular_style;
 static NSArray* s_observers;
+static NSTimer* s_geometry_timer;
+static void message(NSString* title, NSString* detail);
 
 static NSDictionary* defaults(void)
 {
@@ -97,6 +99,27 @@ static BOOL save_settings(void)
     return ok;
 }
 
+static void persist_geometry(void)
+{
+    [s_geometry_timer invalidate]; s_geometry_timer = nil;
+    if (!save_settings()) message(@"Settings could not be saved", @"Check write access to the settings folder. Changes apply for this session.");
+}
+
+static void schedule_geometry_save(void)
+{
+    [s_geometry_timer invalidate];
+    s_geometry_timer = [NSTimer timerWithTimeInterval:0.35 repeats:NO block:^(NSTimer* timer) {
+        (void)timer; persist_geometry();
+    }];
+    [NSRunLoop.mainRunLoop addTimer:s_geometry_timer forMode:NSRunLoopCommonModes];
+}
+
+void d2_settings_flush(void)
+{
+    assert(NSThread.isMainThread);
+    if (s_geometry_timer) persist_geometry();
+}
+
 static void apply_settings(void)
 {
     assert(NSThread.isMainThread);
@@ -128,6 +151,19 @@ static void message(NSString* title, NSString* detail)
     NSAlert* alert = [NSAlert new];
     alert.messageText = title; alert.informativeText = detail ?: @"";
     [alert runModal];
+}
+
+static BOOL python_crypto_available(NSString* python)
+{
+    if (![NSFileManager.defaultManager isExecutableFileAtPath:python]) return NO;
+    NSTask* probe = [NSTask new];
+    probe.executableURL = [NSURL fileURLWithPath:python];
+    probe.arguments = @[@"-c", @"from Crypto.Cipher import AES; from Crypto.Hash import CMAC, SHA1"];
+    probe.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    probe.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![probe launchAndReturnError:nil]) return NO;
+    [probe waitUntilExit];
+    return probe.terminationStatus == 0;
 }
 
 static void open_save_folder(void)
@@ -262,6 +298,11 @@ static void toggle_borderless(void)
         NSArray* wh = [[name substringFromIndex:5] componentsSeparatedByString:@" × "];
         [s_window setContentSize:NSMakeSize([wh[0] doubleValue], [wh[1] doubleValue])];
     } else if ([name isEqual:@"reset"]) {
+        assert(!python_crypto_available(@"/nonexistent/python3"));
+        assert(!python_crypto_available(@"/usr/bin/false"));
+        const char* test_python = getenv("D2_SETTINGS_TEST_PYTHON");
+        if (test_python) assert(python_crypto_available(@(test_python)));
+        fprintf(stderr, "[D2 settings] save-import interpreter/module dependency probe: PASS\n");
         s_settings = [defaults() mutableCopy]; apply_settings(); save_settings();
         if (!s_borderless && !(s_window.styleMask & NSWindowStyleMaskFullScreen)) {
             [s_window setContentSize:NSMakeSize(1280, 720)]; [s_window center];
@@ -290,9 +331,9 @@ static void toggle_borderless(void)
         NSString* python = nil;
         for (NSString* candidate in @[[ @D2_PROJECT_ROOT stringByAppendingPathComponent:@".venv/bin/python"],
                 @"/opt/homebrew/bin/python3", @"/usr/local/bin/python3", @"/usr/bin/python3"])
-            if ([NSFileManager.defaultManager isExecutableFileAtPath:candidate]) { python = candidate; break; }
+            if (python_crypto_available(candidate)) { python = candidate; break; }
         if (!python || ![NSFileManager.defaultManager fileExistsAtPath:script]) {
-            message(@"Save Import Unavailable", @"Import requires Python 3 with PyCryptodome. Run from the project with its .venv, or import using tools/d2_save_import.py. The save folder will open.");
+            message(@"Save Import Unavailable", @"Import requires Python 3 with PyCryptodome (Crypto). Install Python 3 and run python3 -m pip install pycryptodome, or use the project’s .venv. The save folder will open.");
             open_save_folder(); return;
         }
         NSTask* task = [NSTask new]; task.executableURL = [NSURL fileURLWithPath:python];
@@ -333,6 +374,11 @@ void d2_settings_init(void)
 {
     @autoreleasepool {
         assert(NSThread.isMainThread);
+        assert(!python_crypto_available(@"/nonexistent/python3"));
+        assert(!python_crypto_available(@"/usr/bin/false"));
+        const char* test_python = getenv("D2_SETTINGS_TEST_PYTHON");
+        if (test_python) assert(python_crypto_available(@(test_python)));
+        fprintf(stderr, "[D2 settings] save-import interpreter/module dependency probe: PASS\n");
         s_settings = [defaults() mutableCopy];
         merge_settings(s_settings, json_data([NSData dataWithContentsOfFile:settings_path()]));
         const char* override = getenv("D2_SETTINGS_OVERRIDE");
@@ -358,7 +404,7 @@ void ps3_host_window_created(void* window)
     assert(NSThread.isMainThread);
     if (s_observers) for (id observer in s_observers) [NSNotificationCenter.defaultCenter removeObserver:observer];
     s_window = (__bridge NSWindow*)window;
-    if (!s_window) { s_fps = nil; s_observers = nil; return; }
+    if (!s_window) { d2_settings_flush(); s_fps = nil; s_observers = nil; return; }
     if ([s_settings[@"remember_window"] boolValue]) {
         NSRect frame = [s_window frameRectForContentRect:NSMakeRect(0, 0,
             [s_settings[@"window_width"] doubleValue], [s_settings[@"window_height"] doubleValue])];
@@ -374,8 +420,8 @@ void ps3_host_window_created(void* window)
             }
         } else [s_window setContentSize:NSMakeSize([s_settings[@"window_width"] doubleValue], [s_settings[@"window_height"] doubleValue])];
     }
-    s_fps = [NSTextField labelWithString:@"FPS: —"];
-    s_fps.frame = NSMakeRect(12, 12, 180, 26);
+    s_fps = [NSTextField labelWithString:@"Guest: — · Display: —"];
+    s_fps.frame = NSMakeRect(12, 12, 330, 26);
     s_fps.textColor = NSColor.whiteColor; s_fps.backgroundColor = [NSColor.blackColor colorWithAlphaComponent:0.7];
     s_fps.drawsBackground = YES; s_fps.font = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightMedium];
     [s_window.contentView addSubview:s_fps];
@@ -391,7 +437,8 @@ void ps3_host_window_created(void* window)
                     s_settings[@"window_width"] = @(s_window.contentView.bounds.size.width);
                     s_settings[@"window_height"] = @(s_window.contentView.bounds.size.height);
                     s_settings[@"window_x"] = @(s_window.frame.origin.x);
-                    s_settings[@"window_y"] = @(s_window.frame.origin.y); save_settings();
+                    s_settings[@"window_y"] = @(s_window.frame.origin.y);
+                    schedule_geometry_save();
                 }
             }];
         [observers addObject:observer];
@@ -399,10 +446,10 @@ void ps3_host_window_created(void* window)
     s_observers = observers; install_menu(); apply_settings();
 }
 
-void ps3_host_frame_rate(double fps)
+void ps3_host_frame_rates(double guest, double display)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool { s_fps.stringValue = [NSString stringWithFormat:@"FPS: %.1f", fps]; }
+        @autoreleasepool { s_fps.stringValue = [NSString stringWithFormat:@"Guest: %.1f FPS · Display: %.1f FPS", guest, display]; }
     });
 }
 
@@ -411,9 +458,23 @@ int d2_settings_self_test(void)
     @autoreleasepool {
         assert(NSThread.isMainThread);
         assert(getenv("D2_SETTINGS_PATH")); /* tests never write personal settings */
+        assert(!python_crypto_available(@"/nonexistent/python3"));
+        assert(!python_crypto_available(@"/usr/bin/false"));
+        const char* test_python = getenv("D2_SETTINGS_TEST_PYTHON");
+        if (test_python) assert(python_crypto_available(@(test_python)));
+        fprintf(stderr, "[D2 settings] save-import interpreter/module dependency probe: PASS\n");
         s_settings = [defaults() mutableCopy];
         merge_settings(s_settings, @{@"scale": @2, @"volume": @0.5, @"window_x": @-120, @"filter": @"nearest"});
         assert(save_settings());
+        NSData* before_geometry = [NSData dataWithContentsOfFile:settings_path()];
+        for (int i = 0; i < 20; i++) { s_settings[@"window_x"] = @(i); schedule_geometry_save(); }
+        assert([[NSData dataWithContentsOfFile:settings_path()] isEqual:before_geometry]);
+        [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.45]];
+        assert(!s_geometry_timer);
+        assert([json_data([NSData dataWithContentsOfFile:settings_path()]) isEqual:s_settings]);
+        s_settings[@"window_y"] = @120; schedule_geometry_save(); d2_settings_flush();
+        assert(!s_geometry_timer && [json_data([NSData dataWithContentsOfFile:settings_path()]) isEqual:s_settings]);
+        fprintf(stderr, "[D2 settings] geometry coalesces until idle and flushes at shutdown: PASS\n");
         NSMutableDictionary* read = [defaults() mutableCopy];
         merge_settings(read, json_data([NSData dataWithContentsOfFile:settings_path()]));
         assert([read isEqual:s_settings]);

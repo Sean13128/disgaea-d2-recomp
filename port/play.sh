@@ -1,13 +1,11 @@
 #!/bin/sh
 # Play Disgaea D2 natively. Builds if needed; saves live in port/hdd0 + port/hdd1.
 # Controls: see "Controls" in OPERATIONS.md (arrows, Z/Enter = Cross, X/Esc = Circle, ...).
-cd "$(dirname "$0")/.."
-cmake --build port/build -j6 > port/runs/build.log 2>&1 || { tail -30 port/runs/build.log; exit 1; }
-version=$(sed -n 's/^D2_GAME_VERSION:STRING=//p' port/build/CMakeCache.txt)
-elf=work/EBOOT.elf
-if [ "$version" = 140 ]; then elf=work/v140/EBOOT.elf; fi
+cd "$(dirname "$0")/.." || exit 1
+. ./port/script-common.sh
+d2_prepare || exit $?
 mkdir -p port/hdd0 port/hdd1
 PS3_TITLE="Disgaea D2" \
 PS3_VFS_ROOT="$PWD/Disgaea D2 A Brighter Darkness - [BLUS31313]" \
 PS3_HDD0_ROOT="$PWD/port/hdd0" PS3_HDD1_ROOT="$PWD/port/hdd1" \
-  exec ./port/build/DisgaeaD2Recomp "$elf" > port/runs/play-latest.log 2>&1
+  exec "$build/DisgaeaD2Recomp" "$elf" > "$runs/play-latest.log" 2>&1

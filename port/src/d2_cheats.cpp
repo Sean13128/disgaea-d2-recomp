@@ -3,8 +3,8 @@
 #include "ppu_recomp.h"
 #include "d2_cheats.h"
 #include "d2_cheats_data.h"
-#include "../../ps3recomp/libs/system/sys_overlay.h"
-#include "../../ps3recomp/libs/system/cellSaveData.h"
+#include "sys_overlay.h"
+#include "cellSaveData.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <atomic>

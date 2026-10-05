@@ -31,32 +31,40 @@ endif()
 #         -DRECOMP_DIR=/path/to/my_game/recompiled
 #
 if(NOT DEFINED PS3RECOMP_DIR)
-    # Default: this project is still sitting inside ps3recomp/templates/project/
-    get_filename_component(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../" ABSOLUTE)
+    set(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ps3recomp")
 endif()
-get_filename_component(PS3RECOMP_DIR "${PS3RECOMP_DIR}" ABSOLUTE)
+get_filename_component(PS3RECOMP_DIR "${PS3RECOMP_DIR}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
 set(D2_GAME_VERSION "140" CACHE STRING "D2 executable version (100 or 140)")
 set_property(CACHE D2_GAME_VERSION PROPERTY STRINGS 100 140)
 if(D2_GAME_VERSION STREQUAL "140")
-    set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp-140")
-    set(D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out-140")
+    set(D2_DEFAULT_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp-140")
+    set(D2_DEFAULT_D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out-140")
     set(D2_DEFAULT_EBOOT "work/v140/EBOOT.elf")
     set(D2_EXPECTED_ENTRY_OPD "0x00461000")
     set(D2_EXPECTED_TOC "0x0047DF98")
-    set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu-140")
+    set(D2_DEFAULT_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu-140")
     set(D2_MOVIE_OVERRIDES 001686AC 00168304 00167FC8)
 elseif(D2_GAME_VERSION STREQUAL "100")
-    set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp")
-    set(D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out")
+    set(D2_DEFAULT_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp")
+    set(D2_DEFAULT_D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out")
     set(D2_DEFAULT_EBOOT "work/EBOOT.elf")
     set(D2_EXPECTED_ENTRY_OPD "0x003E0EE8")
     set(D2_EXPECTED_TOC "0x003FDE60")
-    set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu")
+    set(D2_DEFAULT_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu")
     set(D2_MOVIE_OVERRIDES 0015FD14 0015F9F4 0015F680)
 else()
     message(FATAL_ERROR "D2_GAME_VERSION must be 100 or 140")
 endif()
+# Explicit -D paths take precedence; relative paths are relative to port/.
+foreach(path IN ITEMS RECOMP_DIR D2_OUT_DIR SPU_DIR)
+    if(NOT DEFINED ${path})
+        set(${path} "${D2_DEFAULT_${path}}")
+    endif()
+    get_filename_component(${path} "${${path}}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+endforeach()
+message(STATUS "Loader metadata: ${D2_OUT_DIR}")
+message(STATUS "SPU output:      ${SPU_DIR}")
 message(STATUS "Disgaea D2:     ${D2_GAME_VERSION}")
 
 message(STATUS "ps3recomp SDK:   ${PS3RECOMP_DIR}")
@@ -276,6 +284,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${PS3RECOMP_DIR}/runtime/syscalls"
     "${PS3RECOMP_DIR}/runtime/platform"        # win32_compat.h and friends
     "${PS3RECOMP_DIR}/libs/video"
+    "${PS3RECOMP_DIR}/libs/system"
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
@@ -362,4 +371,9 @@ install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
 
 if(APPLE)
     include(src/d2_bundle.cmake)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()

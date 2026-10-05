@@ -1,11 +1,12 @@
 #!/bin/sh
-# Build and run the D2 port. usage: port/run.sh [seconds=40] [log name=run]
-set -e
-cd "$(dirname "$0")/.."
-cmake --build port/build -j6 > port/runs/build.log 2>&1 || { tail -30 port/runs/build.log; exit 1; }
-version=$(sed -n 's/^D2_GAME_VERSION:STRING=//p' port/build/CMakeCache.txt)
-elf=work/EBOOT.elf
-if [ "$version" = 140 ]; then elf=work/v140/EBOOT.elf; fi
-PS3_VFS_ROOT="$PWD/Disgaea D2 A Brighter Darkness - [BLUS31313]" PS3_HDD0_ROOT="$PWD/port/hdd0" \
-  perl -e 'alarm shift; exec @ARGV' "${1:-40}" ./port/build/DisgaeaD2Recomp "$elf" \
-  > "port/runs/${2:-run}.log" 2>&1 || echo "exit $?"
+# Build and run. usage: port/run.sh [seconds=40] [log name=run]
+cd "$(dirname "$0")/.." || exit 1
+. ./port/script-common.sh
+d2_prepare || exit $?
+mkdir -p port/hdd0 port/hdd1 || exit 1
+log="$runs/${2:-run}.log"
+PS3_VFS_ROOT="$PWD/Disgaea D2 A Brighter Darkness - [BLUS31313]" PS3_HDD0_ROOT="$PWD/port/hdd0" PS3_HDD1_ROOT="$PWD/port/hdd1" \
+    perl -e 'alarm shift; exec @ARGV' "${1:-40}" "$build/DisgaeaD2Recomp" "$elf" > "$log" 2>&1
+status=$?
+d2_result "$status" "$log"
+exit "$status"

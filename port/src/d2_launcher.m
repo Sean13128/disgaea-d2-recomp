@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include "d2_launcher_paths.h"
 #include "d2_launcher_elf.h"
+#include "d2_content.h"
 
 static void failure(NSString* detail)
 {
@@ -30,8 +31,7 @@ static BOOL make_directory(NSString* path)
 
 static BOOL valid_game(NSString* path)
 {
-    return path && [[NSFileManager defaultManager] fileExistsAtPath:
-        [path stringByAppendingPathComponent:@"PS3_GAME/PARAM.SFO"]];
+    return path && [d2_sfo_string([path stringByAppendingPathComponent:@"PS3_GAME/PARAM.SFO"], "TITLE_ID") isEqual:@"BLUS31313"];
 }
 
 static BOOL valid_elf(NSString* path)
@@ -47,6 +47,44 @@ static NSString* choose_path(NSString* prompt, BOOL directory)
     panel.canChooseFiles = !directory;
     panel.allowsMultipleSelection = NO;
     return [panel runModal] == NSModalResponseOK ? panel.URL.path : nil;
+}
+
+/* Explicit installation only; data stays in the user's Application Support. */
+static BOOL ensure_content(NSString* hdd, NSArray<NSString*>* roots)
+{
+    if (d2_content_ready(hdd, strcmp(D2_GAME_VERSION_TEXT, "140") == 0)) return YES;
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"Install Disgaea D2 1.40 content";
+    alert.informativeText = [NSString stringWithFormat:@"This build needs the 1.40 update and DLC in %@. Install your extracted update-140 and dlc-pack folders there before playing.", hdd];
+    [alert addButtonWithTitle:@"Install…"]; [alert addButtonWithTitle:@"Migrate hdd0…"]; [alert addButtonWithTitle:@"Cancel"];
+    NSModalResponse choice = [alert runModal];
+    if (choice != NSAlertFirstButtonReturn && choice != NSAlertSecondButtonReturn) return NO;
+    NSString* source = nil;
+    if (choice == NSAlertSecondButtonReturn)
+        source = choose_path(@"Choose an installed hdd0 containing game/BLUS31313 and game/NPUB31321. Only game content will migrate; saves stay in their current location.", YES);
+    else for (NSString* root in roots) {
+        NSString* candidate = [root stringByAppendingPathComponent:@"dlc"];
+        if ([NSFileManager.defaultManager fileExistsAtPath:[candidate stringByAppendingPathComponent:@"update-140/PARAM.SFO"]]) { source = candidate; break; }
+    }
+    if (!source && choice == NSAlertFirstButtonReturn) source = choose_path(@"Choose the folder containing update-140 and dlc-pack.", YES);
+    if (!source) return NO;
+    NSString* helper = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"d2_install_content.py"];
+    NSTask* task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = @[@"python3", helper, source, @"--into", hdd];
+    NSError* error = nil;
+    if (![task launchAndReturnError:&error]) {
+        failure([NSString stringWithFormat:@"Content installation requires Python 3. %@", error.localizedDescription]); return NO;
+    }
+    [task waitUntilExit];
+    if (task.terminationStatus || !d2_content_ready(hdd, YES)) {
+        failure(@"Content installation failed or the content is incomplete. Supply the BLUS31313 1.40 update and NPUB31321 DLC. Python 3 must be installed; see the game log for details."); return NO;
+    }
+    fprintf(stderr, "[D2 launcher] installed matching external content\n");
+    return YES;
 }
 
 int main(void)
@@ -131,6 +169,7 @@ int main(void)
         if (!make_directory(hdd0) || !make_directory(hdd1)) {
             failure(@"Cannot create the game save/cache directories."); return 1;
         }
+        if (!ensure_content(hdd0, roots)) return 1;
         setenv("PS3_TITLE", "Disgaea D2", 1);
         setenv("PS3_VFS_ROOT", game.fileSystemRepresentation, 1);
         setenv("PS3_HDD0_ROOT", hdd0.fileSystemRepresentation, 1);

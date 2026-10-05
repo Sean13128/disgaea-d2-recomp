@@ -44,6 +44,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include "sys_overlay.h"
+#endif
 
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
@@ -78,6 +83,7 @@ extern const char* ppu_vfs_root;              /* host dir the PS3 mount points m
  * entry function unwound instead. */
 extern int     g_sys_process_exit_called;
 extern int32_t g_sys_process_exit_code;
+int32_t cellSaveDataHostRecover(void);
 
 /* Host-provided symbols the runtime and the HLE libraries link against. */
 uint8_t* vm_base = nullptr;
@@ -125,6 +131,7 @@ extern "C" int  rsx_d3d12_backend_pump_messages(void);
 #elif defined(__APPLE__)
 extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_metal_backend_present(void);
+extern "C" int rsx_metal_backend_submission_ok(void);
 extern "C" void rsx_metal_backend_set_vsync(int enabled);
 extern "C" void rsx_metal_backend_set_flip_buffer(uint32_t buffer);
 extern "C" int  rsx_metal_backend_pump_messages(void);
@@ -175,6 +182,24 @@ static int  (*s_backend_pump)(void) = rsx_backend_pump;
  * The ticks are driven off real elapsed time rather than off how long present()
  * took. A hidden or occluded window makes present block hard, and pacing the
  * ticks behind it paces the whole game behind it. */
+static std::atomic<bool> s_stop_requested{false};
+static std::atomic<bool> s_frame_stopping{false};
+static std::atomic<int> s_stop_failure{0};
+extern "C" void ps3_host_request_stop(void)
+{
+    if (!s_stop_requested.exchange(true)) fprintf(stderr, "[shutdown] stop requested\n");
+}
+#ifdef __APPLE__
+extern "C" int cellSaveDataHostRequestStop(void);
+extern "C" void ps3_guest_workers_request_stop(void);
+extern "C" int ps3_guest_workers_stopped(void);
+extern "C" void ps3_guest_workers_join(void);
+extern "C" void d2_settings_flush(void);
+extern "C" int32_t cellAudioQuit(void);
+extern "C" void rsx_metal_backend_shutdown(void);
+extern "C" void rsx_null_backend_shutdown(void);
+#endif
+
 static volatile LONG g_frames_presented = 0;
 
 /* Frames handed to the backend at a guest FLIP boundary -- one per frame the
@@ -186,18 +211,22 @@ extern "C" unsigned ppu_boot_frames_presented(void)
     return (unsigned)g_frames_presented;
 }
 
-static void present_guest_frame(void)
+static int present_guest_frame(void)
 {
 #ifdef __APPLE__
     rsx_metal_backend_set_flip_buffer(cellGcmGetCurrentDisplayBufferId());
     rsx_metal_backend_set_vsync(cellGcm_flip_mode() == 2); /* DISPLAY_VSYNC */
 #endif
     s_backend_present();
+#ifdef __APPLE__
+    if (!rsx_metal_backend_submission_ok()) return 0;
+#endif
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     LONG frame = InterlockedIncrement(&g_frames_presented);
     if (frame <= 3 || frame % 60 == 0)
         fprintf(stderr, "[rsx] presented guest frame %ld\n", (long)frame);
+    return 1;
 }
 
 extern "C" void d2_install_shader_trace(void);
@@ -231,6 +260,7 @@ static DWORD WINAPI frame_clock(LPVOID)
     }
 #endif
 
+    if (!rsx_ok) { s_stop_failure = 1; ps3_host_request_stop(); }
     if (d2_install_draw_trace())
         s_backend_present = rsx_draw_engine_present;
     d2_install_shader_trace();
@@ -239,7 +269,7 @@ static DWORD WINAPI frame_clock(LPVOID)
     ULONGLONG next_report = GetTickCount64() + 5000;
     const int boot_trace = getenv("D2_BOOT_TRACE") != nullptr;
 
-    for (;;) {
+    while (!s_frame_stopping.load()) {
         /* A kick drains immediately. VSYNC readiness is enforced by GCM,
          * using the same clock as its counters; HSYNC need not await vblank. */
         cellGcm_fifo_kick_wait(cellGcm_vblank_wait_ms());
@@ -255,15 +285,15 @@ static DWORD WINAPI frame_clock(LPVOID)
         /* Hold the batch until its scheduled refresh, submit it, then wake
          * the producer. Missed refreshes advance counters without bursts. */
         if (rsx_ok && cellGcm_take_flip_pending()) {
-            present_guest_frame();
-            cellGcmTickFlip();
+            if (present_guest_frame()) cellGcmTickFlip();
+            else { fprintf(stderr, "[rsx] guest submission failed\n"); s_stop_failure = 1; ps3_host_request_stop(); break; }
         } else if (rsx_ok && vblank != previous_vblank && cellGcm_flip_request_count() == 0) {
             s_backend_present();
         }
         previous_vblank = vblank;
         if (rsx_ok) {
             cellGcm_rsx_process_fifo();
-            if (s_backend_pump() != 0) rsx_ok = 0;
+            if (s_backend_pump() != 0) ps3_host_request_stop();
         }
     }
     return 0;
@@ -377,10 +407,16 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    const uint32_t expected_entry = D2_GAME_VERSION == 140 ? 0x461000u : 0x3E0EE8u;
     const uint32_t expected_toc = D2_GAME_VERSION == 140 ? 0x47DF98u : 0x3FDE60u;
-    if (vm_read32(entry + 4) != expected_toc) {
+    if (entry != expected_entry || vm_read32(entry + 4) != expected_toc) {
         fprintf(stderr, "ERROR: this build requires D2 version %d (%s)\n",
                 D2_GAME_VERSION, D2_GAME_VERSION == 140 ? "work/v140/EBOOT.elf" : "work/EBOOT.elf");
+        return 1;
+    }
+
+    if (cellSaveDataHostRecover() != 0) {
+        fprintf(stderr, "ERROR: savedata recovery failed; preserved transaction needs retry\n");
         return 1;
     }
 
@@ -397,12 +433,80 @@ int main(int argc, char** argv)
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
-    CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
+    HANDLE frame_thread = CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
+    if (!frame_thread) { fprintf(stderr, "[boot] frame thread creation failed\n"); return 1; }
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
+#ifdef __APPLE__
+    /* Own the guest entry worker here so a stop can join it without changing
+     * ppu_run's loader/dispatch semantics. Main continues servicing AppKit. */
+    struct GuestRun {
+        uint32_t entry;
+        int rc = 0;
+        std::atomic<bool> done{false};
+    } run{entry};
+    pthread_t guest_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr); pthread_attr_setstacksize(&attr, 16u * 1024 * 1024);
+    int error = pthread_create(&guest_thread, &attr, [](void* arg) -> void* {
+        auto* r = static_cast<GuestRun*>(arg);
+        pthread_cleanup_push([](void* arg) {
+            auto* r = static_cast<GuestRun*>(arg);
+            r->done.store(true); CFRunLoopWakeUp(CFRunLoopGetMain());
+        }, arg);
+        r->rc = ppu_run(r->entry, STACK_TOP);
+        pthread_cleanup_pop(1);
+        return nullptr;
+    }, &run);
+    pthread_attr_destroy(&attr);
+    if (error) {
+        s_frame_stopping = true;
+        while (WaitForSingleObject(frame_thread, 0) != WAIT_OBJECT_0)
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+        CloseHandle(frame_thread);
+        fprintf(stderr, "[boot] guest thread creation failed: %s\n", strerror(error)); return 1;
+    }
+    bool stopping = false;
+    ULONGLONG start = GetTickCount64();
+    const char* stop_after = getenv("D2_STOP_AFTER_SECONDS");
+    while (!run.done.load() || !stopping || !ps3_guest_workers_stopped()) {
+        if (run.done.load()) ps3_host_request_stop();
+        if (stop_after && GetTickCount64() - start >= (ULONGLONG)(atof(stop_after) * 1000))
+            ps3_host_request_stop();
+        if (s_stop_requested && !stopping) {
+            /* Cancel only the dialog, never the save's commit. Admission closes
+             * atomically; rendering/callbacks continue until the operation ends. */
+            auto* overlay = new SysOverlaySnapshot;
+            ps3_overlay_snapshot(overlay);
+            if (overlay->active) ps3_overlay_finish(overlay->token, SYS_OVERLAY_BACK);
+            delete overlay;
+            if (cellSaveDataHostRequestStop()) {
+                fprintf(stderr, "[shutdown] savedata quiescent; stopping guest workers\n");
+                s_frame_stopping = true;
+                while (WaitForSingleObject(frame_thread, 0) != WAIT_OBJECT_0)
+                    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+                stopping = true; ps3_guest_workers_request_stop();
+                pthread_cancel(guest_thread);
+            }
+        }
+        if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false) == kCFRunLoopRunFinished) Sleep(1);
+    }
+    pthread_join(guest_thread, nullptr);
+    ps3_guest_workers_join();
+    while (WaitForSingleObject(frame_thread, 0) != WAIT_OBJECT_0)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+    CloseHandle(frame_thread);
+    d2_settings_flush(); cellAudioQuit();
+    rsx_metal_backend_shutdown(); rsx_null_backend_shutdown();
+    fprintf(stderr, "[shutdown] guest workers and frame thread stopped\n");
+    int rc = run.rc ? run.rc : s_stop_failure.load();
+#else
     int rc = ppu_run(entry, STACK_TOP);
+    s_frame_stopping = true;
+    WaitForSingleObject(frame_thread, INFINITE); CloseHandle(frame_thread);
+#endif
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 
     /* A title that called sys_process_exit never reaches this line: that path
@@ -410,5 +514,5 @@ int main(int argc, char** argv)
      * instead, so hand back the status the guest published if it published
      * one. Returning a hardcoded 0 would report success for a run that never
      * got anywhere. */
-    return g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
+    return g_sys_process_exit_called ? (int)g_sys_process_exit_code : (rc != 0 ? 1 : 0);
 }

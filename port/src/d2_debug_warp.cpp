@@ -71,7 +71,11 @@ static void pad_probe(ppu_context* ctx)
     if (D2_GAME_VERSION == 140) {
         uint32_t scene = vm_read32(toc - 0x3FC4);
         uint32_t event = vm_read32(toc - 0x37C8);
-        if (vm_read32(scene + 8) != 12 || vm_read32(event + 0x13314)) return;
+        if (vm_read32(scene + 8) != 12 || vm_read32(event + 0x13314)) {
+            if (frame % 300 == 0)
+                std::fprintf(stderr, "[D2-warp] waiting: scene=%u event=%u\n", vm_read32(scene + 8), vm_read32(event + 0x13314));
+            return;
+        }
     }
     // Hub announcements own sprites in the hub animation pack. The normal
     // interaction path requests their destruction (140: 001C4C20); jumping straight
@@ -92,7 +96,10 @@ static void pad_probe(ppu_context* ctx)
         if (vm_read16(record + 0x28) == s_stage) { index = i; break; }
     }
     if (index == 400) {
-        std::fprintf(stderr, "[D2-warp] stage %u absent from loaded stage table\n", s_stage);
+        std::fprintf(stderr, "[D2-warp] stage %u absent from loaded stage table; ids:", s_stage);
+        for (unsigned i = 0; i < 400; ++i)
+            if (unsigned id = vm_read16(game + 0xD3BF0 + i * 0x5E + 0x28)) std::fprintf(stderr, " %u", id);
+        std::fprintf(stderr, "\n");
         return;
     }
     call(SELECT_STAGE, game, index);

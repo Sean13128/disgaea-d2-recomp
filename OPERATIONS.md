@@ -133,7 +133,7 @@ Disgaea D2-RE/
 
 Build configure line (Homebrew SDL2 needs its parent include dir):
 ```
-cmake -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=../ps3recomp -DRECOMP_DIR=src/recomp \
+cmake -S port -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=../ps3recomp -DRECOMP_DIR=src/recomp-140 \
   -DCMAKE_{C,CXX,OBJC,OBJCXX}_FLAGS=-I/opt/homebrew/include
 ```
 
@@ -336,6 +336,20 @@ cmake -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=../ps3re
 
 - **Pushed** `main` (`270982a`, `fb8c2ec`) to the private repo **github.com/Sean13128/disgaea-d2-recomp** after the user's go. The ps3recomp `d2-macos` branch (`f1d2b5c`, `5b24f49`) stays local; its changes ship as `patches/ps3recomp-d2-macos.diff` (apply to ps3recomp `a679051`).
 - **Codex AI done** (`codex/AI.report.md`): the battle OOB/Bus error was **debug-warp-only** (a hub announcement sprite kept a freed animation pack). The warp now drains native messages first. The GPU harness abort was a test-only static-name collision. **Real Mac: 120 s battle with constant Cross: PASS**, GPU harness PASS.
+
+- **Reviewed `codex/CURRENT_BUILD_REVIEW.md`** (R01–R12 + improvements). Agree with all findings. R04 is largely addressed by the post-review patch re-export in `fb8c2ec` (all four symbols present), but the clean bootstrap is untested. Confirmed R07 (capture.sh hardcodes the 1.00 ELF, so captures fail on 1.40 while printing "Done"), R09 (`DisgaeaD2Dist ALL`), and R10 (fixtures git-ignored, 0 CTest tests). Launched **AJ** (R01 ELF validation, R02 crash-safe save commit, R03 atomic EDAT cache, R06 exit status), **AK** (R04 SDK lock + bootstrap + lift generation, R10 tracked CTest suite, R12 overrides), **AL** (R05 shutdown path, R07 scripts, R08 nil-drawable, R09 packaging, R11 Finder content validation/install, plus FPS counter split and settings debounce).
+
+- 2026-10-05 AJ done (R01 ELF validation, R02 crash-safe save transactions + startup recovery, R03 atomic/locked EDAT cache, R06 exit status 1 on failed ppu_run). 25/25 CPU regression suites, 22 ASan loader cases, save interruption/ENOSPC matrix, EDAT 84/84. 140 smoke reached frame 2340 in sandbox (no Metal). Real-Mac verification deferred until the user's playtest ends (avoid competing with the live session); will verify combined AJ+AK+AL build.
+
+- 2026-10-05 USER PLAYTEST (dist app, v1.40+DLC, slot 00): full battle start to finish, normal path (move/attack/enemy turns/clear) — "buttery smooth". Native menu bar + cheat editor resolved party/inventory live. Closes the "full battle turn" verification item.
+
+- 2026-10-05 USER PLAYTEST: portrait white box/transparency GONE (V stencil fix confirmed visually). Post-game slot 01 Baal fight (heavy effects): 50-60 fps (measured while 3 Codex workers were compiling in the background). Next profiling pass targets the Baal fight once workers are idle and the user is not playing.
+
+- 2026-10-05 AK done (R04 patches/SDK.lock + tools/bootstrap_sdk.sh + patches/LIFTS.json/tools/generate_lifts.sh; R10 tracked port/tests with CTest, 36 tests incl. AJ/AL fixtures, GPU tests = explicit skip; R12 CMake honors RECOMP_DIR/D2_OUT_DIR/SPU_DIR). Clean clone + fresh SDK + regenerated lifts (10,374 / 10,315 PPU fns, ELF hashes verified) built 100 and 140; 28/28 ctest (26 pass + 2 GPU skips). Integration TODO: re-export SDK patch after AJ/AL, update SDK.lock, repeat bootstrap.
+
+- 2026-10-05 AL done (R05 single shutdown path that waits for in-flight saves; R07 scripts select version from build + preserve status; R08 nil-drawable no longer strands guest work; R09 DisgaeaD2Dist explicit, staged+signed+atomic publish, per-build destinations; R11 launcher validates/installs 1.40 + 45 DLC flags into the hdd0 in use; FPS counter split guest/display; geometry save debounce).
+- 2026-10-05 INTEGRATION (Claude, real Mac): port/build had a stale RECOMP_DIR=src/recomp (1.00 lift) cache entry that AK's R12 now honors; the new cheat-hook guard caught it at configure. Cleared cache paths -> defaults recomp-140/out-140/spu-140. Tests need the project venv: configure with -DPython3_EXECUTABLE=.venv/bin/python. **ctest 36/36 PASS on real Mac (GPU tests run, not skipped).** SDK committed locally as ps3recomp d2-macos cac3ded; patch re-exported (959 KB), SDK.lock updated; tools/bootstrap_sdk.sh into scratch PASS, and a fresh-SDK 140 build passes 36/36. Dist app rebuilt via DisgaeaD2Dist (signed, verify OK).
+- 2026-10-05 PROFILE (Baal map, stage 6001, copy of slot 01 via D2_WARP_STAGE=6001): steady **60.00 fps** over the last 1200 frames, ~55% total CPU, all >34 ms hitches at load transitions (save load / warp), one 39 ms frame. The user's 50-60 was most likely Codex build contention. Warp now prints the loaded stage-id table when the requested id is missing, and logs its scene/event gate while waiting. Known gap: scripted Triangle/Cross did not advance the Baal pre-battle dialogue after the warp (warp-only; the user plays it normally).
 
 ## Next actions
 - [x] ~~User: reproduce the stage-select black screen~~ (no longer happens; battle works)

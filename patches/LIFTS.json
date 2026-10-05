@@ -1,0 +1,67 @@
+{
+  "sdk_lock": "SDK.lock",
+  "environment": {
+    "PS3RECOMP_CHUNK_LINES": "50000",
+    "PYTHONHASHSEED": "0"
+  },
+  "commands": [
+    [
+      "ppu_loader.py",
+      "{elf}",
+      "--output",
+      "{out}"
+    ],
+    [
+      "ppu_lifter.py",
+      "{elf}",
+      "--functions",
+      "{out}/{stem}.functions.json",
+      "--hle-stubs",
+      "{out}/{stem}.imports.json",
+      "--jobs",
+      "4",
+      "--output",
+      "{recomp}"
+    ],
+    [
+      "extract_spu_images.py",
+      "{elf}",
+      "--output",
+      "{spu}/images"
+    ],
+    [
+      "build_spu_workloads.py",
+      "--images",
+      "{spu}/images",
+      "--lifted",
+      "{spu}",
+      "--out",
+      "{spu}/spu_workloads.c",
+      "--register-fn",
+      "d2_spu_register_all",
+      "--constructor",
+      "--title",
+      "Disgaea D2 BLUS31313",
+      "--relift"
+    ]
+  ],
+  "versions": {
+    "100": {
+      "elf": "work/EBOOT.elf",
+      "elf_sha256": "0ba5683248b00a5cdb75d52a640f8b8bc30fd16a16181549cd605f7b09645447",
+      "recomp": "src/recomp",
+      "out": "out",
+      "spu": "spu"
+    },
+    "140": {
+      "elf": "work/v140/EBOOT.elf",
+      "elf_sha256": "0ec183e580a270b0bb1b3a554794a9e4ec2d57a2be251ebdcf81fe21b78d225c",
+      "recomp": "src/recomp-140",
+      "out": "out-140",
+      "spu": "spu-140"
+    }
+  },
+  "python": ">=3.11 (verified with 3.14.5)",
+  "dependencies": "tools/requirements-lifts.txt",
+  "spu_extraction": "All embedded SPU ELFs; extractor names retained; builder invokes spu_lifter.py --auto-functions with distinct symbol prefixes and registers full-image/text fingerprints."
+}
