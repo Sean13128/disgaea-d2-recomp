@@ -334,11 +334,14 @@ cmake -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=../ps3re
 - **Pruned (user deferred to Claude's judgment):** deleted 35 old worker build dirs (`port/build-a…build-ah`, `build-j-asan`; ~2.5 GB, rebuildable in ~25 s each) and, in `port/runs/`, ~97k frame/audio dumps (`*.ppm`, `*.f32le`, raw/bin) plus 53 per-run `hdd0`/`hdd1` copies (FIOS cache.dat ~700 MB each). Kept `milestones/`, all logs/reports and anything touched in the last 2 h. Also cleared old scratch in `/Volumes/Data/ai-tmp/{claude/d2,codex}`. **Project 39 GB → 13 GB; scratch 37 GB → 4.5 GB (~60 GB freed).** Untouched: game dump, `port/hdd0` saves (slots 00/01), `dlc/`, ELFs, lifted sources, `port/build`, `port/build-ai` (AI running).
 - **Commit/push plan:** after Codex AI finishes, commit project `main` (on top of local `270982a`) + ps3recomp `d2-macos` + re-export the combined SDK patch, show the file list/message, and push `main` to the private repo after the user's go. The ps3recomp branch stays local unless the user wants a fork/upstream PR.
 
+- **Pushed** `main` (`270982a`, `fb8c2ec`) to the private repo **github.com/Sean13128/disgaea-d2-recomp** after the user's go. The ps3recomp `d2-macos` branch (`f1d2b5c`, `5b24f49`) stays local; its changes ship as `patches/ps3recomp-d2-macos.diff` (apply to ps3recomp `a679051`).
+- **Codex AI done** (`codex/AI.report.md`): the battle OOB/Bus error was **debug-warp-only** (a hub announcement sprite kept a freed animation pack). The warp now drains native messages first. The GPU harness abort was a test-only static-name collision. **Real Mac: 120 s battle with constant Cross: PASS**, GPU harness PASS.
+
 ## Next actions
 - [x] ~~User: reproduce the stage-select black screen~~ (no longer happens; battle works)
 - [ ] **User:** play a full battle turn (move, attack, end turn, enemy turn) and report anything odd.
 - [ ] **User:** double-click `port/dist/Disgaea D2.app`, Allow file access (macOS privacy), and confirm it launches.
-- [ ] **User:** review the first commit (file list in `git show --stat 270982a`) → approve push to the private repo.
+- [x] ~~review + push~~ (pushed Oct 5)
 - [x] ~~approve the GameFAQs save~~ → imported as slot 01
 - [ ] **User:** playtest the post-game save (slot 01): full-map battles, check the ATTACK ENTRY portrait has no white box
 - [x] (Codex A) Frame clock / Metal init on macOS: get the FIFO drained and a window open.
