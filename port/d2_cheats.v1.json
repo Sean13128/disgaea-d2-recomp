@@ -1,0 +1,807 @@
+{
+  "schema": 1,
+  "title": "BLUS31313",
+  "sources": [
+    "https://github.com/bucanero/apollo-patches/blob/main/PS3/BLUS31313.savepatch",
+    "https://github.com/bucanero/ArtemisPS3/tree/master/docs/codes",
+    "https://github.com/bucanero/ArtemisPS3/blob/master/docs/codes/Disgaea%20D2%20A%20Brighter%20Darkness%20BLES01939%2001.00.ncl"
+  ],
+  "layout": {
+    "size": 1498152,
+    "characters": 1432,
+    "character_stride": 6752,
+    "character_count": 1378284,
+    "character_name": 1616,
+    "items": 906520,
+    "item_stride": 400,
+    "item_count": 999,
+    "item_name": 241,
+    "equipment": 16,
+    "equipment_count": 4,
+    "item_total": 1306120,
+    "skill_ids": 2924,
+    "skill_count": 4475,
+    "skill_exp": 1900,
+    "skill_level": 3692,
+    "skill_boost": 3436
+  },
+  "versions": [
+    {
+      "version": "1.00",
+      "toc": 4185696,
+      "count_signature": 103804,
+      "pointer_offset": -32316,
+      "verified": true,
+      "calls": {
+        "add_item": {
+          "address": 848248,
+          "signature": [
+            "0xf821fde1",
+            "0x7c0802a6",
+            "0xfba10208"
+          ]
+        },
+        "remove_item": {
+          "address": 381912,
+          "signature": [
+            "0x2f830000",
+            "0x7c0802a6",
+            "0xf821ff91"
+          ]
+        },
+        "item_lookup": {
+          "address": 3406880,
+          "signature": [
+            "0x2f840000",
+            "0x409e0010",
+            "0x3960ffff"
+          ]
+        },
+        "class_lookup": {
+          "address": 3406776,
+          "signature": [
+            "0x2f840000",
+            "0x409e0010",
+            "0x3960ffff"
+          ]
+        },
+        "class_refresh": {
+          "address": 134832,
+          "signature": [
+            "0xf821ff71",
+            "0x7c0802a6",
+            "0xfba10078"
+          ]
+        },
+        "exp_threshold": {
+          "address": 101980,
+          "signature": [
+            "0x5463043e",
+            "0x81628190",
+            "0x8122817c"
+          ]
+        }
+      },
+      "slots": {
+        "save_manager": -18212,
+        "save_stat": -18108,
+        "save_file": -18104,
+        "save_metadata": -18112,
+        "item_table": -30308,
+        "class_table": -32368,
+        "inventory_table": -30380
+      },
+      "hooks": {
+        "exp": "0001A1DC",
+        "sp": "000F2A14",
+        "shop": "000CDABC",
+        "damage": "000E8954"
+      },
+      "resolver_words": [
+        "0x81220000",
+        "0x3d290015",
+        "0xa00907ec",
+        "0x7c000734",
+        "0x2f800000",
+        "0x409d0080"
+      ],
+      "sp_callers": [
+        {
+          "return": 2086500,
+          "entity_register": 27
+        },
+        {
+          "return": 2087648,
+          "entity_register": 27
+        },
+        {
+          "return": 2155276,
+          "entity_register": 24
+        },
+        {
+          "return": 2359468,
+          "entity_register": 19
+        }
+      ]
+    },
+    {
+      "version": "1.40",
+      "toc": 4710296,
+      "count_signature": 104056,
+      "pointer_offset": -32308,
+      "verified": true,
+      "calls": {
+        "add_item": {
+          "address": 871520,
+          "signature": [
+            "0xf821fde1",
+            "0x7c0802a6",
+            "0xfba10208"
+          ]
+        },
+        "remove_item": {
+          "address": 384856,
+          "signature": [
+            "0xf821ff91",
+            "0x7c0802a6",
+            "0xf8010080"
+          ]
+        },
+        "item_lookup": {
+          "address": 3471688,
+          "signature": [
+            "0x548b043e",
+            "0x2c0b0000",
+            "0x4182005c"
+          ]
+        },
+        "class_lookup": {
+          "address": 3471576,
+          "signature": [
+            "0x548b043e",
+            "0x2c0b0000",
+            "0x4182005c"
+          ]
+        },
+        "class_refresh": {
+          "address": 134316,
+          "signature": [
+            "0xf821ff71",
+            "0x7c0802a6",
+            "0xfba10078"
+          ]
+        },
+        "exp_threshold": {
+          "address": 102224,
+          "signature": [
+            "0x81228184",
+            "0x3d290001",
+            "0x54841838"
+          ]
+        }
+      },
+      "slots": {
+        "save_manager": -17424,
+        "save_stat": -17316,
+        "save_file": -17312,
+        "save_metadata": -17320,
+        "item_table": -30188,
+        "class_table": -32360,
+        "inventory_table": -30260
+      },
+      "hooks": {
+        "exp": "0001A274",
+        "sp": "000F9020",
+        "shop": "000D3748",
+        "damage": "000EEA0C"
+      },
+      "resolver_words": [
+        "0x81220000",
+        "0x3d290015",
+        "0xa00907ec",
+        "0x38e00000",
+        "0x7c090734",
+        "0x2c090000"
+      ],
+      "sp_callers": [
+        {
+          "return": 2131116,
+          "entity_register": 29
+        },
+        {
+          "return": 2132684,
+          "entity_register": 29
+        },
+        {
+          "return": 2199876,
+          "entity_register": 31
+        },
+        {
+          "return": 2406200,
+          "entity_register": 29
+        }
+      ]
+    }
+  ],
+  "fields": [
+    {
+      "scope": "general",
+      "key": "hl",
+      "label": "HL",
+      "offset": 1384,
+      "size": 8,
+      "min": 0,
+      "max": 9999999999999
+    },
+    {
+      "scope": "general",
+      "key": "bonus",
+      "label": "Bonus Gauge",
+      "offset": 1378306,
+      "size": 2,
+      "min": 0,
+      "max": 9
+    },
+    {
+      "scope": "general",
+      "key": "bonus_progress",
+      "label": "Bonus Gauge progress",
+      "offset": 1378304,
+      "size": 2,
+      "min": 0,
+      "max": 99
+    },
+    {
+      "scope": "general",
+      "key": "cp",
+      "label": "Cheat Shop CP",
+      "offset": 1378464,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "general",
+      "key": "shop_0",
+      "label": "Cheat Shop EXP %",
+      "offset": 1378468,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "general",
+      "key": "shop_1",
+      "label": "Cheat Shop Mana %",
+      "offset": 1378470,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "general",
+      "key": "shop_2",
+      "label": "Cheat Shop HL %",
+      "offset": 1378472,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "general",
+      "key": "shop_3",
+      "label": "Cheat Shop Weapon mastery %",
+      "offset": 1378474,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "general",
+      "key": "shop_4",
+      "label": "Cheat Shop Skill EXP %",
+      "offset": 1378476,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "character",
+      "key": "level",
+      "label": "Level",
+      "offset": 4436,
+      "size": 2,
+      "min": 1,
+      "max": 9999
+    },
+    {
+      "scope": "character",
+      "key": "mana",
+      "label": "Mana",
+      "offset": 4432,
+      "size": 4,
+      "min": 0,
+      "max": 9999999
+    },
+    {
+      "scope": "character",
+      "key": "exp",
+      "label": "EXP",
+      "offset": 8,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "hp",
+      "label": "HP",
+      "offset": 4208,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "sp",
+      "label": "SP",
+      "offset": 4216,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_0",
+      "label": "Max HP",
+      "offset": 4224,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_1",
+      "label": "Max SP",
+      "offset": 4232,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_2",
+      "label": "ATK",
+      "offset": 4240,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_3",
+      "label": "DEF",
+      "offset": 4248,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_4",
+      "label": "INT",
+      "offset": 4256,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_5",
+      "label": "RES",
+      "offset": 4264,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_6",
+      "label": "HIT",
+      "offset": 4272,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "stat_7",
+      "label": "SPD",
+      "offset": 4280,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "apt_0",
+      "label": "HP aptitude %",
+      "offset": 5412,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5380
+    },
+    {
+      "scope": "character",
+      "key": "apt_1",
+      "label": "SP aptitude %",
+      "offset": 5414,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5382
+    },
+    {
+      "scope": "character",
+      "key": "apt_2",
+      "label": "ATK aptitude %",
+      "offset": 5416,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5384
+    },
+    {
+      "scope": "character",
+      "key": "apt_3",
+      "label": "DEF aptitude %",
+      "offset": 5418,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5386
+    },
+    {
+      "scope": "character",
+      "key": "apt_4",
+      "label": "INT aptitude %",
+      "offset": 5420,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5388
+    },
+    {
+      "scope": "character",
+      "key": "apt_5",
+      "label": "RES aptitude %",
+      "offset": 5422,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5390
+    },
+    {
+      "scope": "character",
+      "key": "apt_6",
+      "label": "HIT aptitude %",
+      "offset": 5424,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5392
+    },
+    {
+      "scope": "character",
+      "key": "apt_7",
+      "label": "SPD aptitude %",
+      "offset": 5426,
+      "size": 2,
+      "min": 0,
+      "max": 300,
+      "mirror": 5394
+    },
+    {
+      "scope": "character",
+      "key": "class",
+      "label": "Class ID",
+      "offset": 4440,
+      "size": 2,
+      "min": 1,
+      "max": 32767
+    },
+    {
+      "scope": "item",
+      "key": "stat_0",
+      "label": "HP",
+      "offset": 120,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_1",
+      "label": "SP",
+      "offset": 128,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_2",
+      "label": "ATK",
+      "offset": 136,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_3",
+      "label": "DEF",
+      "offset": 144,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_4",
+      "label": "INT",
+      "offset": 152,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_5",
+      "label": "RES",
+      "offset": 160,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_6",
+      "label": "HIT",
+      "offset": 168,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "stat_7",
+      "label": "SPD",
+      "offset": 176,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "item",
+      "key": "id",
+      "label": "Item ID",
+      "offset": 184,
+      "size": 2,
+      "min": 1,
+      "max": 32767,
+      "readonly": true
+    },
+    {
+      "scope": "item",
+      "key": "level",
+      "label": "Item level",
+      "offset": 186,
+      "size": 2,
+      "min": 0,
+      "max": 9999
+    },
+    {
+      "scope": "item",
+      "key": "rarity",
+      "label": "Rarity (0 common / 1 rare / 2 legendary)",
+      "offset": 223,
+      "size": 1,
+      "min": 0,
+      "max": 2
+    },
+    {
+      "scope": "item",
+      "key": "rarity_value",
+      "label": "Rarity value",
+      "offset": 210,
+      "size": 1,
+      "min": 0,
+      "max": 255
+    },
+    {
+      "scope": "item",
+      "key": "counter",
+      "label": "Counters",
+      "offset": 204,
+      "size": 1,
+      "min": 0,
+      "max": 9
+    },
+    {
+      "scope": "item",
+      "key": "move",
+      "label": "Movement",
+      "offset": 214,
+      "size": 1,
+      "min": 0,
+      "max": 99
+    },
+    {
+      "scope": "item",
+      "key": "jump",
+      "label": "Jump",
+      "offset": 215,
+      "size": 1,
+      "min": 0,
+      "max": 99
+    },
+    {
+      "scope": "item",
+      "key": "range",
+      "label": "Range",
+      "offset": 217,
+      "size": 1,
+      "min": 0,
+      "max": 10
+    },
+    {
+      "scope": "item",
+      "key": "critical",
+      "label": "Critical %",
+      "offset": 220,
+      "size": 1,
+      "min": 0,
+      "max": 100
+    },
+    {
+      "scope": "character",
+      "key": "move",
+      "label": "Movement (base)",
+      "offset": 4464,
+      "mirror": 4465,
+      "size": 1,
+      "min": 1,
+      "max": 31
+    },
+    {
+      "scope": "character",
+      "key": "jump",
+      "label": "Jump (base)",
+      "offset": 4470,
+      "mirror": 4471,
+      "size": 1,
+      "min": 0,
+      "max": 99
+    },
+    {
+      "scope": "character",
+      "key": "counter",
+      "label": "Counters (base)",
+      "offset": 4466,
+      "mirror": 4467,
+      "size": 1,
+      "min": 0,
+      "max": 9
+    },
+    {
+      "scope": "character",
+      "key": "throw",
+      "label": "Throw range (base)",
+      "offset": 4468,
+      "mirror": 4469,
+      "size": 1,
+      "min": 1,
+      "max": 9
+    },
+    {
+      "scope": "character",
+      "key": "critical",
+      "label": "Critical % (base)",
+      "offset": 4462,
+      "mirror": 4463,
+      "size": 1,
+      "min": 0,
+      "max": 100
+    },
+    {
+      "scope": "item",
+      "key": "max_level",
+      "label": "Item World level limit",
+      "offset": 188,
+      "size": 2,
+      "min": 1,
+      "max": 9999
+    },
+    {
+      "scope": "character",
+      "key": "base_0",
+      "label": "Base HP",
+      "offset": 4288,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "base_1",
+      "label": "Base SP",
+      "offset": 4296,
+      "size": 8,
+      "min": 0,
+      "max": 99999999999
+    },
+    {
+      "scope": "character",
+      "key": "base_2",
+      "label": "Base ATK",
+      "offset": 4304,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "base_3",
+      "label": "Base DEF",
+      "offset": 4312,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "base_4",
+      "label": "Base INT",
+      "offset": 4320,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "base_5",
+      "label": "Base RES",
+      "offset": 4328,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "base_6",
+      "label": "Base HIT",
+      "offset": 4336,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    },
+    {
+      "scope": "character",
+      "key": "base_7",
+      "label": "Base SPD",
+      "offset": 4344,
+      "size": 8,
+      "min": 0,
+      "max": 99999999
+    }
+  ],
+  "unresolved": [
+    "Skill insertion/deletion (existing skills editable)",
+    "Class model refresh during current map",
+    "Bag/warehouse separation (shared inventory pool mapped)",
+    "Netherworld/story flags",
+    "Advanced Item World data beyond level"
+  ]
+}

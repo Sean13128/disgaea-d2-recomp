@@ -1,0 +1,690 @@
+--- a/libs/video/cellResc.c
++++ b/libs/video/cellResc.c
+@@ -233,51 +233,42 @@
+     return CELL_OK;
+ }
+ 
+-s32 cellRescSetConvertAndFlip(s32 index)
+-{
+-    if (!s_initialized)
+-        return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+-
+-    /* This is a real flip, not bookkeeping. A title that presents through RESC
+-     * -- Virtua Fighter 5 does -- renders into an off-screen surface and asks
+-     * RESC to scale it into a display buffer and show it. Tracking a counter
+-     * here and returning CELL_OK meant no flip ever reached cellGcm, so the
+-     * title's frame loop never closed: nothing retired, and it kept appending
+-     * to a command buffer it could never reclaim.
+-     *
+-     * ponytail: the convert half is deliberately not emitted -- the backend
+-     * already presents at the output resolution, so RESC's scale is a no-op for
+-     * us. What must happen is the flip. Rotate through the display buffers the
+-     * title registered, the way RESC's own double/triple buffering does. Emit a
+-     * real conversion draw if a title ever needs RESC's PAL/interlace modes
+-     * rather than a plain scale. */
+-    extern s32 cellGcmSetFlipCommand(u32 bufferId);
++s32 cellRescSetConvertAndFlip(void* context, s32 index)
++{
++    if (!s_initialized) return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
++    if (!context || index < 0 || index >= 8 || !s_src[index].width || !s_src[index].height)
++        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+     extern u32 cellGcm_display_buffer_count(void);
+-    u32 nbuf = cellGcm_display_buffer_count();
+-    if (nbuf) {
+-        cellGcmSetFlipCommand(s_flip_target % nbuf);
+-        s_submitted_flip_count = cellGcm_flip_request_count();
+-        s_flip_target = (u32)((s_flip_target + 1) % nbuf);
+-    }
+-
+-    s_flip_status = 1;      /* completion arrives at presentation */
+-
+-    { static int n = 0;
+-      if (n++ < 4)
+-          printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
+-                 index, nbuf); }
+-
++    const u32 nbuf = cellGcm_display_buffer_count();
++    if (!nbuf) return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
++    const CellRescSrc* src = &s_src[index];
++    /* FIFO requests are counted when the walker reaches their marker. Keep
++     * the submitted sequence now, so WaitFlip cannot retire an earlier frame. */
++    const u32 reached = cellGcm_flip_request_count();
++    const u32 sequence = (s_submitted_flip_count > reached ? s_submitted_flip_count : reached) + 1;
++    const s32 result = cellGcmRescConvertAndFlip(context, s_flip_target % nbuf,
++        src->offset, src->pitch, src->width, src->height, src->format);
++    if (result != CELL_OK) return result;
++    s_submitted_flip_count = sequence;
++    s_flip_target = (s_flip_target + 1) % nbuf;
++    s_flip_status = 1;
++    { static int n; if (n++ < 4)
++        printf("[cellResc] SetConvertAndFlip(src=%d) -> ordered conversion + flip, %u display buffer(s)\n",
++               index, nbuf); }
+     return CELL_OK;
+ }
+ 
+ /* NID: 0x0D3C22CE */
+ s32 cellRescSetWaitFlip(void* context)
+ {
+-    (void)context;
+     if (!s_initialized)
+         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+     /* Wait for the submitted RESC frame to retire at presentation. Polling
+      * GetFlipStatus used to fabricate completion and call handlers early. */
++    /* The SDK implements the GPU wait as a host wait. Publish this context's
++     * tail first, otherwise the caller cannot flush the queued flip while it
++     * is blocked here (D2 calls WaitFlip before its inline libgcm flush). */
++    if (s_submitted_flip_count) cellGcmFlushContext(context);
+     cellGcm_wait_flip_count(s_submitted_flip_count);
+     s_flip_status = 0;
+     return CELL_OK;
+--- a/libs/video/cellResc.h
++++ b/libs/video/cellResc.h
+@@ -101,7 +101,7 @@
+ 
+ s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
+ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
+-s32 cellRescSetConvertAndFlip(s32 index);
++s32 cellRescSetConvertAndFlip(void* context, s32 index);
+ s32 cellRescSetWaitFlip(void* context);
+ 
+ s32 cellRescSetFlipHandler(void (*handler)(u32));
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1153,6 +1153,32 @@
+                      s_nv309e.active, 10);
+           }
+       } }
++    const u32 l2w = (s_nv309e.fmt >> 16) & 0xFFu, l2h = s_nv309e.fmt >> 24;
++    const int swizzled = s_nv309e.active && s_nv309e.offset && l2w < 16 && l2h < 16 &&
++        (s_nv3089.fmt & 0xFFu) == 3u && (1u << l2w) == out_w && (1u << l2h) == out_h;
++    if (rsx_draw_engine_enabled() && !swizzled &&
++        ((s_nv3089.fmt & 0xFFu) == 3u || (s_nv3089.fmt & 0xFFu) == 4u)) {
++        u32 x = out_x, y = out_y, w = out_w, h = out_h;
++        const u32 cx = s_nv3089.clip_pt & 0xFFFFu, cy = s_nv3089.clip_pt >> 16;
++        const u32 cw = s_nv3089.clip_sz & 0xFFFFu, ch = s_nv3089.clip_sz >> 16;
++        if (cw && ch) {
++            const u32 right = x + w < cx + cw ? x + w : cx + cw;
++            const u32 bottom = y + h < cy + ch ? y + h : cy + ch;
++            if (x < cx) x = cx;
++            if (y < cy) y = cy;
++            w = right > x ? right - x : 0;
++            h = bottom > y ? bottom - y : 0;
++        }
++        const float ds = s_nv3089.ds_dx / 1048576.0f;
++        const float dt = s_nv3089.dt_dy / 1048576.0f;
++        if (rsx_draw_engine_blit(s_nv3089.src_dma == 0xFEED0001u ? 1u : 0u,
++                s_nv3089.in_off, in_pitch,
++                (s_nv3089.in_uv & 0xFFFFu) / 16.0f + (x - out_x) * ds,
++                (s_nv3089.in_uv >> 16) / 16.0f + (y - out_y) * dt, ds, dt,
++                s_gcm2d.dst_dma == 0xFEED0001u ? 1u : 0u,
++                s_gcm2d.dst_offset, dst_pitch, x, y, w, h,
++                ((s_nv3089.in_fmt >> 24) & 0xFFu) == 1u)) return;
++    }
+     /* A copy out of a surface the live renderer drew exists only on the GPU;
+      * mirror 1:1 blits there too (the guest-memory copy below still runs). */
+     if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+@@ -2286,7 +2312,9 @@
+                    * NV308A SIZE_OUT is ALPHA_FUNC). Do not fold their state
+                    * into the 3D register file. Match the routing below. */
+                   const u32 mfull = (subch << 13) | m;
+-                  if (eng && mfull != 0xE920u && mfull != 0xE924u && mfull != 0xE944u &&
++                  if (eng && mfull >= 0xE900u && mfull <= 0xE914u)
++                      rsx_draw_engine_method(mfull, data);
++                  else if (eng && mfull != 0xE920u && mfull != 0xE924u && mfull != 0xE944u &&
+                       (subch == 0 || (subch == 1 && !s1_2d)))
+                       rsx_draw_engine_method(mfull, data); }
+ 
+@@ -2311,7 +2339,9 @@
+                  * truncates them.  Reconstruct the full address the same way
+                  * the draw-engine call above does. */
+                 { const u32 mfull = (subch << 13) | m;
+-                if (mfull == 0xEB00u || mfull == 0xEB04u) {
++                if (mfull >= 0xE900u && mfull <= 0xE914u) {
++                    /* RESC packet handled by the draw engine above. */
++                } else if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                     cellGcmQueueUserCommand(data);
+                 } else if (mfull == 0xE920u || mfull == 0xE924u || mfull == 0xE944u) {
+                     u32 buffer = data & 7u;
+@@ -2341,6 +2371,16 @@
+                 } else
+                     gcm_2d_method(subch, m, data);
+                 }
++            }
++            if (rsx_draw_engine_enabled() && (subch == 4 || subch == 5) &&
++                method >= 0x0400u && method <= 0x07FCu &&
++                (s_gcm2d.color_fmt == 10u || s_gcm2d.color_fmt == 11u)) {
++                const u32 words = type == 0 ? count : 1u;
++                if (method + (words - 1u) * 4u <= 0x07FCu)
++                    rsx_draw_engine_upload_color(s_gcm2d.dst_dma == 0xFEED0001u ? 1u : 0u,
++                        s_gcm2d.dst_offset, s_gcm2d.pitch >> 16,
++                        (s_gcm2d.point & 0xFFFFu) + (method - 0x0400u) / 4u,
++                        s_gcm2d.point >> 16, words);
+             }
+             rsx_draw_engine_record_packet(s_fifo_getoff, s_host_enabled ? (const void*)(s_host_packet + 1) : vm_base + ea, 4 + count * 4);
+             s_fifo_getoff += 4 + count * 4;
+@@ -2682,8 +2722,9 @@
+      * always in RSX local memory (location 0). */
+     if (rsx_live_draw_enabled())
+         rsx_live_draw_set_display_buffer(bufferId, 0, offset, pitch, width, height);
+-    if (rsx_draw_engine_enabled())
+-        rsx_draw_engine_set_display_buffer(bufferId, 0, offset, pitch, width, height);
++    /* Registration often precedes backend init. Retain native metadata even
++     * then; the renderer allocates its scaled target on the consuming thread. */
++    rsx_draw_engine_set_display_buffer(bufferId, 0, offset, pitch, width, height);
+ 
+     return CELL_OK;
+ }
+@@ -3532,6 +3573,42 @@
+     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+         return gcm_flip_request(bufferId, 1);
+     return cellGcmSetFlipCommand(bufferId);
++}
++
++void cellGcmFlushContext(void* ctx)
++{
++    const u32 ea = (u32)(uintptr_t)ctx;
++    if (!ea) return;
++    const u32 current = vm_read32(ea + 8);
++    if (current < vm_read32(ea) || current > vm_read32(ea + 4)) return;
++    const u32 io = gcm_ea2io(current);
++    if (io == 0xFFFFFFFFu) return;
++    atomic_thread_fence(memory_order_release);
++    vm_write32(GCM_CONTROL_GUEST_ADDR, io);
++    cellGcm_fifo_kick();
++}
++
++s32 cellGcmRescConvertAndFlip(void* ctx, u32 bufferId, u32 offset, u32 pitch,
++                              u32 width, u32 height, u32 format)
++{
++    if (!rsx_draw_engine_enabled()) return _cellGcmSetFlipCommand(ctx, bufferId);
++    const u32 ea = (u32)(uintptr_t)ctx;
++    if (!ea || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[bufferId])
++        return CELL_GCM_ERROR_INVALID_VALUE;
++    u32 cur = vm_read32(ea + 8), end = vm_read32(ea + 4);
++    if ((u64)cur + 40 + GCM_RECYCLE_SLACK > end) {
++        cellGcm_fifo_recycle(ea);
++        cur = vm_read32(ea + 8); end = vm_read32(ea + 4);
++    }
++    if ((u64)cur + 40 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu)
++        return CELL_GCM_ERROR_INVALID_VALUE;
++    /* Six incrementing host driver methods, followed by the normal flip
++     * marker. The producer never calls the renderer from the guest thread. */
++    const u32 args[6] = { offset, pitch, width, height, format, bufferId };
++    vm_write32(cur, (6u << 18) | 0xE900u);
++    for (u32 i = 0; i < 6; i++) vm_write32(cur + 4 + i * 4, args[i]);
++    vm_write32(ea + 8, cur + 28);
++    return _cellGcmSetFlipCommand(ctx, bufferId);
+ }
+ 
+ /* NID: 0xD8F88E1A */
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -267,6 +267,10 @@
+ 
+ /* NID: 0xA2478CA3 */
+ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId);
++void cellGcmFlushContext(void* ctx);
++/* RESC's host conversion packet is ordered with rendering and the flip. */
++s32 cellGcmRescConvertAndFlip(void* ctx, u32 bufferId, u32 offset, u32 pitch,
++                              u32 width, u32 height, u32 format);
+ 
+ /* NID: 0x1BFAB6EE */
+ CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index);
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -135,6 +135,7 @@
+     eng_pipeline pipelines[ENG_MAX_PIPELINES];
+     u32 n_pipelines;
+     eng_display_buffer display_buffers[8];
++    u32 resc_copy[6];
+ 
+     u32 frames;
+     u64 texture_use_serial;
+@@ -1835,10 +1836,8 @@
+ {
+     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+-        for (u32 i = 0; i < g.n_surfaces; i++)
+-            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+-                g.surfaces[i].offset == d->offset)
+-                return i;
++        return eng_surface_get(d->location, d->offset, d->width, d->height,
++                                RSX_BE_FMT_R8G8B8A8);
+     }
+     return eng_current_surface();
+ }
+@@ -1870,6 +1869,101 @@
+     (void)user; (void)r;
+     g.last_flip_buffer = arg & 7u;
+     eng_present(g.last_flip_buffer);
++}
++
++/* Keep GPU detail when a transfer writes a registered scanout or another
++ * rendered target. Guest texture uploads still use the native memory path. */
++int rsx_draw_engine_blit(u32 sl, u32 src, u32 spitch, float sx, float sy,
++                         float step_x, float step_y, u32 dl, u32 dst, u32 dpitch,
++                         u32 dx, u32 dy, u32 w, u32 h, int linear)
++{
++    if (!g.ready || !spitch || !dpitch || !w || !h) return 0;
++    u32 source = ENG_INVALID, target = ENG_INVALID;
++    /* Exact addresses win over an older surface whose byte range contains
++     * them: titles reuse suballocations for smaller offscreen passes. */
++    for (u32 pass = 0; pass < 2 && source == ENG_INVALID; pass++)
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            const eng_surface* s = &g.surfaces[i];
++            if (s->location != sl || spitch < s->w * 4u || src < s->offset ||
++                (u64)src >= (u64)s->offset + (u64)spitch * s->h) continue;
++            if (!pass && src != s->offset) continue;
++            const u32 delta = src - s->offset;
++            sx += (delta % spitch) / 4u; sy += delta / spitch;
++            source = i; break;
++        }
++    if (source == ENG_INVALID) return 0;
++    for (u32 i = 0; i < 8; i++) {
++        const eng_display_buffer* d = &g.display_buffers[i];
++        if (d->valid && d->location == dl && d->offset == dst) {
++            target = eng_surface_get(dl, dst, d->width, d->height, RSX_BE_FMT_R8G8B8A8);
++            break;
++        }
++    }
++    if (target == ENG_INVALID)
++        for (u32 i = 0; i < g.n_surfaces; i++)
++            if (g.surfaces[i].location == dl && g.surfaces[i].offset == dst) { target = i; break; }
++    if (target != ENG_INVALID && g.be->blit) {
++        if (target == source && sx == dx && sy == dy && step_x == 1 && step_y == 1) return 1;
++        g.be->blit(g.be->user, g.surfaces[source].handle, g.surfaces[target].handle,
++                    sx, sy, w * step_x, h * step_y, dx, dy, w, h, linear);
++        return 1;
++    }
++    /* RTT copied to guest memory must resolve to native dimensions before the
++     * existing CPU transfer decodes its pixel layout and destination pitch. */
++    const eng_surface* s = &g.surfaces[source];
++    if (g.be->readback && g.be->submit_and_wait && s->fmt == RSX_BE_FMT_R8G8B8A8) {
++        u8* pixels = malloc((size_t)s->w * s->h * 4);
++        const u8* guest = eng_guest_ptr(NULL, sl, s->offset, spitch * s->h);
++        if (pixels && guest && spitch >= s->w * 4) {
++            g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++            g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, pixels, s->w * 4);
++            for (u32 y = 0; y < s->h; y++) for (u32 x = 0; x < s->w; x++) {
++                const u8* rgba = pixels + ((size_t)y * s->w + x) * 4;
++                u8* argb = (u8*)guest + (size_t)y * spitch + x * 4;
++                if (rsx_texture_argb_is_rgba()) memcpy(argb, rgba, 4);
++                else { argb[0] = rgba[3]; argb[1] = rgba[0]; argb[2] = rgba[1]; argb[3] = rgba[2]; }
++            }
++        }
++        free(pixels);
++    }
++    return 0;
++}
++
++void rsx_draw_engine_upload_color(u32 location, u32 offset, u32 pitch,
++                                   u32 x, u32 y, u32 width)
++{
++    if (!g.ready || !g.be->blit || !pitch || !width) return;
++    u32 slot = ENG_INVALID;
++    for (u32 i = 0; i < 8; i++) {
++        const eng_display_buffer* d = &g.display_buffers[i];
++        if (d->valid && d->location == location && d->offset == offset) {
++            slot = eng_surface_get(location, offset, d->width, d->height, RSX_BE_FMT_R8G8B8A8);
++            break;
++        }
++    }
++    if (slot == ENG_INVALID)
++        for (u32 i = 0; i < g.n_surfaces; i++)
++            if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) { slot = i; break; }
++    if (slot == ENG_INVALID || x >= g.surfaces[slot].w || y >= g.surfaces[slot].h) return;
++    if (width > g.surfaces[slot].w - x) width = g.surfaces[slot].w - x;
++    const u8* guest = eng_guest_ptr(NULL, location, offset + y * pitch + x * 4, width * 4);
++    u8* pixels = malloc(width * 4);
++    if (!guest || !pixels) { free(pixels); return; }
++    for (u32 i = 0; i < width; i++) {
++        if (rsx_texture_argb_is_rgba()) memcpy(pixels + i * 4, guest + i * 4, 4);
++        else {
++            pixels[i*4] = guest[i*4+1]; pixels[i*4+1] = guest[i*4+2];
++            pixels[i*4+2] = guest[i*4+3]; pixels[i*4+3] = guest[i*4];
++        }
++    }
++    const u32 upload = g.be->texture_create(g.be->user, RSX_BE_FMT_R8G8B8A8,
++                                            width, 1, 1, 1, 0xAAE4u, 0x85u);
++    if (upload) {
++        g.be->texture_upload(g.be->user, upload, 0, 0, width, 1, pixels, width * 4, 1);
++        g.be->blit(g.be->user, upload, g.surfaces[slot].handle, 0, 0, width, 1, x, y, width, 1, 0);
++        g.be->texture_release(g.be->user, upload);
++    }
++    free(pixels);
+ }
+ 
+ /* ---- public API ---------------------------------------------------------- */
+@@ -1964,6 +2058,18 @@
+ void rsx_draw_engine_method(u32 method, u32 arg)
+ {
+     if (!g.ready) return;
++    /* Host RESC conversion packet, consumed in FIFO order before its flip. */
++    if (method >= 0xE900u && method <= 0xE914u) {
++        const u32 field = (method - 0xE900u) / 4u;
++        g.resc_copy[field] = arg;
++        if (field == 5 && arg < 8 && g.display_buffers[arg].valid) {
++            const eng_display_buffer* d = &g.display_buffers[arg];
++            rsx_draw_engine_blit(0, g.resc_copy[0], g.resc_copy[1], 0, 0,
++                (float)g.resc_copy[2] / d->width, (float)g.resc_copy[3] / d->height,
++                d->location, d->offset, d->pitch, 0, 0, d->width, d->height, 1);
++        }
++        return;
++    }
+     /* The subchannel is a binding slot, not an engine selector, and a title
+      * whose SPU-built command lists bind NV4097 elsewhere would otherwise
+      * store its state in the wrong register bank.  Standard NV4097 methods
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -199,6 +199,12 @@
+     void (*clear_depth_stencil)(void* user, u32 depth, u32 flags,
+                                 float depth_value, u8 stencil);
+ 
++    /* Rectangles are native guest pixels. The backend scales each resource
++     * exactly once; uploaded textures are never supersampled. */
++    void (*blit)(void* user, u32 source, u32 destination,
++                 float sx, float sy, float sw, float sh,
++                 u32 dx, u32 dy, u32 dw, u32 dh, int linear);
++
+     /* Present the named surface, and read a rectangle of one back. The rows
+      * come back in the format the target was created with, so R,G,B,A for an
+      * ordinary colour surface. */
+@@ -244,6 +250,16 @@
+  * the engine has actually rendered rather than to whatever is bound. */
+ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
+                                         u32 pitch, u32 width, u32 height);
++
++/* GPU transfer from a rendered surface; returns 0 for ordinary guest uploads.
++ * Unregistered destinations receive a native readback for the CPU copy path. */
++int rsx_draw_engine_blit(u32 sl, u32 src, u32 spitch, float sx, float sy,
++                         float step_x, float step_y, u32 dl, u32 dst, u32 dpitch,
++                         u32 dx, u32 dy, u32 w, u32 h, int linear);
++
++/* Inline CPU color words update scaled targets without scaling guest memory. */
++void rsx_draw_engine_upload_color(u32 location, u32 offset, u32 pitch,
++                                   u32 x, u32 y, u32 width);
+ 
+ /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
+  * on its fence sees the GPU catch up. */
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2213,7 +2213,7 @@
+ static u32 s_eng_view_count;
+ 
+ typedef enum {
+-    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE
++    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE, ENG_REC_BLIT
+ } EngRecKind;
+ 
+ typedef struct {
+@@ -2242,6 +2242,7 @@
+     float clear_depth;
+     u8    clear_stencil;
+     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
++    int   blit_linear;
+ } EngRecord;
+ 
+ static EngRecord s_eng_rec[ENG_MAX_RECORDS];
+@@ -2260,11 +2261,20 @@
+ static MTLPixelFormat             s_eng_blit_pso_fmt;
+ static id<MTLRenderPipelineState> s_eng_depth_pso;
+ static id<MTLSamplerState>        s_eng_point_sampler;
++static id<MTLSamplerState>        s_eng_linear_sampler;
++static id<MTLRenderPipelineState> s_eng_transfer_pso;
++static MTLPixelFormat             s_eng_transfer_fmt;
+ 
+ static NSString* const kEngHelperMSL = @
+ "#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct BOut { float4 pos [[position]]; float2 uv; };\n"
++"fragment float4 eng_transfer_fs(BOut i [[stage_in]], texture2d<float> src [[texture(0)]],\n"
++"    sampler s [[sampler(0)]], constant float4* rect [[buffer(0)]]) {\n"
++"    float2 uv = (rect[0].xy + (i.pos.xy - rect[1].xy) * rect[0].zw) /\n"
++"                float2(src.get_width(), src.get_height());\n"
++"    return src.sample(s, uv);\n"
++"}\n"
+ "vertex BOut eng_fullscreen_vs(uint vid [[vertex_id]]) {\n"
+ "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+ "    BOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+@@ -2418,7 +2428,9 @@
+     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+     s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+-    return s_eng_point_sampler ? 0 : -1;
++    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
++    s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
++    return s_eng_point_sampler && s_eng_linear_sampler ? 0 : -1;
+ }
+ 
+ static void eng_vertex_buffers_clear(void);
+@@ -2444,6 +2456,8 @@
+     s_eng_blit_pso = nil;
+     s_eng_depth_pso = nil;
+     s_eng_point_sampler = nil;
++    s_eng_linear_sampler = nil;
++    s_eng_transfer_pso = nil;
+     s_eng_active = 0;
+     atomic_store_explicit(&s_host_engine_output, 0, memory_order_relaxed);
+ }
+@@ -3079,6 +3093,84 @@
+     return 1;
+ }
+ 
++/* Pixel-space transfer; callers convert guest edges once. Exact copies use
++ * the blit encoder so a RESC pass cannot filter away supersampled detail. */
++static void eng_transfer(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst,
++                          const float source[4], const u32 dest[4], int linear)
++{
++    if (!src || !dst || !dest[2] || !dest[3]) return;
++    if (src == dst) {
++        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
++            src.pixelFormat width:src.width height:src.height mipmapped:NO];
++        td.usage = MTLTextureUsageShaderRead;
++        id<MTLTexture> snapshot = [s_dev newTextureWithDescriptor:td];
++        if (!snapshot) return;
++        id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++        [enc copyFromTexture:src toTexture:snapshot]; [enc endEncoding];
++        src = snapshot;
++    }
++    const u32 x = dest[0], y = dest[1];
++    if (x >= dst.width || y >= dst.height) return;
++    const u32 w = MIN(dest[2], dst.width - x), h = MIN(dest[3], dst.height - y);
++    if (src.pixelFormat == dst.pixelFormat && source[2] == dest[2] && source[3] == dest[3] &&
++        source[0] >= 0 && source[1] >= 0 && source[0] == floorf(source[0]) &&
++        source[1] == floorf(source[1]) && source[0] + w <= src.width && source[1] + h <= src.height) {
++        id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++        [enc copyFromTexture:src sourceSlice:0 sourceLevel:0
++            sourceOrigin:MTLOriginMake(source[0], source[1], 0) sourceSize:MTLSizeMake(w, h, 1)
++            toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(x, y, 0)];
++        [enc endEncoding];
++        return;
++    }
++    if (!s_eng_transfer_pso || s_eng_transfer_fmt != dst.pixelFormat) {
++        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
++        pd.vertexFunction = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
++        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_transfer_fs"];
++        pd.colorAttachments[0].pixelFormat = dst.pixelFormat;
++        NSError* error = nil;
++        s_eng_transfer_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&error];
++        if (!s_eng_transfer_pso) {
++            fprintf(stderr, "[rsx engine/metal] transfer pipeline failed: %s\n", error.localizedDescription.UTF8String);
++            return;
++        }
++        s_eng_transfer_fmt = dst.pixelFormat;
++    }
++    const float rect[8] = { source[0], source[1], source[2] / dest[2], source[3] / dest[3],
++                            (float)x, (float)y, 0, 0 };
++    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++    rp.colorAttachments[0].texture = dst;
++    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
++    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
++    [enc setRenderPipelineState:s_eng_transfer_pso];
++    [enc setViewport:(MTLViewport){x, y, dest[2], dest[3], 0, 1}];
++    [enc setScissorRect:(MTLScissorRect){x, y, w, h}];
++    [enc setFragmentTexture:src atIndex:0];
++    [enc setFragmentSamplerState:linear ? s_eng_linear_sampler : s_eng_point_sampler atIndex:0];
++    [enc setFragmentBytes:rect length:sizeof rect atIndex:0];
++    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++    [enc endEncoding];
++}
++
++static void eng_blit(void* user, u32 source, u32 destination,
++                      float sx, float sy, float sw, float sh,
++                      u32 dx, u32 dy, u32 dw, u32 dh, int linear)
++{
++    (void)user;
++    if (s_eng_rec_count >= ENG_MAX_RECORDS) eng_encode_and_commit(nil);
++    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
++    *r = (EngRecord){0};
++    r->kind = ENG_REC_BLIT; r->tex[0] = source; r->rt[0] = destination;
++    r->vp[0] = sx; r->vp[1] = sy; r->vp[2] = sw; r->vp[3] = sh;
++    r->sc[0] = dx; r->sc[1] = dy; r->sc[2] = dw; r->sc[3] = dh;
++    r->blit_linear = linear;
++}
++
++static float eng_transfer_edge(float native, float scale)
++{
++    return native == floorf(native) ? floorf(native * scale + 0.5f) : native * scale;
++}
++
+ /* Is this record aimed at exactly these colour attachments, in this order? */
+ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
+ {
+@@ -3095,6 +3187,19 @@
+ {
+     u32 i = 0;
+     while (i < s_eng_rec_count) {
++        if (s_eng_rec[i].kind == ENG_REC_BLIT) {
++            const EngRecord* r = &s_eng_rec[i++];
++            const float scale = s_eng_native[r->tex[0]-1].w ? s_eng_scale / 2.0f : 1.0f;
++            const float sx = eng_transfer_edge(r->vp[0], scale), sy = eng_transfer_edge(r->vp[1], scale);
++            const float source[4] = {sx, sy,
++                eng_transfer_edge(r->vp[0] + r->vp[2], scale) - sx,
++                eng_transfer_edge(r->vp[1] + r->vp[3], scale) - sy};
++            const u32 dest[4] = {eng_scaled(r->sc[0]), eng_scaled(r->sc[1]),
++                rsx_host_scale_extent(r->sc[0], r->sc[2], s_eng_scale),
++                rsx_host_scale_extent(r->sc[1], r->sc[3], s_eng_scale)};
++            eng_transfer(cb, eng_obj(r->tex[0]), eng_obj(r->rt[0]), source, dest, r->blit_linear);
++            continue;
++        }
+         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
+             const EngRecord* r = &s_eng_rec[i++];
+             id<MTLTexture> src = eng_obj(r->depth);
+@@ -3126,7 +3231,8 @@
+         float cdepth = 1.0f;
+         u8 cstencil = 0;
+         while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
+-               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE) {
++               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE &&
++               s_eng_rec[i].kind != ENG_REC_BLIT) {
+             const EngRecord* r = &s_eng_rec[i];
+             if (r->kind == ENG_REC_CLEAR_COLOR) {
+                 u32 k = 0;
+@@ -3585,7 +3691,9 @@
+         id<MTLTexture> native = [s_dev newTextureWithDescriptor:td];
+         if (!native) return;
+         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+-        eng_copy_surface(cb, t, native, 0); [cb commit]; [cb waitUntilCompleted];
++        const float source[4] = {0, 0, (float)t.width, (float)t.height};
++        const u32 dest[4] = {0, 0, nw, nh};
++        eng_transfer(cb, t, native, source, dest, 1); [cb commit]; [cb waitUntilCompleted];
+         t = native;
+     }
+     if (x + w > [t width] || y + h > [t height]) return;
+@@ -3621,6 +3729,7 @@
+     .draw                 = eng_draw,
+     .clear_color          = eng_clear_color,
+     .clear_depth_stencil  = eng_clear_depth_stencil,
++    .blit                 = eng_blit,
+     .present              = eng_present,
+     .readback             = eng_readback,
+ };
+--- a/libs/video/rsx_metal_overlay.m
++++ b/libs/video/rsx_metal_overlay.m
+@@ -92,14 +92,15 @@
+          215, 580, 850, 30, 22);
+     CGContextRelease(cg);
+ }
+-static id<MTLTexture> texture(void)
++static id<MTLTexture> sized_texture(NSUInteger width, NSUInteger height)
+ {
+     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+-        width:UI_WIDTH height:UI_HEIGHT mipmapped:NO];
++        width:width height:height mipmapped:NO];
+     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+     td.storageMode = MTLStorageModeShared;
+     return [s_device newTextureWithDescriptor:td];
+ }
++static id<MTLTexture> texture(void) { return sized_texture(UI_WIDTH, UI_HEIGHT); }
+ static id<MTLRenderPipelineState> pipeline(MTLPixelFormat format, int blend)
+ {
+     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+@@ -154,7 +155,7 @@
+ }
+ /* Capture a private texture in the same command buffer. Readback is done on
+  * completion, so neither AppKit nor presentation waits for the GPU/disk. */
+-static void capture(id<MTLCommandBuffer> cb, const SysOverlaySnapshot* ui)
++static void capture(id<MTLCommandBuffer> cb, const SysOverlaySnapshot* ui, id<MTLTexture> source)
+ {
+     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
+     if (!path || !*path) return;
+@@ -168,19 +169,21 @@
+     if (strstr(path, "%u")) snprintf(numbered, sizeof numbered, path, frame);
+     else snprintf(numbered, sizeof numbered, "%s", path);
+     NSString* filename = [NSString stringWithUTF8String:numbered];
+-    id<MTLTexture> image = texture();
+-    draw(cb, s_composed, image, 0);
++    const NSUInteger width = source.width, height = source.height;
++    id<MTLTexture> image = sized_texture(width, height);
++    if (!image) return;
++    draw(cb, source, image, 0);
+     int active = ui->active;
+     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+         if (done.status == MTLCommandBufferStatusError) return;
+-        unsigned char* pixels = malloc(UI_WIDTH * UI_HEIGHT * 4);
++        unsigned char* pixels = malloc(width * height * 4);
+         if (!pixels) return;
+-        [image getBytes:pixels bytesPerRow:UI_WIDTH * 4
+-            fromRegion:MTLRegionMake2D(0, 0, UI_WIDTH, UI_HEIGHT) mipmapLevel:0];
++        [image getBytes:pixels bytesPerRow:width * 4
++            fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+         FILE* file = fopen(filename.UTF8String, "wb");
+         if (file) {
+-            fprintf(file, "P6\n%d %d\n255\n", UI_WIDTH, UI_HEIGHT);
+-            for (size_t i = 0; i < UI_WIDTH * UI_HEIGHT; i++) {
++            fprintf(file, "P6\n%zu %zu\n255\n", (size_t)width, (size_t)height);
++            for (size_t i = 0; i < width * height; i++) {
+                 unsigned char rgb[] = { pixels[i*4+2], pixels[i*4+1], pixels[i*4] };
+                 fwrite(rgb, 1, 3, file);
+             }
+@@ -208,7 +211,7 @@
+         dispatch_semaphore_signal(s_inflight); pthread_mutex_unlock(&s_lock); return;
+     }
+     id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+-    compose(cb, &s_snapshot); capture(cb, &s_snapshot); draw(cb, s_composed, drawable.texture, 0);
++    compose(cb, &s_snapshot); capture(cb, &s_snapshot, s_composed); draw(cb, s_composed, drawable.texture, 0);
+     [cb presentDrawable:drawable];
+     dispatch_semaphore_t sem = s_inflight;
+     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; dispatch_semaphore_signal(sem); }];
+@@ -254,10 +257,18 @@
+ {
+     pthread_mutex_lock(&s_lock);
+     if (!s_copy || !guest) return;
++    /* UI coordinates remain native, but composition and captures retain the
++     * guest target's pixels. Text is sampled as an overlay at that resolution. */
++    if (s_background.width != guest.width || s_background.height != guest.height) {
++        id<MTLTexture> background = sized_texture(guest.width, guest.height);
++        id<MTLTexture> composed = sized_texture(guest.width, guest.height);
++        if (!background || !composed) return;
++        s_background = background; s_composed = composed;
++    }
+     draw(cb, guest, s_background, 0);
+     ps3_overlay_snapshot(&s_snapshot);
+-    compose(cb, &s_snapshot);
+-    capture(cb, &s_snapshot);
++    if (s_snapshot.active) compose(cb, &s_snapshot);
++    capture(cb, &s_snapshot, s_snapshot.active ? s_composed : guest);
+     if (s_snapshot.active) draw(cb, s_composed, display, 0);
+     s_was_active = s_snapshot.active;
+ }

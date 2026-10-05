@@ -1,0 +1,571 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index b63df84..1683853 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -71,9 +71,37 @@ static u64 get_timestamp_ns(void)
+  * -----------------------------------------------------------------------*/
+ 
+ static atomic_int s_gcm_initialized = 0;
+-static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
++static atomic_uint s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
+ static atomic_uint s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+ 
++/* One monotonic 60 Hz phase for counters and VSYNC, independent of drawing,
++ * presentation latency and how often the guest queries the counter. */
++static atomic_ullong s_vblank_epoch_ns;
++static u64 gcm_vblank_elapsed_ns(void)
++{
++    u64 now = get_timestamp_ns(), epoch = s_vblank_epoch_ns;
++    if (!epoch) {
++        atomic_compare_exchange_strong(&s_vblank_epoch_ns, &epoch, now);
++        epoch = s_vblank_epoch_ns;
++    }
++    return now >= epoch ? now - epoch : 0;
++}
++
++static u64 gcm_vblank_at(u64 elapsed)
++{
++    return elapsed / 1000000000ULL * 60 + elapsed % 1000000000ULL * 60 / 1000000000ULL;
++}
++
++unsigned cellGcm_vblank_wait_ms(void)
++{
++    u64 phase = gcm_vblank_elapsed_ns() % 1000000000ULL;
++    u64 next = (phase * 60 / 1000000000ULL + 1) * 1000000000ULL;
++    u64 remaining = (next + 59) / 60 - phase;
++    return (unsigned)((remaining + 999999) / 1000000);
++}
++
++u32 cellGcm_flip_mode(void) { return s_flip_mode; }
++
+ /* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
+  * loop uses this as the frame boundary: presenting only when a flip arrived
+  * keeps partially-drained frames off screen (the ticker otherwise presents on
+@@ -84,19 +112,7 @@ static atomic_uint s_flip_request_count = 0;
+ 
+ u32 cellGcm_flip_request_count(void)
+ {
+-    u32 count = s_flip_request_count;
+-    if (getenv("GCM_FLIPCOUNT")) {
+-        static u64 since;
+-        static u32 previous;
+-        u64 now = get_timestamp_ns();
+-        if (!since) { since = now; previous = count; }
+-        if (now - since >= 5000000000ULL) {
+-            fprintf(stderr, "[gcm-rate] flips=%u flips_per_s=%.2f\n",
+-                    count, (count - previous) * 1e9 / (now - since));
+-            since = now; previous = count;
+-        }
+-    }
+-    return count;
++    return s_flip_request_count;
+ }
+ static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+ 
+@@ -121,6 +137,13 @@ static u64 s_progress_generation;
+ static atomic_uint s_presented_flip_count;
+ static atomic_uint s_completed_flip_count;
+ 
++/* Keep each submitted flip distinct. FIFO producers stop at a flip; direct
++ * HLE producers may queue more than one. Backpressure bounds that queue. */
++#define GCM_FLIP_QUEUE_SIZE 64u
++static struct { u32 buffer; u64 earliest_vblank; } s_flip_queue[GCM_FLIP_QUEUE_SIZE];
++static SRWLOCK s_flip_lock = SRWLOCK_INIT;
++static u64 s_last_present_vblank;
++
+ static u64 gcm_progress_begin(void)
+ {
+     AcquireSRWLockExclusive(&s_progress_lock);
+@@ -147,11 +170,46 @@ static void gcm_progress_wait(u64 generation, unsigned ms)
+ 
+ void cellGcm_fifo_kick(void);
+ 
++static void gcm_queue_flip(u32 bufferId)
++{
++    for (;;) {
++        u64 generation = gcm_progress_begin();
++        AcquireSRWLockExclusive(&s_flip_lock);
++        u32 requested = s_flip_request_count;
++        if (requested - s_completed_flip_count < GCM_FLIP_QUEUE_SIZE) {
++            u32 slot = requested % GCM_FLIP_QUEUE_SIZE;
++            s_flip_queue[slot].buffer = bufferId;
++            s_flip_queue[slot].earliest_vblank = gcm_vblank_at(gcm_vblank_elapsed_ns()) + 1;
++            s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
++            s_flip_request_count = requested + 1;
++            s_flip_pending = 1;
++            ReleaseSRWLockExclusive(&s_flip_lock);
++            cellGcm_fifo_kick();
++            return;
++        }
++        ReleaseSRWLockExclusive(&s_flip_lock);
++        cellGcm_fifo_kick();
++        gcm_progress_wait(generation, INFINITE);
++    }
++}
++
+ int cellGcm_take_flip_pending(void)
+ {
+-    int v = atomic_exchange(&s_flip_pending, 0);
+-    if (v) s_presented_flip_count = s_flip_request_count;
+-    return v;
++    int ready = 0;
++    AcquireSRWLockExclusive(&s_flip_lock);
++    u32 completed = s_completed_flip_count;
++    u64 vblank = gcm_vblank_at(gcm_vblank_elapsed_ns());
++    u32 slot = completed % GCM_FLIP_QUEUE_SIZE;
++    if (s_flip_pending && s_presented_flip_count == completed &&
++        (s_flip_mode != CELL_GCM_DISPLAY_VSYNC ||
++         (vblank >= s_flip_queue[slot].earliest_vblank && vblank > s_last_present_vblank))) {
++        s_current_display_buffer_id = s_flip_queue[slot].buffer;
++        s_presented_flip_count = completed + 1;
++        s_last_present_vblank = vblank;
++        ready = 1;
++    }
++    ReleaseSRWLockExclusive(&s_flip_lock);
++    return ready;
+ }
+ 
+ 
+@@ -220,15 +278,6 @@ uint32_t g_gcm_driver_info_ea = 0;
+ 
+ static u32 s_flip_handler_opd     = 0;
+ 
+-/* GCM_FLIPCB_ONTICK=1: fire the guest flip handler only when the flip
+- * completes (cellGcmTickFlip), not also when it is requested. */
+-static int gcm_flipcb_on_tick_only(void)
+-{
+-    static int v = -1;
+-    if (v < 0) v = getenv("GCM_FLIPCB_ONTICK") ? 1 : 0;
+-    return v;
+-}
+-
+ static u32 s_vblank_handler_opd   = 0;
+ static u32 s_user_handler_opd     = 0;
+ static u32 s_second_v_handler_opd = 0;
+@@ -269,8 +318,8 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
+ /* Flip timing */
+ static atomic_ullong s_last_flip_time = 0;
+ 
+-/* VBlank counter (incremented on each flip as approximation) */
+-static u32 s_vblank_count = 0;
++/* Last vblank notification; the guest counter itself comes from the clock. */
++static atomic_ullong s_vblank_count = 0;
+ 
+ /* IO map reservation tracking */
+ static u32 s_io_map_reserved = 0;  /* bytes reserved for IO mapping */
+@@ -486,8 +535,11 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+     s_vblank_handler = NULL;
+     s_user_handler = NULL;
+     s_second_v_handler = NULL;
+-    s_last_flip_time = get_timestamp_ns();
++    s_last_flip_time = get_timestamp_ns() / 1000;
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++    s_flip_request_count = s_presented_flip_count = s_completed_flip_count = 0;
++    s_flip_pending = 0;
++    s_last_present_vblank = 0;
+     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
+     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+     s_vblank_count = 0;
+@@ -717,26 +769,8 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
+ 
+ void cellGcm_request_tick(void)
+ {
+-    s_vblank_count++;
+-    /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
+-     * actually consumed up to `put`.
+-     *
+-     * A title's fifo-finish can use flip status as a fast path -- Twisted
+-     * Metal's reads it first and, if the flip is done, skips waiting for `get`
+-     * entirely. Completing a flip on the 60 Hz beat regardless of FIFO
+-     * progress therefore tells it the RSX has caught up when it has not, and
+-     * it recycles a FIFO block the walker is still inside, overwriting the
+-     * JUMP out of it. Off by default: a title whose FIFO never drains would
+-     * stop flipping entirely. */
+-    { static int need = -1;
+-      if (need < 0) { const char* e = getenv("GCM_FLIP_NEEDS_FIFO"); need = e ? atoi(e) : 0; }
+-      if (need) {
+-          u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+-          GCM_PENDING_SET(1);
+-          if (s_fifo_getoff == put) cellGcmTickFlip();
+-          return;
+-      } }
+-    GCM_PENDING_SET(1);
++    cellGcmTickVBlank();
++    /* Completion requires the present gate; a raw tick cannot retire work. */
+     cellGcmTickFlip();
+ }
+ 
+@@ -756,7 +790,7 @@ void ppu_gcm_pump(void)
+       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
+                if ((calls % 20000) == 0)
+                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
+-                           calls, nv, nf, s_vblank_count, 10); } }
++                           calls, nv, nf, (unsigned)s_vblank_count, 10); } }
+     if (p & 1) { extern void cellResc_notify_vblank(void); cellResc_notify_vblank(); }
+     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+@@ -781,7 +815,17 @@ void ppu_gcm_pump(void)
+ 
+ /* Back-compat: the old direct entry points now just mark a tick pending (so any
+  * caller other than the ticker still works) -- delivery stays on the main thread. */
+-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
++void cellGcmTickVBlank(void)
++{
++    u64 count = gcm_vblank_at(gcm_vblank_elapsed_ns());
++    u64 previous = s_vblank_count;
++    while (count > previous) {
++        if (atomic_compare_exchange_weak(&s_vblank_count, &previous, count)) {
++            GCM_PENDING_SET(1);
++            break;
++        }
++    }
++}
+ /* Only deliver a flip completion when a flip is actually outstanding.
+  *
+  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+@@ -796,15 +840,37 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+  * the callback IS the flip interrupt -- no flip, no callback. */
+ void cellGcmTickFlip(void)
+ {
++    AcquireSRWLockExclusive(&s_flip_lock);
+     u32 presented = s_presented_flip_count;
+     if (presented != s_completed_flip_count) {
++        /* Called after the backend submits this flip. Retire just this frame,
++         * release the flip semaphore and publish callbacks/wakeups together. */
++        s_last_flip_time = get_timestamp_ns() / 1000;
+         s_completed_flip_count = presented;
+-        s_last_flip_time = get_timestamp_ns();
+-        if (presented == s_flip_request_count)
+-            s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++        s_flip_pending = (presented != s_flip_request_count);
++        if (!s_flip_pending) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++        vm_write32(GCM_LABEL_GUEST_BASE + 0x10, 0);
+         GCM_PENDING_SET(2);
++        if (getenv("GCM_FLIPCOUNT")) {
++            static u64 since;
++            static u32 previous;
++            u64 now = get_timestamp_ns();
++            if (!since) { since = now; previous = presented; }
++            if (now - since >= 5000000000ULL) {
++                fprintf(stderr, "[gcm-rate] flips=%u flips_per_s=%.6f time_ns=%llu vblanks=%llu\n",
++                        presented, (presented - previous) * 1e9 / (now - since),
++                        (unsigned long long)now,
++                        (unsigned long long)cellGcmGetVBlankCount());
++                since = now; previous = presented;
++            }
++        }
++        ReleaseSRWLockExclusive(&s_flip_lock);
++        ps3_poll_notify(GCM_LABEL_GUEST_BASE + 0x10, 4);
+         gcm_progress_notify();
++        cellGcm_fifo_kick();
++        return;
+     }
++    ReleaseSRWLockExclusive(&s_flip_lock);
+ }
+ 
+ /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
+@@ -837,10 +903,6 @@ unsigned long long ps3_ms_now(void)
+ }
+ 
+ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+-/* Backlog past which the drain stops honouring one-flip-per-tick and
+- * catches up instead. Sized well above a frame's command list so a
+- * title that keeps up never sees this path. */
+-#define GCM_FIFO_CATCHUP_BYTES 0x10000u
+ /* How close `current` must get to `end` before the runtime will recycle a ring
+  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
+  * title that is merely near the end from being touched. */
+@@ -1860,25 +1922,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+                 /* Queued by _cellGcmSetFlipCommand, which already did the
+                  * guest-visible half of the request. */
+-                s_current_display_buffer_id = w & 7u;
+-                s_flip_request_count++;
+-                s_flip_pending = 1;
++                gcm_queue_flip(w & 7u);
+             } else {
+                 cellGcmSetFlipCommand(w & 0xFFu);
+             }
+-            /* ...unless the FIFO is badly backlogged. One flip per drain is
+-             * right while `get` is keeping up with `put`; when it is megabytes
+-             * behind it is a deadlock, because the title's ring can only be
+-             * reclaimed as `get` advances. VF5 submits ~5x faster than one
+-             * flip per drain consumes, so its 4 MB ring fills, its own
+-             * buffer-full callback can never free space, and AMGL prints
+-             * "Command Buffer Overflow" forever. Past the threshold keep
+-             * draining -- the intermediate presents are frames we are too far
+-             * behind to show anyway. No-op for a title that is keeping up. */
+-            if (put < s_fifo_getoff ||
+-                put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+-                { why = "flip"; break; }
+-            continue;
++            /* Preserve this batch even with a full ring. The next vblank
++             * releases it, then event-driven draining resumes immediately. */
++            why = "flip";
++            break;
+         }
+ 
+         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+@@ -2083,9 +2134,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                    * NV308A SIZE_OUT is ALPHA_FUNC). Do not fold their state
+                    * into the 3D register file. Match the routing below. */
+                   const u32 mfull = (subch << 13) | m;
+-                  if (eng && (subch == 0 || (subch == 1 && !s1_2d) ||
+-                              mfull == 0xE920u || mfull == 0xE924u ||
+-                              mfull == 0xE944u))
++                  if (eng && mfull != 0xE920u && mfull != 0xE924u && mfull != 0xE944u &&
++                      (subch == 0 || (subch == 1 && !s1_2d)))
+                       rsx_draw_engine_method(mfull, vm_read32(dea)); }
+ 
+                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
+@@ -2111,7 +2161,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 { const u32 mfull = (subch << 13) | m;
+                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                     cellGcmQueueUserCommand(vm_read32(dea));
+-                } else if (mfull == 0xE920u || mfull == 0xE924u) {
++                } else if (mfull == 0xE920u || mfull == 0xE924u || mfull == 0xE944u) {
+                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                     rsx_process_method(&s_state, m, vm_read32(dea));
+@@ -2136,6 +2186,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 }
+             }
+             s_fifo_getoff += 4 + count * 4;
++            if (s_flip_pending) { why = "flip"; break; }
+             continue;
+         }
+         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
+@@ -2506,31 +2557,12 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+         return CELL_GCM_ERROR_INVALID_VALUE;
+ 
+ 
+-    /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
+-     * the drain does this half when it reaches it (see the 0xFEAD case). */
+-    if (!in_fifo) {
+-        s_current_display_buffer_id = bufferId;
+-        s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+-        s_flip_request_count++;
+-        s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+-    }
+-    /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+-     * until the present thread's cellGcmTickFlip marks it done (vsync). */
+-    s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
++    /* In-FIFO requests become ready only after their preceding draws.
++     * Flip callbacks belong solely to completion, never to submission. */
++    if (!in_fifo) gcm_queue_flip(bufferId);
++    else s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+     cellGcm_fifo_kick();
+ 
+-    /* Invoke via OPD resolution, not a raw call into guest code.
+-     *
+-     * On hardware this callback fires when the flip COMPLETES, at vsync --
+-     * which is what cellGcmTickFlip does. Calling it again here, at request
+-     * time, is a compatibility wart: some titles need the early edge, but a
+-     * title that issues its first flip while still initialising then runs its
+-     * handler against half-built state. Tokyo Jungle faults that way, in
+-     * func_001F2D3C, dereferencing a singleton it has not constructed yet.
+-     * GCM_FLIPCB_ONTICK=1 leaves the callback to the tick alone. */
+-    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
+-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
+-
+     return CELL_OK;
+ }
+ 
+@@ -3337,6 +3369,9 @@ void cellGcmTerminate(void)
+     s_gcm_initialized = 0;
+     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++    s_flip_request_count = s_presented_flip_count = s_completed_flip_count = 0;
++    s_flip_pending = 0;
++    s_last_present_vblank = 0;
+     gcm_progress_notify();
+     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+     s_vblank_count = 0;
+@@ -3410,11 +3445,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+     return CELL_OK;
+ }
+ 
+-/* Return incrementing VBlank counter */
+-u32 cellGcmGetVBlankCount(void)
++/* Reading the hardware counter has no side effects, even if presentation
++ * is stalled or no flips have ever been submitted. */
++u64 cellGcmGetVBlankCount(void)
+ {
+-    /* Approximate: increment each time queried (games use this for timing) */
+-    return s_vblank_count++;
++    return gcm_vblank_at(gcm_vblank_elapsed_ns());
+ }
+ 
+ /* Return tile info for a given index */
+diff --git a/libs/video/cellGcmSys.h b/libs/video/cellGcmSys.h
+index 854f57c..89b2bde 100644
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -285,6 +285,8 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
+  * title-screen state machine from the VBlank handler. */
+ void cellGcmTickVBlank(void);
+ void cellGcmTickFlip(void);
++unsigned cellGcm_vblank_wait_ms(void);
++u32 cellGcm_flip_mode(void);
+ 
+ /* NID: 0xF9BFCDA3 */
+ void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
+@@ -398,7 +400,7 @@ s32 cellGcmReserveIoMapSize(u32 size);
+ s32 cellGcmUnreserveIoMapSize(u32 size);
+ 
+ /* VBlank counter */
+-u32 cellGcmGetVBlankCount(void);
++u64 cellGcmGetVBlankCount(void);
+ 
+ /* Tile / Zcull info getters */
+ CellGcmTileInfo* cellGcmGetTileInfo(u8 index);
+diff --git a/libs/video/rsx_metal_backend.h b/libs/video/rsx_metal_backend.h
+index aee795c..06c9b22 100644
+--- a/libs/video/rsx_metal_backend.h
++++ b/libs/video/rsx_metal_backend.h
+@@ -35,6 +35,8 @@ int  rsx_metal_backend_pump_messages(void);
+ /* Present one frame: clear the drawable to the colour last received through the
+  * RSX clear method, then hand it to the compositor. */
+ void rsx_metal_backend_present(void);
++void rsx_metal_backend_set_vsync(int enabled);
++void rsx_metal_backend_set_flip_buffer(u32 buffer);
+ 
+ /* --- test hooks ---------------------------------------------------------- */
+ 
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 0690514..480e531 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -71,6 +71,7 @@
+ 
+ static id<MTLDevice>       s_dev;
+ static id<MTLCommandQueue> s_queue;
++static u32                s_flip_buffer; /* selected at the GCM present gate */
+ static CAMetalLayer*       s_layer;      /* windowed only   */
+ static id<MTLTexture>      s_offscreen;  /* headless only   */
+ static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+@@ -531,6 +532,7 @@ static int create_window_impl(const char* title)
+     s_layer = [CAMetalLayer layer];
+     s_layer.device          = s_dev;
+     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
++    s_layer.displaySyncEnabled = YES;
+     s_layer.framebufferOnly = NO; /* system overlay preserves the vtable frame */
+     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
+ 
+@@ -3093,6 +3095,16 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+     [e endEncoding];
+ }
+ 
++/* The runner gates guest VSYNC on its 60 Hz clock. Keep the compositor
++ * synchronized too, without waiting for GPU/display completion on the CPU. */
++void rsx_metal_backend_set_flip_buffer(u32 buffer) { s_flip_buffer = buffer; }
++
++void rsx_metal_backend_set_vsync(int enabled)
++{
++    if (s_layer && s_layer.displaySyncEnabled != (BOOL)(enabled != 0))
++        s_layer.displaySyncEnabled = (enabled != 0);
++}
++
+ /* Encode everything recorded so far and commit it.
+  *
+  * The staging arena is recycled the moment this returns, which is safe
+@@ -3434,10 +3446,9 @@ int rsx_metal_backend_pump_messages(void)
+ void rsx_metal_backend_present(void)
+ {
+     if (!s_ready) return;
+-    /* Under the draw engine the frame belongs to it: a host that drives the
+-     * flip itself (the harness, the boot smoke title) calls here, and a title
+-     * whose FIFO carries 0xE944 presents through the engine's own sink. */
+-    if (s_eng_active) { rsx_draw_engine_present(); return; }
++    /* GCM selects the completed buffer at its present gate. FIFO flip methods
++     * must not submit a drawable early through the draw engine's own sink. */
++    if (s_eng_active) { rsx_draw_engine_present_buffer(s_flip_buffer); return; }
+     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
+     if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+     @autoreleasepool {
+diff --git a/templates/project/main.cpp b/templates/project/main.cpp
+index 7a62aad..d1038eb 100644
+--- a/templates/project/main.cpp
++++ b/templates/project/main.cpp
+@@ -95,6 +95,10 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+ void     rsx_set_backend(struct rsx_backend*);
+ void     cellGcmTickVBlank(void);
+ void     cellGcmTickFlip(void);
++unsigned cellGcm_vblank_wait_ms(void);
++uint64_t cellGcmGetVBlankCount(void);
++uint32_t cellGcm_flip_mode(void);
++uint32_t cellGcmGetCurrentDisplayBufferId(void);
+ void     cellGcm_fifo_kick_wait(unsigned ms);
+ int      cellGcm_take_flip_pending(void);
+ void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+@@ -119,6 +123,8 @@ extern "C" int  rsx_d3d12_backend_pump_messages(void);
+ #elif defined(__APPLE__)
+ extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
+ extern "C" void rsx_metal_backend_present(void);
++extern "C" void rsx_metal_backend_set_vsync(int enabled);
++extern "C" void rsx_metal_backend_set_flip_buffer(uint32_t buffer);
+ extern "C" int  rsx_metal_backend_pump_messages(void);
+ #  define rsx_backend_init    rsx_metal_backend_init
+ #  define rsx_backend_present rsx_metal_backend_present
+@@ -180,6 +186,10 @@ extern "C" unsigned ppu_boot_frames_presented(void)
+ 
+ static void present_guest_frame(void)
+ {
++#ifdef __APPLE__
++    rsx_metal_backend_set_flip_buffer(cellGcmGetCurrentDisplayBufferId());
++    rsx_metal_backend_set_vsync(cellGcm_flip_mode() == 2); /* DISPLAY_VSYNC */
++#endif
+     s_backend_present();
+     /* This thread increments and guest threads read, so interlocked rather
+      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
+@@ -212,36 +222,23 @@ static DWORD WINAPI frame_clock(LPVOID)
+     }
+ #endif
+ 
+-    LARGE_INTEGER frequency, counter;
+-    QueryPerformanceFrequency(&frequency);
+-    QueryPerformanceCounter(&counter);
+-    const LONGLONG period = frequency.QuadPart / 60;
+-    LONGLONG next_tick = counter.QuadPart + period;
++    uint64_t previous_vblank = cellGcmGetVBlankCount();
+ 
+     for (;;) {
+-        QueryPerformanceCounter(&counter);
+-        LONGLONG remaining = next_tick - counter.QuadPart;
+-        unsigned wait_ms = remaining > 0
+-            ? (unsigned)((remaining * 1000 + frequency.QuadPart - 1) / frequency.QuadPart) : 0;
+-        /* put/label/flip notifications drain immediately; the timeout only
+-         * services vblank and the window when the guest has nothing to submit. */
+-        cellGcm_fifo_kick_wait(wait_ms);
+-        QueryPerformanceCounter(&counter);
+-        if (counter.QuadPart >= next_tick) {
+-            cellGcmTickVBlank();
+-            /* Present the completed batch before allowing the next drain.
+-             * Flip completion wakes the producer only AFTER presentation. */
+-            if (rsx_ok && cellGcm_take_flip_pending()) {
+-                present_guest_frame();
+-                cellGcmTickFlip();
+-            } else if (rsx_ok && cellGcm_flip_request_count() == 0) {
+-                s_backend_present();
+-            }
+-            /* Preserve clock phase, skipping missed refreshes rather than
+-             * bursting multiple presents/callbacks faster than 60 Hz. */
+-            QueryPerformanceCounter(&counter);
+-            next_tick += ((counter.QuadPart - next_tick) / period + 1) * period;
++        /* A kick drains immediately. VSYNC readiness is enforced by GCM,
++         * using the same clock as its counters; HSYNC need not await vblank. */
++        cellGcm_fifo_kick_wait(cellGcm_vblank_wait_ms());
++        cellGcmTickVBlank();
++        uint64_t vblank = cellGcmGetVBlankCount();
++        /* Hold the batch until its scheduled refresh, submit it, then wake
++         * the producer. Missed refreshes advance counters without bursts. */
++        if (rsx_ok && cellGcm_take_flip_pending()) {
++            present_guest_frame();
++            cellGcmTickFlip();
++        } else if (rsx_ok && vblank != previous_vblank && cellGcm_flip_request_count() == 0) {
++            s_backend_present();
+         }
++        previous_vblank = vblank;
+         if (rsx_ok) {
+             cellGcm_rsx_process_fifo();
+             if (s_backend_pump() != 0) rsx_ok = 0;

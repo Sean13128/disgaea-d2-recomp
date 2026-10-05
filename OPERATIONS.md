@@ -29,7 +29,7 @@
 
 ## 📊 Progress dashboard (updated Oct 4, 11:55pm CT)
 
-**Overall: ~73% of the way to "playable start to finish"** (11 of 15 checkpoints done; see below).
+**Overall: ~80% of the way to "playable start to finish"** (12 of 15 checkpoints done; see below).
 
 ### Code translation
 | Metric | Done | Total | % |
@@ -54,7 +54,7 @@ The 28 unhandled imports are mostly PRX loaders, sockets, keyboard, the movie co
 | 7 | Cutscene dialogue advances with input | ✅ (scripted); Laharl meteor cutscene reached (`milestones/cutscene-laharl-meteor.png`) |
 | 8 | A human plays with keyboard/gamepad in the live window | ✅ user skipped the meteor scene with △ via keyboard |
 | 9 | Free movement in the castle hub | ✅ user walked the hub after Continue ("full speed" until the next room) |
-| 10 | First battle (grid, attacks, enemy turn) | ❌ stage selector works; **selecting a stage → static near-black screen** (218 draws/frame, no errors) |
+| 10 | First battle (grid, attacks, enemy turn) | ✅ **user entered a battle on real Metal: map, units, HUD render correctly** (`milestones/first-battle-user.webp`). Minor: ATTACK ENTRY portrait drawn on a white box (Codex V) |
 | 11 | Save game | ✅ user saved in-game (`NPUB31321_NORMAL_00`, 1.5 MB SAVEDATA.DAT, RPCS3 layout) |
 | 12 | Continue / load save | ✅ restart → Continue → `LOAD complete` → castle hub |
 | 13 | Menus, shops, Item World | ⏳ |
@@ -75,9 +75,9 @@ The 28 unhandled imports are mostly PRX loaders, sockets, keyboard, the movie co
 ### Performance and stability
 | Metric | Value |
 |---|---|
-| Frame rate (real Metal, M4) | **60.0 fps at title, 55.7 fps on a loaded map** (Q host check) |
-| CPU use (game process) | **~97% title / ~120% map** (was ~700%) |
-| Game speed | ✅ ~full speed after O + Q (user saw full speed in the hub before Q) |
+| Frame rate (real Metal, M4) | ✅ title 60.0 · battle 60.0 · **Castle Hallway (heaviest, ~800 draws) 59.99** · 1 flip per vblank |
+| CPU use (game process) | **~70% on the map** after S (was ~700%) |
+| Game speed | ✅ full speed everywhere measured (title, castle, hallway, battle) |
 | Memory (game process) | ~640 MB (system at 12/16 GB incl. workers) |
 | Longest verified run without crash | **450 s (7.5 min), ended by timer: no crash, no corruption, no hang** |
 | Build time (incremental / full lifted code) | ~25 s |
@@ -103,7 +103,7 @@ The 28 unhandled imports are mostly PRX loaders, sockets, keyboard, the movie co
 | Guest shader translator (glslang + spirv-cross) | ✅ guest VP/FP translate to MSL; Metal pipelines compile on the real host |
 | Audio init (synth2/cellAudio/ATRAC) | ✅ (Codex D) synth2 SPU ⇄ PPU event/mailbox protocol works; silent audio clock at 187.5 Hz |
 | Guest frames on real Metal | 🟡 **first real art:** Prinny "NOW LOADING" sprite renders and animates (`port/runs/milestones/first-frame-now-loading.png`). ~53 fps, 3,180 frames/60 s with no stall. Later scenes fixed by Codex G |
-| ATRAC audio decode + CoreAudio out | ✅ (Codex H) streaming ATRAC3plus BGM/voice decode with no errors; real host: `driver=coreaudio` 48 kHz stereo, 187.5 blocks/s, BGM peaks up to 0.43 |
+| Audio output | ✅ ATRAC/synth2 decode + CoreAudio; **choppy-audio fix (W): 0.04% silent blocks** |
 | Loading progress | ✅ (Codex E) stable: 4/4 runs × 55 s keep presenting (~2,500 frames), no SPU faults, reused cache OK |
 | Input (keyboard/gamepad on macOS) | ✅ (Codex I) AppKit keyboard monitor + SDL2 gamepads on main thread; scripted input verified on real Metal |
 | New Game → story → in-engine map | ✅ real Metal, scripted input (`port/runs/milestones/story-intro.png`, `ingame-flonne-garden.png`) |
@@ -259,7 +259,96 @@ cmake -B port/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR=../ps3re
 
 - **Mac app rebuilt** with all fixes (`cmake --build port/build --target DisgaeaD2Dist` → `port/dist/Disgaea D2.app`, signature verifies). Launched via `open`: the launcher never reached the runner (empty `~/Library/Logs/DisgaeaD2Recomp/latest.log`) even with a valid config written to `~/Library/Application Support/DisgaeaD2Recomp/config`. Most likely macOS privacy (TCC): a LaunchServices-launched app needs the user's one-time approval to read files on `/Volumes/Data`, so it sits on that prompt or the file picker. **User action:** double-click the app and Allow access (or pick the dump folder and `work/EBOOT.elf`). Closed it for the night.
 
+- **Repo prepared (local only, NOT pushed):** project commit `270982a` (84 files, 1.6 MB: sources, docs, scripts, worker prompts/reports, patches; no game data, lifted code or logs). SDK changes are committed on the local ps3recomp branch `d2-macos` (`f1d2b5c`) and exported as `patches/ps3recomp-d2-macos.diff` (110 files, audited: no binaries, no personal paths). **Awaiting the user's review before `git push`.** Note: 25 docs/reports mention local paths (`/Volumes/Data/...`); the user should decide whether to scrub them.
+
+- **Codex S done** (`codex/S.report.md`, `patches/S-perf.diff`): NEON `spu_shufb` (exhaustive selector tests), debug store-watch and `vm_read32` tracing outlined behind cached gates, 4096-entry line filter before notifier buckets (**patch 19**). Real Mac: **map CPU 70%**, but **69.9 flips/s**, so the game runs ~16% fast (vsync was not enforced; the CPU limit hid it before). Launched **Codex T**: firmware-correct vsync flip pacing at 60 Hz.
+
+- **Codex T done** (`codex/T.report.md`, `patches/T-vsync.diff`). S's 69.9 was a **sampling artifact** in S's script, but T fixed real firmware defects: flip mode was ignored, flips could merge, vblank counters were manufactured on query, and flip handlers/status fired early. Now each VSYNC flip retires on its own tick of a monotonic 60 Hz clock, with Metal presentation in lockstep (**patch 20**). **Real Mac: title 59.998 / map 60.002 flips/s, flips == vblanks.** 🎯
+
+- **Morning (Oct 5, ~6:30am): the user took over the nav2 window** (Continue → castle → gatekeeper → stage) and **entered the first battle**. Map, units, HUD, help panel, Bonus gauge all correct, so the old stage-select black screen no longer reproduces (likely fixed by the overnight Q/T/S timing work). One visual bug: the top-left "ATTACK ENTRY" portrait renders on an opaque white rectangle. Launched **Codex V** (alpha/transparency for that draw). Codex U (debug stage warp) is still useful for automated battle testing.
+
+- **User feedback in battle: "biggest issues are speed and audio; audio is painfully distorted."**
+  - **Battle profile** (live sample, `/Volumes/Data/ai-tmp/claude/d2/battle-sample.txt`): ~37 fps @ 88% CPU. PPU main 42% in `cellRescSetWaitFlip`; the RSX render thread is 48% blocked on main-queue dispatch; the **main thread is 54% in `nanosleep`**: A's `ppu_run` main loop did `CFRunLoopRunInMode(0.01, returnAfterSourceHandled) + Sleep(1)`, so every main-queue present waited out a sleep. **Claude fixed it** (block in `CFRunLoopRunInMode(0.25, false)`, sleep only on `kCFRunLoopRunFinished`) (**patch 21**). Awaiting the user's speed impression.
+  - **Audio:** the user's capture (`port/runs/capture.Yy9G/mix.f32le`, 211 s) shows **exactly alternating silent/non-silent 256-sample blocks (".#.#.#", 50.5% silent), no clipping**, i.e. audio gated at 93.75 Hz = the "distortion". Launched **Codex W**.
+
+- **User: after the main-thread sleep fix, battle speed is "about half the slowdown, 0.5–0.75 of full".** Live battle profile (`port/runs/battle-profile-2.txt`): CPU ~110%, presentation 60/s, PPU main 46% in RescSetWaitFlip, 8.6% ring recycle, 8.6% guest usleep; RSX thread 71% idle, and `eng_texture_content_hash` costs 7.5%. Neither side is saturated, so flips probably retire a vblank late. Launched **Codex X** (per-flip latency instrumentation, battle-speed fix). Audio was silent in that session because W's in-progress cellAudio edits were in the tree when capture.sh rebuilt.
+
+- **Codex U done** (`codex/U.report.md`): **`D2_WARP_STAGE=<n>`** (opt-in, port-only `port/src/d2_debug_warp.cpp`). After Continue loads the hub, it replays the stage-select confirmation path (`0002E3C4`, `001E1B80(0)`, `0008D8A4(11,0)`) and enters battle without navigation. `D2_WARP_STAGE=1` = first battle (map 101, mission 5011). `D2_WARP_TRACE=1` logs state only. The old 218-draw "black" frame was the stage fade-in (final overlay alpha ramps from 0.26). It no longer freezes; frames advance with real geometry. **Automated battle testing now possible.**
+
+- **Codex W done** (`codex/W.report.md`, `patches/W-audio-clock.diff`). Root cause of the "painful distortion": with a device open, cellAudio consumption was driven only by device room, and the CoreAudio callback takes 512 frames = **two** PS3 blocks at once, so every other block was consumed before the guest rendered it (silence). Fix: always pace on the monotonic 256/48000 s deadline and use device room only as back-pressure (**patch 22**). **Real Mac (CoreAudio): 0.037% silent blocks (was 50%), continuous pattern.** WAV: `port/runs/W-host.QzEtYh/mix.wav` (sent to the user).
+
+- **User confirmed: "audio improved tremendously"** after W's fix. ✅
+
+- **Codex X done** (`codex/X.report.md`, `patches/X-battle-speed.diff`): D2 calls Finish → RESC ConvertAndFlip → WaitFlip once per frame (no 30 fps divider). **Headless warp battle: 60.0 distinct guest flips/s**, with no late-retirement bug found. Sped up the texture mutation hash (4 independent streams) and added `GCM_FLIP_TRACE`. Fixed the stale Q sync test for T's VSYNC. If real Metal battles are still slow, the cost is in the Metal backend/GPU path, not guest pacing. Real-Metal check queued until the user closes their session.
+
+- **X real-Metal battle check** (warp → battle 101): **59.998 distinct guest flips/s = vblanks/s, 440/440 flips retired on the next tick**, 0 undrained FIFO submissions; submit→retire mean 10.0 ms. Battle pacing is correct on real hardware with the current build. Asked the user to re-feel battle speed.
+
+- **User playtest (play.sh, latest build):** "battle feels smooth"; **castle main room drags**. Live profile (`port/runs/hub-profile.txt`): PPU 18% waiting in `cellGcm_fifo_recycle` (ring full) + 27% WaitFlip while the RSX thread is 60% idle, so heavy scenes (~800 draws) overflow the ring and the drain/recycle waits for vblank/present. Launched **Codex Y**.
+- **User: "something happened and audio went out of whack like before"**, right after Claude's `sample` suspended the process ~8 s. W's deadline clock does not resync after a stall. Launched **Codex Z** (resync after hitches, App Nap opt-out, SIGSTOP/SIGCONT test).
+
+- **User left for work (~7am).** Asked for: (1) a late-game save from the web to stress-test full-map battles, (2) keep improving efficiency; granted screen control (needs an in-person approval dialog, so not usable while away).
+  - Found on [GameFAQs saves](https://gamefaqs.gamespot.com/ps3/687861-disgaea-d2-a-brighter-darkness/saves): **NA post-game save by XYZexal (02/19/2014, 1,552 KB, cycle 1, DLC chars/weapons)**, and a maxed EU save (RoronoaZoro97, 1,533 KB). **Download awaits the user's explicit OK.** Retail PS3 saves may need secure-file decryption/resign (pfd/Apollo-style, using public keys) to load in our RPCS3-layout cellSaveData.
+
+- **Codex Z done** (`codex/Z.report.md`): discard deadline debt > 3 blocks (~16 ms), ≥4.33 ms reserve after each notification so short delays can't burst, and an `NSActivityLatencyCritical|UserInitiated` process activity (App Nap off) (**patch 23**). **Real Mac: 5 s SIGSTOP mid-BGM → 0% silent before / first second after / settled; continuous pattern.** WAV `port/runs/Z-host.pZGZPs/mix.wav`.
+
+- **Codex Y done** (`codex/Y.report.md`, `patches/Y-fifo-*`): fixed a generic flip-ordering defect (a direct flip could present before the preceding unread commands ran). Headless hallway 56.3→59.8. **Real Mac (Y host check, Castle Hallway map30001): 30.0 distinct flips/s (788/1576 vblanks)**, recycle mean 1.55 ms × ~7 wraps/frame. Claude's Metal hallway profile (`port/runs/hallway-metal-profile.txt`): RSX 48% idle, 26% FIFO processing dominated by CPU per-element vertex decode, plus vm_read/write and TLS lookups. PPU and RSX are serialized per ring wrap. Launched **Codex AA** (overlap drain with PPU writes, bulk/NEON/cached vertex fetch, hot-path TLS/watch removal).
+
+- **Codex AA done** (`codex/AA.report.md`): engine-only decoding (no double decode), NEON bulk vertex fetch, a 32 MiB verified vertex cache, immutable MTLBuffers, redundant-bind suppression, chunked self-kicking drain, and hot-path gates. Recorded hallway drain **8.27→4.88 ms/frame** (**patch 24**). **Real Mac still 30.000 flips/s**: recycle mean 0.91 ms × ~7/frame, **wake_next_submit 17.45 ms** (PPU frame-build time just over one vblank → always retires on the 2nd tick). Launched **Codex AB**: snapshot the ring into a host command queue on recycle so the PPU never waits for Metal encoding (ordering-preserving), plus a PPU work profile.
+
+- **Codex AB done** (`codex/AB.report.md`, `patches/AB-fifo-snapshot*`): an RSX copy worker snapshots complete command packets into 64×64 KiB host buffers and publishes guest GET after copying, so recycling no longer waits for Metal encoding. Ordered execution is preserved (17 new sync checks; replay checksum identical) (**patch 25**). **Real Mac, Castle Hallway: 59.992 distinct flips/s (1588/1588 vblanks)**, recycle mean 0.064 ms (was 0.91), wake→submit 12.05 ms (was 17.45). 🎯
+
+- **User approved the GameFAQs NA post-game save download.** Identified save `23628` = `NPUB31321_NORMAL_04` (ICON0.PNG, PARAM.PFD, PARAM.SFO, SAVEDATA.DAT **1,498,160** B = protected/encrypted form of our 1,498,152 B plain file). GameFAQs 403s non-browser clients (TLS fingerprinting) and the browser pane cannot save downloads, so the user was asked to click the link once; a watcher copies it from `~/Downloads` into `saves-import/` and unzips it. Launched **Codex AC**: `tools/d2_save_import.py` (secure-file decrypt via public PFD format + D2's secure file id → plain RPCS3 layout, written to a copy, never over the user's saves).
+
+## Post-goal feature backlog (user request, Oct 5)
+- **Resolution options**: internal render resolution scale (native 720p → 1080p/1440p/4K, i.e. render targets scaled up for a sharper image), plus output filtering (nearest/linear, integer scale).
+- **Display options**: windowed sizes, fullscreen (exclusive vs borderless), aspect (16:9 letterbox/stretch), vsync on/off, frame-rate cap.
+- **Save import/export menu**: keep Codex AC's `tools/d2_save_import.py` (console/PSN-format save → port/RPCS3 plain layout, plus reverse) as a maintained tool and expose it later as a user-facing option (settings menu / app menu: "Import PS3 save…", "Export save…") operating on `~/Library/Application Support/DisgaeaD2Recomp/hdd0`.
+- **Audio options**: master mute/volume (and maybe a separate movie volume), mute when unfocused.
+- (Natural companions: key/controller remapping, a settings menu reachable from the window (e.g. Cmd+, or an in-window overlay like P's), settings persisted in `~/Library/Application Support/DisgaeaD2Recomp/settings`.)
+
+## Stretch goals (user request, Oct 5)
+1. ✅ **Cheat menu** (Codex AF, done): an in-window overlay to view and edit game state (HL/money, levels, stats, items, mana, Bonus Gauge, etc.). Reuse community knowledge: Cheat Engine tables / RPCS3 patch.yml / PS3 cheat codes for BLUS31313 map to guest addresses directly (same PPU memory layout). Implement as guest-memory pokes with labeled entries; persist presets.
+2. **Vulkan backend for Windows + Linux**: ps3recomp already has D3D12 (Windows) and community Vulkan PRs (#182/#192). Port D2's port/runner to build there; the lifted C++ is platform-neutral. Needs per-platform input/audio/window equivalents of today's macOS work.
+3. ✅ **Validate DLC** (done: v1.40 + 45 DLC flags, visitors announced in battle) (*found on MediaSVR*, copied to `dlc/`, extracted with `tools/pkg_extract.py`): `DISGAEA D2 … USA ALL DLC PACK FIX (NPUB3132).pkg` (1.2 MB → ~50 `USRDIR/Data/flag/flag000xxxxx.edat` unlock flags of 304–320 B + save icons) and the **official 1.40 update** `UP1063-BLUS31313_00-…-A0140-V0100-PE.pkg` (68 MB → new `EBOOT.BIN`, `Data/START_7.dat`, icons). DLC likely needs the 1.40 EBOOT (re-decrypt + re-lift + remap the few address-specific hooks) plus EDATA reading in cellFs/sceNpDrm (RPCS3 as reference). Original notes: D2 DLC (extra characters such as Pram, Marona, La Pucelle, Baal, items). Needs the user's own DLC packages (PSN .pkg + .rap/.edat licenses) installed into hdd0/game/NPUB31321 (cellGame/DataCheck, NPDRM EDATA decryption via `sceNpDrm*`, which today are offline stubs). The GameFAQs post-game save includes DLC characters, which makes a good test once DLC data is present.
+4. **Super stretch: add characters from other Disgaea games**: import models/sprites/data from e.g. Disgaea 4 Complete+ (on disk) into D2's NISPACK databases (class tables, sprite/anim archives); needs data-format tooling (NISPACK/TX2/ANM, character DB records), likely built on community tools (D5tools, UDT, makaikit).
+
+- **DLC check (user thought it was in the game folder):** none found in the dump, the ROM folder, RPCS3 dev_hdd0 or ~/Downloads (no .pkg/.rap/.edat). The two `NPUB31321` dirs inside the dump were **empty dirs created by Claude's very first run (Oct 4 21:56)** before the hdd0/hdd1 path fixes. Removed them with `rmdir` (empty-only); the dump is back to PS3_DISC.SFB / PS3_GAME / PS3_UPDATE. DLC needs the user's PSN .pkg + .rap files.
+
+- **Codex V done** (`codex/V.report.md`, `patches/V-stencil-reset.diff`): the white box behind the ATTACK ENTRY portrait = stencil-clipped backing quad. NV40 front/back **stencil write masks reset to 0xFF** on hardware, but the SDK's zero-initialized register file left them 0, so the stencil never got written and the quad drew unclipped (**patch 26**). V's host check didn't reach battle (its script stalled at the title), so **visual confirmation is pending the user's next playtest**.
+- **Codex AC done** (`codex/AC.report.md`, `tools/d2_save_import.py` + tests): retail save import. D2 secure file id `0f×16` (from lifted `func_00164C3C`), PFD v3/v4 + public-key verification, the protected-file block cipher (flatz pfdtool / Apollo as references), plain RPCS3 layout, free-slot selection, never overwrites. Kept as maintained tooling for the future Import/Export Save menu. **Installed the GameFAQs post-game save as slot `NPUB31321_NORMAL_01`** in `port/hdd0` and the app's hdd0 (SAVEDATA.DAT 1,498,152 B, SHA256 9f5a84…fc30). The user's own save stays slot 00.
+- Rebuilt `port/build` and `port/dist/Disgaea D2.app` with V's fix.
+
+- **User (remote, can't playtest): continue with DLC + patch, then a robust cheat/item/character menu and menu-bar settings (resolution etc.).** Claude decrypted the **v1.40 update EBOOT** (`work/v140/EBOOT.elf`, 5.2 MB, APP_VER 01.40). Launched **Codex AD** (v1.40 port with selectable version + install layout + DLC EDATA flags), **AF** (cheat/character/item editor overlay, community cheat research), **AG** (macOS menu bar: render scale, window/fullscreen, vsync, audio mute/volume, save import/export, cheats entry).
+
+- **Codex AD done** (`codex/AD.report.md`): **v1.40 is the default build** (`D2_GAME_VERSION=140`, 1.00 still buildable). 10,315 lifted functions in `port/src/recomp-140`, all address hooks remapped (table in the report). Fixed SPU image selection when CRT entry addresses collide. `port/install-content.sh` installs update → `hdd0/game/BLUS31313`, DLC → `hdd0/game/NPUB31321`. RPCS3-compatible EDATA reading with validated klicensee/hashes (84 EDAT tests) replaced the offline NPDRM stubs (**patch 27**). **Real Mac: 45/45 DLC flags accepted; slot 01 post-game save → battle 101; the game announces the DLC visitors "Badass Overlord", "God of Destruction", "Phantom"** (`milestones/v140-dlc-visitors.png`). 🎉
+
+- **Codex AG done** (`codex/AG.report.md`, `patches/AG-host-settings.diff`): native macOS menus (Graphics: render scale 1/1.5/2/3×, filter, aspect, VSync, presentation cap, FPS · Window: sizes, native/borderless fullscreen, topmost, remember geometry · Audio: Cmd+M mute, volume steps, mute when unfocused · Game: import/export save, open save folder/log, Cheats…, reset · Controls), settings in `~/Library/Application Support/DisgaeaD2Recomp/settings.json`, scaled color/depth/MRT targets, host gain in cellAudio (**patch 28**). Real Mac: hallway **59.97 flips/s at 1x and 2x**, but the **presented frame stays 1280×720 at 2x** (the RESC/display-buffer step discards the scale). Launched **Codex AG2**.
+
+- **Codex AG2 done** (`codex/AG2.report.md`, `patches/AG2-render-scale.diff`): display buffers registered before Metal init now allocate as scaled targets. Fixed the RESC ConvertAndFlip ABI (`(context,index)`; it received the context address as the index) and queued RESC conversion in FIFO order. NV3089/NV308A transfers reach scaled engine targets. The overlay compositor/captures use target size (**patch 29**). **Real Mac: 2× presented frames are 2560×1440** (`milestones/render-2x-1440p-crop.png`: crisp 3D edges). AG2's RESC/presenter GPU tests pass at 1/1.5/2/3×. One harness test (`conversion_chain` stripe assertion, `codex/AG.metal-test.m:71`) still fails; low priority (likely a test expectation for filtered scaling), to recheck.
+
+- **Codex AF done** (`codex/AF.report.md`): in-window cheat/editor for 1.00 and 1.40 (F1 / Cmd+Shift+C; menu bar Game → Cheats…). General (HL, Mana, Bonus Gauge, Cheat Shop CP/rates, infinite HP/SP, one-hit kills, EXP ×1–1024, free shop), Characters (level/EXP/mana/stats/aptitudes/class/move/jump/counter/skills/equipment), Items (bag+warehouse: add/remove via native helpers, rarity/level/stats), Presets (`~/Library/Application Support/DisgaeaD2Recomp/cheats/`). The live root pointer is resolved by validated signature (no hardcoded heap addresses). Struct map in the report. Edits persist through a real save/reload. **Real-Metal screenshots** (`milestones/cheat-menu-*.png`): HL 993,701,506,631, Laharl Lv 9999, item stats. Minor: ghost text behind the panel title.
+- **Main build reconfigured for 1.40** (`port/build`, `-DD2_GAME_VERSION=140`) and `port/dist/Disgaea D2.app` rebuilt with everything. Updated the app config to `work/v140/EBOOT.elf` (the old config pointed at 1.00, which the 1.40 runner rejects). Launched **Codex AH** (polish: overlay ghosting, launcher version check + visible start errors, AG `conversion_chain` harness failure, automated portrait-stencil verification).
+
+- **Codex AH done** (`codex/AH.report.md`): the "ghost text" is actually the live DLC announcement beneath a 96%-alpha panel, so the panel is now opaque. Launcher validates entry OPD + TOC for the build's version, falls back to the matching project ELF, and shows NSAlerts on start failure (**patch 30**). AG harness clear/transfer encoder fix. Real Mac: the OCR-driven portrait check **failed to navigate to an attack** (no portrait verdict); `AH.metal-check.sh` GPU harness **still aborts** (exit 134). AD/AH noted **a guest OOB + Bus error after repeated Cross in battle** (AD-host.UsTk9h/slot01/run.log:3224+; null-read by guest-fn 0x002EF390), seen only after the debug warp so far. Launched **Codex AI** (crash root cause: warp-only vs real path, plus the harness abort).
+
+- **Pruned (user deferred to Claude's judgment):** deleted 35 old worker build dirs (`port/build-a…build-ah`, `build-j-asan`; ~2.5 GB, rebuildable in ~25 s each) and, in `port/runs/`, ~97k frame/audio dumps (`*.ppm`, `*.f32le`, raw/bin) plus 53 per-run `hdd0`/`hdd1` copies (FIOS cache.dat ~700 MB each). Kept `milestones/`, all logs/reports and anything touched in the last 2 h. Also cleared old scratch in `/Volumes/Data/ai-tmp/{claude/d2,codex}`. **Project 39 GB → 13 GB; scratch 37 GB → 4.5 GB (~60 GB freed).** Untouched: game dump, `port/hdd0` saves (slots 00/01), `dlc/`, ELFs, lifted sources, `port/build`, `port/build-ai` (AI running).
+- **Commit/push plan:** after Codex AI finishes, commit project `main` (on top of local `270982a`) + ps3recomp `d2-macos` + re-export the combined SDK patch, show the file list/message, and push `main` to the private repo after the user's go. The ps3recomp branch stays local unless the user wants a fork/upstream PR.
+
 ## Next actions
+- [x] ~~User: reproduce the stage-select black screen~~ (no longer happens; battle works)
+- [ ] **User:** play a full battle turn (move, attack, end turn, enemy turn) and report anything odd.
+- [ ] **User:** double-click `port/dist/Disgaea D2.app`, Allow file access (macOS privacy), and confirm it launches.
+- [ ] **User:** review the first commit (file list in `git show --stat 270982a`) → approve push to the private repo.
+- [x] ~~approve the GameFAQs save~~ → imported as slot 01
+- [ ] **User:** playtest the post-game save (slot 01): full-map battles, check the ATTACK ENTRY portrait has no white box
 - [x] (Codex A) Frame clock / Metal init on macOS: get the FIFO drained and a window open.
 - [x] (Codex B) Lift `NisGraphics.spu.elf` (and `synth2`) with spu_lifter + build_spu_workloads; register in the port.
 - [x] (Codex C) cellResc unresolved NIDs + map /dev_hdd1 to a writable dir.
+
+## AD: update 1.40 and DLC (Oct 5)
+
+`D2_GAME_VERSION=140` is now the CMake default. Version 100 remains available with `-DD2_GAME_VERSION=100`; use `work/EBOOT.elf` for 100 and `work/v140/EBOOT.elf` for 140. The runner rejects mismatched executables; `run.sh`, `play.sh`, and the app launcher choose the matching ELF. Generated 140 output is in `port/src/recomp-140`, `port/out-140`, and `port/spu-140`. Existing build caches need reconfiguration. AD's own build is `port/build-ad`; other workers should use their assigned directories.
+
+`port/install-content.sh` defaults to a fresh hdd0 copy; `--into <hdd0>` installs update under `game/BLUS31313` and DLC under `game/NPUB31321`. Content is installed in `port/hdd0`; app-support hdd0 still needs host installation. All **45** supplied EDAT flags authenticate and are read as plaintext (license type 3, no RAP required). SDK fixes include update overlays, genuine local NPDRM checks, full HMAC authentication, writable EDAT caching, and imported-SPU fingerprint selection (overlapping CRT entries caused the 140 boot failure).
+
+Headless title, Continue slot 01/00 → hub → battle all pass; 100 Continue/battle also passes. `bash codex/AD.host-check.sh` performs the pending real-Metal check using hdd0 copies and captures frames. Full findings, addresses, test evidence (84 crypto checks, 101 SPU checks), and one unresolved extra-input guest fault: `codex/AD.report.md`. SDK patch: `patches/AD-runtime.diff`. No shared distribution bundle was rebuilt by AD.

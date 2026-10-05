@@ -1,0 +1,1024 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -92,12 +92,16 @@
+     return elapsed / 1000000000ULL * 60 + elapsed % 1000000000ULL * 60 / 1000000000ULL;
+ }
+ 
+-unsigned cellGcm_vblank_wait_ms(void)
++static u64 gcm_vblank_remaining_ns(void)
+ {
+     u64 phase = gcm_vblank_elapsed_ns() % 1000000000ULL;
+     u64 next = (phase * 60 / 1000000000ULL + 1) * 1000000000ULL;
+-    u64 remaining = (next + 59) / 60 - phase;
+-    return (unsigned)((remaining + 999999) / 1000000);
++    return (next + 59) / 60 - phase;
++}
++
++unsigned cellGcm_vblank_wait_ms(void)
++{
++    return (unsigned)((gcm_vblank_remaining_ns() + 999999) / 1000000);
+ }
+ 
+ u32 cellGcm_flip_mode(void) { return s_flip_mode; }
+@@ -1696,8 +1700,7 @@
+ /* The PPU/SPU store paths already notify O's memory wait API. Bridge those
+  * notifications to the render event without changing their implementations.
+  * Its bounded 100us wait also covers HLE/direct stores lacking notification.
+- * An installed direct store hook supersedes this bridge automatically. */
+-static atomic_int s_direct_store_hook;
++ * Direct lifted stores kick immediately; keep this fallback for other writers. */
+ static atomic_int s_put_watch_started;
+ static atomic_uint s_fifo_wait_label_ea;
+ static atomic_uint s_fifo_wait_label_value;
+@@ -1706,7 +1709,7 @@
+     (void)unused;
+     ps3_poll_thread_start("RSX submit", 1);
+     u32 last_put = vm_read32(GCM_CONTROL_GUEST_ADDR);
+-    while (!s_direct_store_hook && s_gcm_initialized) {
++    while (s_gcm_initialized) {
+         u32 raw;
+         memcpy(&raw, vm_base + GCM_CONTROL_GUEST_ADDR, sizeof(raw));
+         u32 put = ps3_bswap32(raw);
+@@ -1734,7 +1737,7 @@
+ static void gcm_start_put_watch(void)
+ {
+     int expected = 0;
+-    if (s_gcm_initialized && !s_direct_store_hook &&
++    if (s_gcm_initialized &&
+         atomic_compare_exchange_strong(&s_put_watch_started, &expected, 1)) {
+         HANDLE thread = CreateThread(NULL, 0, gcm_put_watch, NULL, 0, NULL);
+         if (thread) CloseHandle(thread);
+@@ -1760,13 +1763,12 @@
+ }
+ 
+ /* Guest stores (including inline libgcm flushes) call this after committing.
+- * Optional direct-store integration bypasses the notified put watcher above.
++ * Direct-store integration complements the notified put watcher above.
+  * Label stores can release an RSX semaphore acquire as well. */
+ void cellGcm_notify_guest_write(u32 ea, u32 size)
+ {
+     u64 end = (u64)ea + size;
+     if (!size) return;
+-    s_direct_store_hook = 1;
+     if ((ea < GCM_CONTROL_GUEST_ADDR + 4 && end > GCM_CONTROL_GUEST_ADDR) ||
+         (ea < GCM_LABEL_GUEST_BASE + CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE &&
+          end > GCM_LABEL_GUEST_BASE))
+@@ -1779,7 +1781,25 @@
+ void cellGcm_fifo_kick_wait(unsigned ms)
+ {
+     gcm_start_put_watch();
+-    WaitForSingleObject((HANDLE)cellGcm_fifo_kick_event(), ms);
++    HANDLE kick = (HANDLE)cellGcm_fifo_kick_event();
++#ifndef _WIN32
++    /* The POSIX waitable timer has a nanosecond deadline. Rounding the 60 Hz
++     * phase up to milliseconds gives the producer up to 1 ms less preparation
++     * time and can turn an otherwise complete frame into a two-vblank frame.
++     * Both the event and the timer interrupt this single-consumer render wait. */
++    static HANDLE timer;
++    if (!timer) timer = CreateWaitableTimerA(NULL, FALSE, NULL);
++    u64 remaining = gcm_vblank_remaining_ns();
++    if (timer && ms != INFINITE && remaining <= (u64)ms * 1000000u) {
++        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((remaining + 99u) / 100u);
++        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
++            HANDLE events[2] = {kick, timer};
++            WaitForMultipleObjects(2, events, FALSE, ms);
++            return;
++        }
++    }
++#endif
++    WaitForSingleObject(kick, ms);
+ }
+ 
+ /* Serializes fence publication between the present ticker and every guest
+@@ -1811,6 +1831,7 @@
+      * cannot overwrite the batch awaiting presentation. */
+     if (!s_fifo_flip_reached) {
+         s_fifo_wait_label_ea = 0;
++        rsx_draw_engine_record_begin();
+         gcm_rsx_process_fifo_unlocked();
+     }
+     if (gcm_recycle_trace_enabled()) {
+@@ -1851,6 +1872,14 @@
+      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
+     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
+     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
++    /* The register-file engine owns 3D state when no legacy/live backend is
++     * attached. Feeding both front ends needlessly decodes every register
++     * twice. Keep the legacy processor's guest-visible fence/label effects. */
++    static int force_legacy = -1;
++    if (force_legacy < 0)
++        force_legacy = getenv("GCM_LEGACY_STATE") || getenv("RSX_TRACE") || getenv("PS3_MILESTONE_OUT");
++    const int engine_only = !force_legacy && rsx_draw_engine_enabled() &&
++                            !rsx_get_backend() && !rsx_live_draw_enabled();
+ 
+     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
+      * offset in the control register), decoding method headers and following
+@@ -1949,7 +1978,17 @@
+      * short of `put` every tick is the signature of a FIFO that can never
+      * catch up, and the reason is the whole diagnosis. */
+     const char* why = "caught-up";
++    const u64 chunk_start = get_timestamp_ns();
++    u32 chunk_packets = 0;
+     while (s_fifo_getoff != put && budget-- > 0) {
++        /* Yield only between complete packets. Publish real progress below,
++         * then self-kick so the runner checks its presentation deadline before
++         * continuing. A single expensive draw is never split or reordered. */
++        if ((++chunk_packets & 63u) == 0 &&
++            get_timestamp_ns() - chunk_start >= 1000000u) {
++            why = "chunk";
++            break;
++        }
+         u32 ea = gcm_io2ea(s_fifo_getoff);
+         if (!ea) {
+             /* get is sitting on an IO offset with no mapping -- the title
+@@ -2128,6 +2167,7 @@
+             for (u32 i = 0; i < count; i++) {
+                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                 if (!dea) break;
++                const u32 data = vm_read32(dea);
+                 u32 m = (type == 0) ? method + i * 4 : method;
+                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
+                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
+@@ -2139,10 +2179,10 @@
+                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
+                   if (sd && subch == 7 && (s7++ < 16))
+                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
+-                              m, vm_read32(dea)); }
++                              m, data); }
+                 if (subch == 7 && m == 0x0B00u) {
+                     extern void rsx_raise_user_cmd(u32 arg);
+-                    rsx_raise_user_cmd(vm_read32(dea));
++                    rsx_raise_user_cmd(data);
+                     continue;
+                 }
+                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
+@@ -2159,7 +2199,7 @@
+                   if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
+                   if (od && m == 0) {
+                       static unsigned seen[8]; static int have[8];
+-                      const unsigned h = vm_read32(dea);
++                      const unsigned h = data;
+                       if (subch < 8 && (!have[subch] || seen[subch] != h)) {
+                           have[subch] = 1; seen[subch] = h;
+                           printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
+@@ -2177,7 +2217,7 @@
+                     s1_2d = e ? atoi(e) : (d && atoi(d) ? 0 : 1);
+                 }
+                 if (!s1_forced && subch == 1) {
+-                    const u32 object = vm_read32(dea);
++                    const u32 object = data;
+                     if (m == 0 && object == 0x31337303u) s1_2d = 1;
+                     else if ((m == 0 && object == 0x31337000u) || m >= 0x0800u)
+                         s1_2d = 0;
+@@ -2190,7 +2230,7 @@
+                   /* GCM_VAL_WATCH=<hex>: every FIFO word carrying that value, any method. */
+                   { static u32 vw = 1;
+                     if (vw == 1) { const char* e = getenv("GCM_VAL_WATCH"); vw = e ? (u32)strtoul(e, 0, 16) : 0; }
+-                    if (vw && vm_read32(dea) == vw) {
++                    if (vw && data == vw) {
+                         static int vn; if (vn++ < 64)
+                             printf("[valwatch] subch=%u method=0x%04X = 0x%08X get=0x%X%c", subch, m, vw, s_fifo_getoff, 10);
+                     } }
+@@ -2198,11 +2238,11 @@
+                   if (sg && !subch && (cm3 == 0x210 || cm3 == 0x214 || cm3 == 0x218 || cm3 == 0x288 || cm3 == 0x28C ||
+                                        cm3 == 0x1A20)) {
+                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
+-                      if (open_g) printf("[surfreg] 0x%04X = 0x%08X%c", cm3, vm_read32(dea), 10);
++                      if (open_g) printf("[surfreg] 0x%04X = 0x%08X%c", cm3, data, 10);
+                   }
+                   if (sg && subch) {
+                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
+-                      if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, vm_read32(dea), 10);
++                      if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, data, 10);
+                   } }
+                 /* Mirror the whole method stream into the live NV4097->D3D12
+                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
+@@ -2210,7 +2250,7 @@
+                  * canonicalises with & 0x1FFC itself. */
+                 { static int live = -1;
+                   if (live < 0) live = rsx_live_draw_enabled();
+-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
++                  if (live) rsx_live_draw_method((subch << 13) | m, data); }
+ 
+                 /* And into the platform-neutral register-file draw engine,
+                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
+@@ -2224,7 +2264,7 @@
+                   const u32 mfull = (subch << 13) | m;
+                   if (eng && mfull != 0xE920u && mfull != 0xE924u && mfull != 0xE944u &&
+                       (subch == 0 || (subch == 1 && !s1_2d)))
+-                      rsx_draw_engine_method(mfull, vm_read32(dea)); }
++                      rsx_draw_engine_method(mfull, data); }
+ 
+                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
+                  * for any run, live engine or not, so the method stream and the
+@@ -2248,15 +2288,16 @@
+                  * the draw-engine call above does. */
+                 { const u32 mfull = (subch << 13) | m;
+                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+-                    cellGcmQueueUserCommand(vm_read32(dea));
++                    cellGcmQueueUserCommand(data);
+                 } else if (mfull == 0xE920u || mfull == 0xE924u || mfull == 0xE944u) {
+-                    u32 buffer = vm_read32(dea) & 7u;
++                    u32 buffer = data & 7u;
+                     if (s_display_buffer_set[buffer]) {
+                         gcm_flip_trace("submit", s_flip_request_count + 1);
+                         gcm_queue_flip(buffer);
+                     }
+                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+-                    rsx_process_method(&s_state, m, vm_read32(dea));
++                    if (!engine_only || m == 0x50 || m == 0x1d6c || m == 0x1d70 || m == 0x1d74)
++                        rsx_process_method(&s_state, m, data);
+                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
+                      * publication (gcm_ref_publish below) instead of letting a
+                      * later fence in the same batch overwrite it. */
+@@ -2266,7 +2307,7 @@
+                      * reports "visible" -- the conservative answer; reading 0
+                      * tells the title every queried object is occluded. */
+                     if (m == 0x1800) {
+-                        const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
++                        const u32 v = data, idx = (v & 0xFFFFFFu) / 16u;
+                         { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
+                         if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                             s_report_data[idx].timestamp = get_timestamp_ns();
+@@ -2274,9 +2315,10 @@
+                         }
+                     }
+                 } else
+-                    gcm_2d_method(subch, m, vm_read32(dea));
++                    gcm_2d_method(subch, m, data);
+                 }
+             }
++            rsx_draw_engine_record_packet(s_fifo_getoff, vm_base + ea, 4 + count * 4);
+             s_fifo_getoff += 4 + count * 4;
+             if (s_fifo_flip_reached) { why = "flip"; break; }
+             continue;
+@@ -2457,6 +2499,8 @@
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();
+     ReleaseSRWLockExclusive(&s_ref_pub_lock);
++    if (!strcmp(why, "chunk") && !s_fifo_flip_reached)
++        cellGcm_fifo_kick();
+ }
+ 
+ /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -203,17 +203,72 @@
+     s_guest_user = user;
+ }
+ 
++/* Opt-in raw, consumed FIFO recording for repeatable drain benchmarks. Reads
++ * are recorded before the packet that used them, preserving guest mutations.
++ * This is a local diagnostic format, tied to this SDK's dispatch-state ABI. */
++static FILE* s_fifo_record;
++static int s_fifo_record_on, s_fifo_record_done;
++static u32 s_fifo_record_first, s_fifo_record_frames;
++static void eng_record_write(u32 kind, u32 a, u32 b, const void* data, u32 bytes)
++{
++    const u32 header[4] = {kind, a, b, bytes};
++    if (fwrite(header, sizeof(header), 1, s_fifo_record) != 1 ||
++        (bytes && fwrite(data, bytes, 1, s_fifo_record) != 1)) {
++        fclose(s_fifo_record); s_fifo_record = NULL;
++        s_fifo_record_on = 0; s_fifo_record_done = 1;
++        fprintf(stderr, "[rsx record] write failed\n");
++    }
++}
++
++void rsx_draw_engine_record_begin(void)
++{
++    static int configured;
++    static const char* path;
++    static u32 first;
++    if (!configured) {
++        path = getenv("RSX_FIFO_RECORD");
++        const char* e = getenv("RSX_FIFO_RECORD_FRAME");
++        first = e ? (u32)strtoul(e, NULL, 0) : 2040;
++        e = getenv("RSX_FIFO_RECORD_FRAMES");
++        s_fifo_record_frames = e ? (u32)strtoul(e, NULL, 0) : 4;
++        configured = 1;
++    }
++    if (s_fifo_record_on && g.frames - s_fifo_record_first >= s_fifo_record_frames) {
++        fclose(s_fifo_record); s_fifo_record = NULL;
++        s_fifo_record_on = 0; s_fifo_record_done = 1;
++        fprintf(stderr, "[rsx record] complete frames=%u\n", s_fifo_record_frames);
++    }
++    if (!path || !g.ready || s_fifo_record_on || s_fifo_record_done || g.frames < first) return;
++    s_fifo_record = fopen(path, "wb");
++    if (!s_fifo_record) { s_fifo_record_done = 1; return; }
++    s_fifo_record_on = 1;
++    s_fifo_record_first = g.frames;
++    eng_record_write(0x41414631u, g.width, g.height, &g.rsx, sizeof(g.rsx));
++    if (s_fifo_record_on)
++        eng_record_write('B', 0, 0, g.display_buffers, sizeof(g.display_buffers));
++    fprintf(stderr, "[rsx record] begin frame=%u file=%s\n", g.frames, path);
++}
++
++void rsx_draw_engine_record_packet(u32 io, const void* data, u32 bytes)
++{
++    if (s_fifo_record_on) eng_record_write('F', io, 0, data, bytes);
++}
++
+ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+                                u32 min_bytes)
+ {
+     (void)user;
+     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
+-    if (s_guest_reader) return s_guest_reader(s_guest_user, location, offset, min_bytes);
+-    if (!vm_base) return NULL;
+-    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+-    if (!ea) return NULL;
+-    if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
+-    return vm_base + ea;
++    const u8* ptr;
++    if (s_guest_reader) ptr = s_guest_reader(s_guest_user, location, offset, min_bytes);
++    else {
++        if (!vm_base) return NULL;
++        const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
++        if (!ea || (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size)) return NULL;
++        ptr = vm_base + ea;
++    }
++    if (s_fifo_record_on && ptr) eng_record_write('M', location, offset, ptr, min_bytes);
++    return ptr;
+ }
+ 
+ static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
+@@ -952,6 +1007,32 @@
+     return vp_instrs && fp_size;
+ }
+ 
++/* Input analysis and the VP part of pipeline identity depend only on code,
++ * not constants or draw state. Validate the complete code before reuse. */
++typedef struct {
++    u32 instrs, mask;
++    u64 hash;
++    u8 code[RSX_DSP_VP_WORDS * 4];
++} eng_vp_info;
++static eng_vp_info s_vp_info[16];
++static u32 s_vp_info_next;
++static const eng_vp_info* eng_vp_get(const u8* uc, u32 instrs)
++{
++    for (u32 i = 0; i < 16; i++)
++        if (s_vp_info[i].instrs == instrs && !memcmp(s_vp_info[i].code, uc, instrs * 16u))
++            return &s_vp_info[i];
++    eng_vp_info* info = &s_vp_info[s_vp_info_next++ % 16];
++    info->instrs = instrs;
++    info->mask = 0xffffu;
++    memcpy(info->code, uc, instrs * 16u);
++    info->hash = eng_fnv1a(uc, instrs * 16u, 1469598103934665603ull);
++    rsx_vp_input_analysis analysis = {0xffffu, 0};
++    if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
++        analysis.exact && analysis.input_mask)
++        info->mask = analysis.input_mask;
++    return info;
++}
++
+ /* The layout the active vertex program actually reads. An uncertain analysis
+  * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
+ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
+@@ -959,12 +1040,8 @@
+     u32 mask = 0xFFFFu;
+     const u8* uc = NULL;
+     u32 instrs = 0;
+-    if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
+-        rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+-            analysis.exact && analysis.input_mask)
+-            mask = analysis.input_mask;
+-    }
++    if (eng_guest_programs(&uc, &instrs, NULL, NULL))
++        mask = eng_vp_get(uc, instrs)->mask;
+     rsx_vertex_layout_plan_init(layout, mask);
+ }
+ 
+@@ -1056,7 +1133,7 @@
+         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
+         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
+     } else {
+-        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
++        key = eng_vp_get(vp_uc, vp_instrs)->hash;
+         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+         if (!key) return 0;
+         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+@@ -1163,6 +1240,146 @@
+     if (!p) return 0;
+     g.indices = p;
+     g.index_cap = next;
++    return 1;
++}
++
++/* Converted vertices may be reused across frames, but guest arrays can change
++ * between any two draws (including direct SPU/DMA writes). Compare every source
++ * byte on a hit, not a frame-aged hash or a PPU-only write generation. Bounds,
++ * formats, frequency, references and current attribute defaults are in the key.
++ * Unsupported/noncontiguous streams keep the ordinary fetch path. */
++#define ENG_VERTEX_CACHE_SLOTS 1024
++#define ENG_VERTEX_CACHE_BYTES (32u << 20)
++typedef struct {
++    rsx_vertex_fetch_plan plan;
++    u32 count, bytes, source_bytes, ref_bytes;
++    u64 stamp;
++    u8* data;                    /* references, source snapshot, converted data */
++} eng_vertex_cache_entry;
++static eng_vertex_cache_entry s_vertex_cache[ENG_VERTEX_CACHE_SLOTS];
++static u32 s_vertex_cache_bytes;
++static u64 s_vertex_cache_hits, s_vertex_cache_misses, s_vertex_cache_clock;
++
++static void eng_vertex_cache_clear(void)
++{
++    for (u32 i = 0; i < ENG_VERTEX_CACHE_SLOTS; i++) {
++        free(s_vertex_cache[i].data);
++        memset(&s_vertex_cache[i], 0, sizeof s_vertex_cache[i]);
++    }
++    s_vertex_cache_bytes = 0;
++}
++
++static int dc_fetch_cached(void)
++{
++    static int disabled = -1;
++    if (disabled < 0) disabled = getenv("RSX_VERTEX_CACHE_OFF") != NULL;
++    const rsx_vertex_fetch_plan* p = &dc.fetch_plan;
++    if (disabled || dc.n_refs < 16 || !p->layout.stride)
++        return rsx_vertex_fetch_many(p, dc.refs, dc.n_refs, dc.verts);
++    struct { const u8* base; u32 bytes; } ranges[RSX_DSP_NUM_VERTEX_ATTR];
++    u32 nranges = 0;
++    u64 source_bytes = 0;
++    u32 hash = dc.n_refs * 16777619u ^ p->layout.mask;
++    hash ^= dc.refs[0].vertex_id * 31u ^ dc.refs[dc.n_refs - 1].vertex_id;
++    for (u32 slot = 0; slot < p->layout.count; slot++) {
++        const u32 attr = p->layout.attrs[slot];
++        const rsx_vertex_fetch_attr* f = &p->attr[attr];
++        if (!f->desc.type || !f->desc.size) continue;
++        if (!f->stable_base)
++            return rsx_vertex_fetch_many(p, dc.refs, dc.n_refs, dc.verts);
++        const u64 span = (u64)(f->stable_last - f->stable_first) * f->stride + f->elem_size;
++        if (span > (512u << 10))
++            return rsx_vertex_fetch_many(p, dc.refs, dc.n_refs, dc.verts);
++        /* Interleaved position/colour/UV streams share one snapshot. */
++        u32 at = nranges;
++        while (at && (uintptr_t)ranges[at - 1].base > (uintptr_t)f->stable_base) {
++            ranges[at] = ranges[at - 1]; at--;
++        }
++        ranges[at].base = f->stable_base;
++        ranges[at].bytes = (u32)span;
++        nranges++;
++        hash = (hash ^ (u32)(uintptr_t)f->stable_base ^ f->desc.offset) * 16777619u;
++    }
++    u32 merged = 0;
++    for (u32 i = 0; i < nranges; i++) {
++        if (merged && (uintptr_t)ranges[i].base <= (uintptr_t)ranges[merged - 1].base + ranges[merged - 1].bytes) {
++            const uintptr_t end = (uintptr_t)ranges[i].base + ranges[i].bytes;
++            const uintptr_t prev_end = (uintptr_t)ranges[merged - 1].base + ranges[merged - 1].bytes;
++            if (end > prev_end) ranges[merged - 1].bytes += (u32)(end - prev_end);
++        } else ranges[merged++] = ranges[i];
++    }
++    nranges = merged;
++    for (u32 i = 0; i < nranges; i++) source_bytes += ranges[i].bytes;
++    const u64 ref_bytes = (u64)dc.n_refs * sizeof(*dc.refs);
++    const u64 bytes = (u64)dc.n_refs * p->layout.stride;
++    const u64 total = ref_bytes + source_bytes + bytes;
++    if (total > (1u << 20))
++        return rsx_vertex_fetch_many(p, dc.refs, dc.n_refs, dc.verts);
++    hash ^= hash >> 16; hash *= 0x85ebca6bu;
++    hash ^= hash >> 13; hash *= 0xc2b2ae35u; hash ^= hash >> 16;
++    const u32 bucket = (hash % (ENG_VERTEX_CACHE_SLOTS / 4)) * 4;
++    eng_vertex_cache_entry* e = &s_vertex_cache[bucket];
++    eng_vertex_cache_entry* changed = NULL;
++    for (u32 way = 0; way < 4; way++) {
++        eng_vertex_cache_entry* candidate = &s_vertex_cache[bucket + way];
++        if (candidate->stamp < e->stamp) e = candidate;
++        if (!candidate->data || candidate->count != dc.n_refs || candidate->source_bytes != source_bytes ||
++            memcmp(&candidate->plan, p, sizeof(*p)) || memcmp(candidate->data, dc.refs, (size_t)ref_bytes))
++            continue;
++        const u8* raw = candidate->data + ref_bytes;
++        int same = 1;
++        for (u32 i = 0; i < nranges && same; i++) {
++            if (memcmp(raw, ranges[i].base, ranges[i].bytes)) same = 0;
++            raw += ranges[i].bytes;
++        }
++        if (same) {
++            s_vertex_cache_hits++;
++            candidate->stamp = ++s_vertex_cache_clock;
++            memcpy(dc.verts, raw, (size_t)bytes);
++            return 1;
++        }
++        changed = candidate;
++    }
++    if (changed) e = changed;
++    s_vertex_cache_misses++;
++    if (total > e->bytes || !e->data) {
++        if (e->data) {
++            s_vertex_cache_bytes -= e->bytes;
++            free(e->data); e->data = NULL;
++        }
++        if (s_vertex_cache_bytes + total > ENG_VERTEX_CACHE_BYTES)
++            eng_vertex_cache_clear();
++        e->data = (u8*)malloc((size_t)total);
++        e->bytes = (u32)total;
++        if (!e->data) return rsx_vertex_fetch_many(p, dc.refs, dc.n_refs, dc.verts);
++        s_vertex_cache_bytes += e->bytes;
++    }
++    e->stamp = ++s_vertex_cache_clock;
++    e->plan = *p;
++    e->count = dc.n_refs;
++    e->source_bytes = (u32)source_bytes;
++    e->ref_bytes = (u32)ref_bytes;
++    memcpy(e->data, dc.refs, (size_t)ref_bytes);
++    u8* raw = e->data + ref_bytes;
++    rsx_vertex_fetch_plan snapshot = *p;
++    for (u32 i = 0; i < nranges; i++) {
++        memcpy(raw, ranges[i].base, ranges[i].bytes);
++        for (u32 slot = 0; slot < p->layout.count; slot++) {
++            const u32 attr = p->layout.attrs[slot];
++            const uintptr_t base = (uintptr_t)p->attr[attr].stable_base;
++            if (base >= (uintptr_t)ranges[i].base && base < (uintptr_t)ranges[i].base + ranges[i].bytes)
++                snapshot.attr[attr].stable_base = raw + (base - (uintptr_t)ranges[i].base);
++        }
++        raw += ranges[i].bytes;
++    }
++    /* Decode the saved bytes, so a concurrent guest update cannot pair an old
++     * conversion with a newer validation snapshot. */
++    if (!rsx_vertex_fetch_many(&snapshot, dc.refs, dc.n_refs, dc.verts)) {
++        s_vertex_cache_bytes -= e->bytes;
++        free(e->data); e->data = NULL;
++        return 0;
++    }
++    memcpy(raw, dc.verts, (size_t)bytes);
+     return 1;
+ }
+ 
+@@ -1234,12 +1451,9 @@
+         dc.fetch_ok = 0;
+         return;
+     }
+-    for (u32 i = 0; i < dc.n_refs; i++) {
+-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
+-            dc.fetch_ok = 0;
+-            return;
+-        }
++    if (!dc_fetch_cached()) {
++        dc.fetch_ok = 0;
++        return;
+     }
+     dc.n_verts = dc.n_refs;
+ }
+@@ -1615,6 +1829,7 @@
+ 
+ static void eng_present(u32 buffer_id)
+ {
++    if (s_fifo_record_on) eng_record_write('P', buffer_id, 0, NULL, 0);
+     if (!g.ready) return;
+     const u32 target = eng_present_surface(buffer_id);
+     if (target == ENG_INVALID) return;
+@@ -1720,6 +1935,7 @@
+     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
+ 
+     rsx_draw_engine_set_guest_memory(NULL, NULL);
++    eng_vertex_cache_clear();
+     free(dc.refs); free(dc.cuts); free(dc.verts);
+     rsx_vertex_remap_destroy(&dc.ref_remap);
+     memset(&dc, 0, sizeof dc);
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -210,6 +210,10 @@
+ /* ---- the engine --------------------------------------------------------- */
+ 
+ /* Register the backend the engine drives. Passing NULL unregisters it. */
++/* Local diagnostic recording of consumed ring packets and referenced memory. */
++void rsx_draw_engine_record_begin(void);
++void rsx_draw_engine_record_packet(u32 io, const void* data, u32 bytes);
++
+ void rsx_draw_engine_set_backend(const rsx_draw_backend* backend);
+ /* The registered backend, for diagnostic wrappers installed before FIFO work. */
+ const rsx_draw_backend* rsx_draw_engine_get_backend(void);
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2180,6 +2180,7 @@
+     u32 pipeline;
+     MTLPrimitiveType topology;
+     u32 vb_off, stride, vertex_count;
++    id<MTLBuffer> vertex_buffer; /* immutable cached upload, retained by record */
+     u32 ib_off, index_count;
+     u32 vs_cb_off, vs_cb_bytes;
+     u32 ps_cb_off, ps_cb_bytes;
+@@ -2359,6 +2360,8 @@
+     return s_eng_point_sampler ? 0 : -1;
+ }
+ 
++static void eng_vertex_buffers_clear(void);
++
+ static void eng_shutdown(void* user)
+ {
+     (void)user;
+@@ -2373,6 +2376,7 @@
+     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
+     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
+     s_eng_rec_count = 0;
++    eng_vertex_buffers_clear();
+     free(s_eng_stage); s_eng_stage = NULL;
+     s_eng_stage_used = s_eng_stage_cap = 0;
+     s_eng_helper_lib = nil;
+@@ -2523,7 +2527,7 @@
+     if (!dst) return 0;
+ 
+     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+-    memset(r, 0, sizeof *r);
++    *r = (EngRecord){0};
+     r->kind = ENG_REC_DEPTH_RESOLVE;
+     r->depth = depth;
+     r->resolve_dst = dst;
+@@ -2790,6 +2794,70 @@
+ static void eng_set_stencil_ref(void* user, u32 ref)
+ { (void)user; s_eng_pending.stencil_ref = ref; }
+ 
++/* Converted guest vertices are immutable snapshots. Verify the entire buffer
++ * on reuse; a cheap sampled bucket key is not a content-validity test. Records
++ * retain evicted buffers until encoding, and Metal retains them until completion. */
++#define ENG_VERTEX_BUFFERS 1024
++static struct { id<MTLBuffer> buffer; u8* candidate; u32 bytes; } s_eng_vertex_cache[ENG_VERTEX_BUFFERS];
++static u32 s_eng_vertex_cache_bytes;
++static void eng_vertex_buffers_clear(void)
++{
++    for (u32 i = 0; i < ENG_VERTEX_BUFFERS; i++) {
++        s_eng_vertex_cache[i].buffer = nil;
++        free(s_eng_vertex_cache[i].candidate); s_eng_vertex_cache[i].candidate = NULL;
++        s_eng_vertex_cache[i].bytes = 0;
++    }
++    for (u32 i = 0; i < s_eng_rec_count; i++) s_eng_rec[i].vertex_buffer = nil;
++    s_eng_vertex_cache_bytes = 0;
++}
++
++static id<MTLBuffer> eng_vertex_buffer(const void* data, u32 bytes)
++{
++    static int disabled = -1;
++    if (disabled < 0) disabled = getenv("RSX_METAL_VERTEX_CACHE_OFF") != NULL;
++    if (disabled || bytes < 256 || bytes > (1u << 20)) return nil;
++    u32 first, last;
++    memcpy(&first, data, 4);
++    memcpy(&last, (const u8*)data + bytes - 4, 4);
++    u32 hash = bytes * 31u ^ first ^ (last * 16777619u);
++    hash ^= hash >> 16; hash *= 0x85ebca6bu;
++    hash ^= hash >> 13; hash *= 0xc2b2ae35u; hash ^= hash >> 16;
++    const u32 slot = hash % ENG_VERTEX_BUFFERS;
++    id<MTLBuffer> cached = s_eng_vertex_cache[slot].buffer;
++    const void* saved = cached ? [cached contents] : s_eng_vertex_cache[slot].candidate;
++    if (saved && s_eng_vertex_cache[slot].bytes == bytes && !memcmp(saved, data, bytes)) {
++        if (cached) return cached;
++        /* Admit only a second identical use. Animated streams keep using the
++         * existing frame staging instead of allocating a GPU buffer per draw. */
++        id<MTLBuffer> buffer = [s_dev newBufferWithBytes:data length:bytes
++                                              options:MTLResourceStorageModeShared];
++        if (!buffer) return nil;
++        s_eng_vertex_cache[slot].buffer = buffer;
++        free(s_eng_vertex_cache[slot].candidate); s_eng_vertex_cache[slot].candidate = NULL;
++        return buffer;
++    }
++    s_eng_vertex_cache_bytes -= s_eng_vertex_cache[slot].bytes;
++    s_eng_vertex_cache[slot].buffer = nil;
++    free(s_eng_vertex_cache[slot].candidate); s_eng_vertex_cache[slot].candidate = NULL;
++    s_eng_vertex_cache[slot].bytes = 0;
++    if (s_eng_vertex_cache_bytes + bytes > (32u << 20)) {
++        for (u32 i = 0; i < ENG_VERTEX_BUFFERS; i++) {
++            s_eng_vertex_cache[i].buffer = nil;
++            free(s_eng_vertex_cache[i].candidate); s_eng_vertex_cache[i].candidate = NULL;
++            s_eng_vertex_cache[i].bytes = 0;
++        }
++        s_eng_vertex_cache_bytes = 0;
++    }
++    u8* candidate = (u8*)malloc(bytes);
++    if (candidate) {
++        memcpy(candidate, data, bytes);
++        s_eng_vertex_cache[slot].candidate = candidate;
++        s_eng_vertex_cache[slot].bytes = bytes;
++        s_eng_vertex_cache_bytes += bytes;
++    }
++    return nil;
++}
++
+ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+                      u32 vertex_count, u32 stride, const u32* indices,
+                      u32 index_count)
+@@ -2798,7 +2866,8 @@
+     if (!vertex_count || !stride) return;
+     if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+     u32 vb_off = 0, ib_off = 0;
+-    if (!eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
++    id<MTLBuffer> vb = eng_vertex_buffer(vertices, vertex_count * stride);
++    if (!vb && !eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
+     if (indices && index_count &&
+         !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
+         return;
+@@ -2808,6 +2877,7 @@
+     r->kind         = ENG_REC_DRAW;
+     r->topology     = topo_to_metal(topology);
+     r->vb_off       = vb_off;
++    r->vertex_buffer = vb;
+     r->stride       = stride;
+     r->vertex_count = vertex_count;
+     r->ib_off       = ib_off;
+@@ -2825,7 +2895,7 @@
+                     (u32)(rgba[2] * 255.0f + 0.5f);
+     if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+-    memset(r, 0, sizeof *r);
++    *r = (EngRecord){0};
+     r->kind  = ENG_REC_CLEAR_COLOR;
+     r->rt[0] = surface;
+     r->nrt   = 1;
+@@ -2838,7 +2908,7 @@
+     (void)user;
+     if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+-    memset(r, 0, sizeof *r);
++    *r = (EngRecord){0};
+     r->kind = ENG_REC_CLEAR_DS;
+     r->depth = depth;
+     r->clear_flags = flags;
+@@ -2848,25 +2918,30 @@
+ 
+ /* ---- replay -------------------------------------------------------------- */
+ 
+-static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+-                            id<MTLBuffer> stage)
+-{
+-    if (!r->pipeline || r->pipeline > s_eng_pipe_count) return;
++static int eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
++                            id<MTLBuffer> stage, const EngRecord* previous)
++{
++    if (!r->pipeline || r->pipeline > s_eng_pipe_count) return 0;
+     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
+-    if (!p->pso) return;
+-    [enc setRenderPipelineState:p->pso];
+-    [enc setDepthStencilState:p->ds];
+-    [enc setCullMode:p->cull];
+-    [enc setFrontFacingWinding:p->winding];
+-    [enc setStencilReferenceValue:r->stencil_ref];
++    if (!p->pso) return 0;
++    if (!previous || previous->pipeline != r->pipeline) {
++        [enc setRenderPipelineState:p->pso];
++        [enc setDepthStencilState:p->ds];
++        [enc setCullMode:p->cull];
++        [enc setFrontFacingWinding:p->winding];
++    }
++    if (!previous || previous->stencil_ref != r->stencil_ref)
++        [enc setStencilReferenceValue:r->stencil_ref];
+     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+-    [enc setViewport:vp];
+-    if (r->sc[2] && r->sc[3])
++    if (!previous || memcmp(previous->vp, r->vp, sizeof r->vp)) [enc setViewport:vp];
++    if ((!previous || memcmp(previous->sc, r->sc, sizeof r->sc)) && r->sc[2] && r->sc[3])
+         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
+-    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
++    [enc setVertexBuffer:(r->vertex_buffer ? r->vertex_buffer : stage)
++                   offset:(r->vertex_buffer ? 0 : r->vb_off) atIndex:MTL_VB_INDEX];
+     if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
+     if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
++        if (previous && previous->tex[u] == r->tex[u] && previous->samp[u] == r->samp[u]) continue;
+         id<MTLTexture> t = eng_obj(r->tex[u]);
+         [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
+         [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
+@@ -2874,6 +2949,7 @@
+                              atIndex:(NSUInteger)u];
+     }
+     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
++        if (previous && previous->vtex[u] == r->vtex[u] && previous->vsamp[u] == r->vsamp[u]) continue;
+         id<MTLTexture> t = eng_obj(r->vtex[u]);
+         [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
+         [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
+@@ -2893,6 +2969,7 @@
+     else
+         [enc drawPrimitives:r->topology
+                 vertexStart:0 vertexCount:r->vertex_count];
++    return 1;
+ }
+ 
+ /* Is this record aimed at exactly these colour attachments, in this order? */
+@@ -3053,11 +3130,13 @@
+                    eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
+             continue;
+         }
++        const EngRecord* previous = NULL;
+         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
+                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
+                (s_eng_rec[i].depth == depth ||
+                 (!s_eng_rec[i].depth && zbuf == s_depth))) {
+-            eng_encode_draw(enc, &s_eng_rec[i], stage);
++            previous = eng_encode_draw(enc, &s_eng_rec[i], stage, previous)
++                ? &s_eng_rec[i] : NULL;
+             i++;
+         }
+         [enc endEncoding];
+@@ -3173,6 +3252,7 @@
+                     s_eng_dropped, ENG_MAX_RECORDS);
+             s_eng_dropped = 0;
+         }
++        for (u32 i = 0; i < s_eng_rec_count; i++) s_eng_rec[i].vertex_buffer = nil;
+         s_eng_rec_count  = 0;
+         s_eng_stage_used = 0;
+         eng_collect_retired_objects();
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -5,6 +5,9 @@
+ #include <limits.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(__aarch64__) && defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ 
+ static float rsx_compact_be_f32(const u8* p)
+ {
+@@ -292,6 +295,107 @@
+     return 1;
+ }
+ 
++#if defined(__aarch64__) && defined(__ARM_NEON)
++static inline void rsx_vertex_copy_components(void* dst, const void* src,
++                                              u32 size, u32 width)
++{
++    /* Each call specializes width. Constant lengths avoid a libc memcpy call
++     * in the vertex loop while retaining exact tail bounds for float3/half3. */
++    switch (size) {
++    case 4: memcpy(dst, src, 4 * width); break;
++    case 3: memcpy(dst, src, 3 * width); break;
++    case 2: memcpy(dst, src, 2 * width); break;
++    case 1: memcpy(dst, src, width); break;
++    }
++}
++#endif
++
++/* Attribute-major fetch: resolve the stream and choose its conversion once,
++ * rather than dispatching a format switch for every component of every vertex.
++ * Keep the scalar path for invalid mappings, inline bounds and unusual formats. */
++int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* restrict plan,
++                          const rsx_vertex_ref* restrict refs, u32 count, u8* restrict out)
++{
++    if (!plan || (!refs && count) || (!out && count && plan->layout.stride))
++        return 0;
++    for (u32 slot = 0; slot < plan->layout.count; slot++) {
++        const u32 attr = plan->layout.attrs[slot];
++        const rsx_vertex_fetch_attr* f = &plan->attr[attr];
++        const u32 size = f->desc.size < 4 ? f->desc.size : 4;
++        const u32 freq = f->desc.frequency;
++        const u32 modulo = (plan->divider_mask >> attr) & 1u;
++        for (u32 i = 0; i < count; i++) {
++            float* dst = (float*)(out + (size_t)i * plan->layout.stride + slot * 16u);
++            if (!f->desc.type || !size) {
++                memcpy(dst, f->default_value, 16);
++                continue;
++            }
++            const u32 element = rsx_vertex_element_index(
++                refs[i].vertex_id, refs[i].base_index, freq, modulo);
++            if (!f->stable_base || element < f->stable_first || element > f->stable_last) {
++                /* The ordinary fetch owns all the fallback rules. */
++                if (!rsx_vertex_fetch_one(plan, &refs[i], out + (size_t)i * plan->layout.stride))
++                    return 0;
++                continue;
++            }
++            const u8* src = f->stable_base + (size_t)(element - f->stable_first) * f->stride;
++#if defined(__aarch64__) && defined(__ARM_NEON)
++            /* memcpy only the declared bytes: float3/half3 at the end of a
++             * mapping must not load a fourth component past its boundary. */
++            if (f->desc.type == RSX_VTX_TYPE_FLOAT) {
++                if (size == 4)
++                    vst1q_f32(dst, vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src))));
++                else {
++                    /* Small float vectors need fewer instructions as scalar
++                     * REV loads than padding a temporary SIMD register. */
++                    dst[0] = rsx_compact_be_f32(src);
++                    dst[1] = size > 1 ? rsx_compact_be_f32(src + 4) : 0.0f;
++                    dst[2] = size > 2 ? rsx_compact_be_f32(src + 8) : 0.0f;
++                    dst[3] = 1.0f;
++                }
++                continue;
++            }
++            if (f->desc.type == RSX_VTX_TYPE_HALF) {
++                u16 raw[4] = {0, 0, 0, 0x003cu};
++                rsx_vertex_copy_components(raw, src, size, 2);
++                uint16x4_t h = vreinterpret_u16_u8(vrev16_u8(vld1_u8((const u8*)raw)));
++                /* Preserve the existing decoder's flush-to-zero rule. */
++                h = vbsl_u16(vceq_u16(vand_u16(h, vdup_n_u16(0x7c00)), vdup_n_u16(0)),
++                              vand_u16(h, vdup_n_u16(0x8000)), h);
++                vst1q_f32(dst, vcvt_f32_f16(vreinterpret_f16_u16(h)));
++                continue;
++            }
++            if (f->desc.type == RSX_VTX_TYPE_UNORM8 || f->desc.type == RSX_VTX_TYPE_UINT8) {
++                u8 raw[8] = {0};
++                rsx_vertex_copy_components(raw, src, size, 1);
++                float32x4_t v = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vld1_u8(raw)))));
++                if (f->desc.type == RSX_VTX_TYPE_UNORM8)
++                    v = vdivq_f32(v, vdupq_n_f32(255.0f));
++                vst1q_f32(dst, v);
++                if (size < 4) dst[3] = 1.0f;
++                continue;
++            }
++            if (f->desc.type == RSX_VTX_TYPE_SNORM16 || f->desc.type == RSX_VTX_TYPE_SINT16) {
++                u16 raw[4] = {0};
++                rsx_vertex_copy_components(raw, src, size, 2);
++                int16x4_t h = vreinterpret_s16_u8(vrev16_u8(vld1_u8((const u8*)raw)));
++                float32x4_t v = vcvtq_f32_s32(vmovl_s16(h));
++                if (f->desc.type == RSX_VTX_TYPE_SNORM16)
++                    v = vdivq_f32(v, vdupq_n_f32(32767.0f));
++                vst1q_f32(dst, v);
++                if (size < 4) dst[3] = 1.0f;
++                continue;
++            }
++#endif
++            if (!rsx_vertex_decode_element(f->desc.type, size, src, dst)) {
++                if (attr == 0) return 0;
++                memcpy(dst, f->default_value, 16);
++            }
++        }
++    }
++    return 1;
++}
++
+ static u64 rsx_vertex_remap_hash(u64 value)
+ {
+     value ^= value >> 33;
+--- a/libs/video/rsx_vertex_compact.h
++++ b/libs/video/rsx_vertex_compact.h
+@@ -116,6 +116,10 @@
+ int rsx_vertex_fetch_one(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+ 
++/* Fetch a complete compact draw with attribute stream conversion hoisted. */
++int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
++                          const rsx_vertex_ref* refs, u32 count, u8* out);
++
+ /* Collapse repeated (vertex_id, base_index) references in first-use order.
+  * refs is rewritten in place with the unique prefix.  The occurrence map
+  * remains valid until the next call using the same remap object. */
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1472,6 +1472,17 @@
+     }
+ }
+ 
++/* Put/label stores wake the renderer after commitment. Retain the watcher
++ * for direct HLE/DMA writes which do not use these lifted accessors. */
++extern "C" void cellGcm_notify_guest_write(uint32_t ea, uint32_t size);
++static inline void ppu_gcm_write_notify(uint32_t ea, uint32_t size)
++{
++    const uint32_t base = VM_HLE_INJECT_BASE;
++    if ((ea - base < 0x1000u) ||
++        ((uint64_t)ea < (uint64_t)base + 0x2004u && (uint64_t)ea + size > base + 0x2000u))
++        cellGcm_notify_guest_write(ea, size);
++}
++
+ /* Every guest store commits through this: on a line no SPU has reserved (all of
+  * them, until SPU code runs) it is the plain memcpy it replaced. */
+ #define VM_WRITE_COH(a, src, n)                                               \
+@@ -1486,10 +1497,12 @@
+             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+         }                                                                     \
+         ps3_poll_notify((uint32_t)(a), (n));                              \
++        ppu_gcm_write_notify((uint32_t)(a), (n));                         \
+     } while (0)
+ 
+ extern "C" {
+ /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
++static const bool s_rwatch_enabled = getenv("PPU_RWATCH") != nullptr;
+ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
+ {
+     static int64_t s_lo = -2; static uint32_t s_len = 0x10;
+@@ -1591,7 +1604,7 @@
+      *
+      * Every width shares one window so a byte-at-a-time strcmp is caught as
+      * readily as a word load. */
+-    ppu_rwatch_hit((uint32_t)a, 1, __builtin_return_address(0));
++    if (__builtin_expect(s_rwatch_enabled, 0)) ppu_rwatch_hit((uint32_t)a, 1, __builtin_return_address(0));
+     if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) {
+           if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
+@@ -1600,7 +1613,7 @@
+           n=0; } }
+       else { last=(uint32_t)a; n=0; } }
+     uint8_t v = vm_base[(uint32_t)a]; ppu_poll_read((uint32_t)a, &v, 1); return v; }
+-uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
++uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; if (__builtin_expect(s_rwatch_enabled, 0)) ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+     if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) { if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
+     ppu_poll_read((uint32_t)a, &v, 2);
+@@ -1684,7 +1697,7 @@
+       else { last=(uint32_t)a; n=0; } }
+ }
+ 
+-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
++uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; if (__builtin_expect(s_rwatch_enabled, 0)) ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
+      * cannot be served out of memory. Everything else in the window the SPU
+@@ -1711,7 +1724,10 @@
+         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
+         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+-    g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
++    static const bool track_read_source = getenv("PPU_WVAL") || getenv("PT");
++    if (__builtin_expect(track_read_source, 0)) {
++        g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
++    }
+ #ifdef _WIN32
+     /* PT report: the hunted truncated value is being READ BACK from a slot we saw
+      * get truncated and never restored -> this read (about to free it) is the bug's

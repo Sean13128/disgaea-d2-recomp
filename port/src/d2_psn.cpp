@@ -9,10 +9,8 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(
 
 static constexpr uint32_t NP_OFFLINE = 0x8002AA0C;
 static constexpr uint32_t COMMUNITY_NO_LOGIN = 0x8002A106;
-static constexpr uint32_t DRM_NO_LOGIN = 0x80029516;
 
 static void np_offline(ppu_context* ctx) { ctx->gpr[3] = NP_OFFLINE; }
-static void drm_offline(ppu_context* ctx) { ctx->gpr[3] = DRM_NO_LOGIN; }
 static void community_offline(ppu_context* ctx) { ctx->gpr[3] = COMMUNITY_NO_LOGIN; }
 
 /* Poll/Wait take (transactionId, result*). Complete with an offline failure,
@@ -43,7 +41,6 @@ extern "C" void d2_register_psn_offline(void)
     ps3_hle_register_ctx(0x8440537Cu, "sceNpLookupTerm", community_offline);
     ps3_hle_register_ctx(0xA1709ABDu, "sceNpManagerGetEntitlementById", np_offline);
     ps3_hle_register_ctx(0xA7A090E5u, "sceNpScorePollAsync", community_poll_offline);
-    ps3_hle_register_ctx(0xAD218FAFu, "sceNpDrmIsAvailable", drm_offline);
     ps3_hle_register_ctx(0xB9F93BBBu, "sceNpScoreCreateTitleCtx", community_offline);
     ps3_hle_register_ctx(0xBCDBB2ABu, "sceNpBasicAddPlayersHistoryAsync", np_offline);
     ps3_hle_register_ctx(0xBDC07FD5u, "sceNpManagerGetNetworkTime", np_offline);
@@ -59,7 +56,6 @@ extern "C" void d2_register_psn_offline(void)
     ps3_hle_register_ctx(0xF76847C2u, "sceNpScoreRecordGameDataAsync", community_offline);
     ps3_hle_register_ctx(0xFB87CF5Eu, "sceNpLookupDestroyTransactionCtx", community_offline);
     ps3_hle_register_ctx(0xFBC82301u, "sceNpScoreGetRankingByRange", community_offline);
-    ps3_hle_register_ctx(0xF042B14Fu, "sceNpDrmIsAvailable2", drm_offline);
     ps3_hle_register_ctx(0x065B610Du, "sceNpTusSetMultiSlotVariableAsync", community_offline);
     ps3_hle_register_ctx(0x0835DEB2u, "sceNpTusSetDataVUser", community_offline);
     ps3_hle_register_ctx(0x17DB7AA7u, "sceNpTusTryAndSetVariableVUserAsync", community_offline);
@@ -87,5 +83,5 @@ extern "C" void d2_register_psn_offline(void)
     ps3_hle_register_ctx(0x8DDD0D85u, "sceNpTusGetData", community_offline);
     ps3_hle_register_ctx(0x19BCE18Cu, "sceNpTusPollAsync", community_poll_offline);
     ps3_hle_register_ctx(0xB8E8FF22u, "sceNpTusWaitAsync", community_poll_offline);
-    std::printf("[d2] Registered 61 PSN-offline handlers (NP=0x8002AA0C, community=0x8002A106)\n");
+    std::printf("[d2] Registered 59 PSN-offline handlers (NP=0x8002AA0C, community=0x8002A106)\n");
 }

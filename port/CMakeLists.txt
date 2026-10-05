@@ -36,9 +36,28 @@ if(NOT DEFINED PS3RECOMP_DIR)
 endif()
 get_filename_component(PS3RECOMP_DIR "${PS3RECOMP_DIR}" ABSOLUTE)
 
-set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/recompiled" CACHE PATH
-    "Directory holding the lifter's output: ppu_recomp.h and the lifted sources")
-get_filename_component(RECOMP_DIR "${RECOMP_DIR}" ABSOLUTE)
+set(D2_GAME_VERSION "140" CACHE STRING "D2 executable version (100 or 140)")
+set_property(CACHE D2_GAME_VERSION PROPERTY STRINGS 100 140)
+if(D2_GAME_VERSION STREQUAL "140")
+    set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp-140")
+    set(D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out-140")
+    set(D2_DEFAULT_EBOOT "work/v140/EBOOT.elf")
+    set(D2_EXPECTED_ENTRY_OPD "0x00461000")
+    set(D2_EXPECTED_TOC "0x0047DF98")
+    set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu-140")
+    set(D2_MOVIE_OVERRIDES 001686AC 00168304 00167FC8)
+elseif(D2_GAME_VERSION STREQUAL "100")
+    set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp")
+    set(D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out")
+    set(D2_DEFAULT_EBOOT "work/EBOOT.elf")
+    set(D2_EXPECTED_ENTRY_OPD "0x003E0EE8")
+    set(D2_EXPECTED_TOC "0x003FDE60")
+    set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu")
+    set(D2_MOVIE_OVERRIDES 0015FD14 0015F9F4 0015F680)
+else()
+    message(FATAL_ERROR "D2_GAME_VERSION must be 100 or 140")
+endif()
+message(STATUS "Disgaea D2:     ${D2_GAME_VERSION}")
 
 message(STATUS "ps3recomp SDK:   ${PS3RECOMP_DIR}")
 message(STATUS "Lifted output:   ${RECOMP_DIR}")
@@ -70,7 +89,7 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 # its three definitions in a BUILD copy; src/recomp and the dump stay intact.
 # The replacements live in d2_movie.cpp. Re-lifts trigger reconfiguration.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMP_SOURCES})
-set(D2_MOVIE_OVERRIDES 0015FD14 0015F9F4 0015F680)
+include(src/d2_cheats_lift.cmake)
 foreach(source IN LISTS RECOMP_SOURCES)
     file(READ "${source}" text)
     set(changed FALSE)
@@ -83,12 +102,24 @@ foreach(source IN LISTS RECOMP_SOURCES)
             list(APPEND D2_MOVIE_FOUND ${address})
         endif()
     endforeach()
+
+
+    d2_cheats_patch("${text}" text cheat_changed)
+    if(cheat_changed)
+        set(changed TRUE)
+    endif()
     if(changed)
         get_filename_component(name "${source}" NAME)
         set(copy "${CMAKE_CURRENT_BINARY_DIR}/d2_${name}")
         file(WRITE "${copy}" "${text}")
         list(REMOVE_ITEM RECOMP_SOURCES "${source}")
         list(APPEND RECOMP_SOURCES "${copy}")
+    endif()
+endforeach()
+get_property(D2_CHEAT_FOUND GLOBAL PROPERTY D2_CHEAT_FOUND)
+foreach(kind IN ITEMS exp sp shop damage)
+    if(NOT kind IN_LIST D2_CHEAT_FOUND)
+        message(FATAL_ERROR "D2 cheat hook '${kind}' missing for ${D2_GAME_VERSION}; re-resolve this lift")
     endif()
 endforeach()
 list(LENGTH D2_MOVIE_FOUND D2_MOVIE_COUNT)
@@ -158,8 +189,7 @@ set(PS3RECOMP_SCAFFOLD
 # match, which is worse than shipping none. Both the table and the job-module
 # registry self-register from constructors and are therefore optional -- a tree
 # that has not lifted its SPU images yet configures and links without them.
-set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu" CACHE PATH
-    "Directory holding the lifted SPU images (<SPU_DIR>/<image>/spu_recomp.c)")
+
 option(PORT_ENABLE_SPU "Compile and register the title's lifted SPU images" ON)
 
 set(SPU_SOURCES "")
@@ -196,11 +226,20 @@ add_executable(${PROJECT_NAME}
     src/d2_movie.cpp
     src/d2_shader_trace.cpp
     src/d2_draw_trace.cpp
+    src/d2_debug_warp.cpp
+    src/d2_cheats.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
     ${SPU_SOURCES}
 )
+
+# Embed the asset-free, versioned editor schema so app bundles do not depend on cwd.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/d2_cheats.v1.json" D2_CHEATS_JSON)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/d2_cheats.v1.json")
+find_path(D2_JSON_INCLUDE_DIR nlohmann/json.hpp REQUIRED)
+configure_file(src/d2_cheats_data.h.in d2_cheats_data.h @ONLY)
+set_source_files_properties(src/d2_cheats.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${D2_JSON_INCLUDE_DIR}" COMPILE_DEFINITIONS "D2_CHEATS_VERSION=${D2_GAME_VERSION}")
 
 # The lifted SPU sources use bare #include "spu_context.h". Scope that include
 # directory (and their flags) to those TUs alone: adding it to the whole target
@@ -225,6 +264,8 @@ endif()
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
     target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
 endif()
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE D2_GAME_VERSION=${D2_GAME_VERSION})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${RECOMP_DIR}"                            # the generated ppu_recomp.h

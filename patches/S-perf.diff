@@ -1,0 +1,696 @@
+diff --git a/runtime/platform/guest_poll.c b/runtime/platform/guest_poll.c
+index a197aeb..1426c8d 100644
+--- a/runtime/platform/guest_poll.c
++++ b/runtime/platform/guest_poll.c
+@@ -16,6 +16,10 @@ int ps3_poll_enabled = 1;
+ #include <stdatomic.h>
+ 
+ #define POLL_BUCKETS 256
++/* A finer line filter avoids broadcasting to unrelated waiters sharing a
++ * mutex bucket. Collisions only cause extra work, never missed wakeups. */
++#define POLL_LINES 4096
++static atomic_uint s_lines[POLL_LINES];
+ typedef struct poll_bucket {
+     pthread_mutex_t lock;
+     pthread_cond_t changed;
+@@ -50,14 +54,19 @@ static void poll_init(void)
+ }
+ void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
+ {
+-    if (!ps3_poll_enabled || repeats < 32) return;
++    if (!ps3_poll_enabled || repeats < 32 || !size) return;
+     pthread_once(&s_init, poll_init);
+     if (!ps3_poll_enabled) return;
+     if (repeats < 40) { sched_yield(); return; }
++    /* A condition belongs to the first line's bucket. A value spanning lines
++     * could be changed by a store into a different bucket; yield/re-read for
++     * those rare unaligned polls rather than relying on its notification. */
++    if (size > 128 - (ea & 127)) { sched_yield(); return; }
+     extern uint8_t* vm_base;
+     poll_bucket* b = poll_slot(ea);
+     pthread_mutex_lock(&b->lock);
+     atomic_fetch_add_explicit(&b->waiters, 1, memory_order_seq_cst);
++    atomic_fetch_add_explicit(&s_lines[(ea >> 7) & (POLL_LINES - 1)], 1, memory_order_seq_cst);
+     /* Register before checking the value, under the same lock as notify.
+      * A store racing registration is either seen here or wakes the wait. */
+     if (!memcmp(vm_base + ea, value, size)) {
+@@ -72,6 +81,7 @@ void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t
+         pthread_cond_timedwait(&b->changed, &b->lock, &deadline);
+ #endif
+     }
++    atomic_fetch_sub_explicit(&s_lines[(ea >> 7) & (POLL_LINES - 1)], 1, memory_order_seq_cst);
+     atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
+     pthread_mutex_unlock(&b->lock);
+ }
+@@ -80,6 +90,9 @@ void ps3_poll_notify(uint32_t ea, uint32_t size)
+     if (!size) return;
+     uint32_t last = (uint32_t)(((uint64_t)ea + size - 1) >> 7);
+     for (uint32_t line = ea >> 7; line <= last; line++) {
++        /* Register the filter before the under-lock value recheck, just like
++         * the bucket count. A racing store is observed or wakes the waiter. */
++        if (!atomic_load_explicit(&s_lines[line & (POLL_LINES - 1)], memory_order_seq_cst)) continue;
+         poll_bucket* b = poll_slot(line << 7);
+         if (!atomic_load_explicit(&b->waiters, memory_order_seq_cst)) continue;
+         pthread_mutex_lock(&b->lock);
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index dd0ae0a..7baf1ae 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1605,45 +1605,10 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
+       if ((uint32_t)a==last) { if (++n==200000) { if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
+     ppu_poll_read((uint32_t)a, &v, 2);
+     return __builtin_bswap16(v); }
+-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+-    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+-    /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
+-     * cannot be served out of memory. Everything else in the window the SPU
+-     * thread keeps current, so it falls through to the plain load. */
+-    if (spu_raw_is_reg((uint32_t)a)) { uint32_t _rv;
+-        if (spu_raw_reg_load((uint32_t)a, &_rv)) return _rv; }
+-    /* PPU_FORCE_READ_ADDR=<hex>: force reads of one address to PPU_FORCE_READ_VAL (default 0)
+-     * -- diagnostic to break a completion spin and see whether the game proceeds.
+-     * (From eeff394; dropped by the runtime/spu consolidation, restored here.) */
+-    { static int64_t _fa=-2; static uint32_t _fv=0;
+-      if(_fa==-2){ const char* e=getenv("PPU_FORCE_READ_ADDR"); _fa=e?(int64_t)strtoul(e,0,16):-1;
+-                   const char* ev=getenv("PPU_FORCE_READ_VAL"); _fv=ev?(uint32_t)strtoul(ev,0,16):0; }
+-      if (_fa>=0 && (uint32_t)a==(uint32_t)_fa) return _fv; }
+-    /* GCM_REFPOLL: read-driven RSX fence publication. A spin-read of the ref
+-     * register (GCM_CONTROL+8 = 0x03002008) advances one queued fence (paced
+-     * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
+-     * ticker is starved during heavy boot load (fixes the [finspin] crawl).
+-     * Publish BEFORE the read so this poll observes the freshly-advanced ref. */
+-    /* Default ON (GCM_REFPOLL=0 disables): with only the 60 Hz ticker
+-     * publishing, LBP's asset loading -- thousands of fence-waits -- crawled
+-     * at ~28 fences/s (minutes-to-hours of [finspin]); read-driven pacing
+-     * publishes at up to 1/ms and the loading progresses ~35x faster. */
+-    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
+-        if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
+-        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+-    uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+-    g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
+-#ifdef _WIN32
+-    /* PT report: the hunted truncated value is being READ BACK from a slot we saw
+-     * get truncated and never restored -> this read (about to free it) is the bug's
+-     * consumption; print the ORIGINAL truncating writer we recorded. */
+-    if (g_pt_val>=0 && g_last_rd_val==(uint32_t)g_pt_val) {
+-        for (int i=0;i<g_pt_n;i++) if (g_pt_live[i] && g_pt_addr[i]==(uint32_t)a) {
+-            static int _rn=0; if (_rn++<6) { char rb[300]; pt_bt(rb,300);
+-                fprintf(stderr,"[PT-HIT] persistent trunc [0x%08X]=0x%08X\n  TRUNCATED-BY:%s\n  READ-BACK-BY:%s\n",
+-                        (uint32_t)a,(uint32_t)g_pt_val, g_pt_bt[i], rb); }
+-            g_pt_live[i]=0; break; } }
+-#endif
++/* These diagnostics need large stack buffers/backtraces, but the normal
++ * read path only needs its bounds/MMIO checks and unchanged-value detector. */
++static void ppu_read32_trace(uint64_t a, uint32_t v)
++{
+     { static int64_t rw=-2; if (rw==-2) { const char* e=getenv("YDKJ_RWATCH"); rw=e?(int64_t)strtoul(e,0,0):-1; }
+       if (rw>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)rw && ea<(uint32_t)rw+0x80) {
+         static int _n=0; if (_n<40) {
+@@ -1717,6 +1682,54 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
+ #endif
+       } }
+       else { last=(uint32_t)a; n=0; } }
++}
++
++uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
++    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
++    /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
++     * cannot be served out of memory. Everything else in the window the SPU
++     * thread keeps current, so it falls through to the plain load. */
++    if (spu_raw_is_reg((uint32_t)a)) { uint32_t _rv;
++        if (spu_raw_reg_load((uint32_t)a, &_rv)) return _rv; }
++    /* PPU_FORCE_READ_ADDR=<hex>: force reads of one address to PPU_FORCE_READ_VAL (default 0)
++     * -- diagnostic to break a completion spin and see whether the game proceeds.
++     * (From eeff394; dropped by the runtime/spu consolidation, restored here.) */
++    { static int64_t _fa=-2; static uint32_t _fv=0;
++      if(_fa==-2){ const char* e=getenv("PPU_FORCE_READ_ADDR"); _fa=e?(int64_t)strtoul(e,0,16):-1;
++                   const char* ev=getenv("PPU_FORCE_READ_VAL"); _fv=ev?(uint32_t)strtoul(ev,0,16):0; }
++      if (_fa>=0 && (uint32_t)a==(uint32_t)_fa) return _fv; }
++    /* GCM_REFPOLL: read-driven RSX fence publication. A spin-read of the ref
++     * register (GCM_CONTROL+8 = 0x03002008) advances one queued fence (paced
++     * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
++     * ticker is starved during heavy boot load (fixes the [finspin] crawl).
++     * Publish BEFORE the read so this poll observes the freshly-advanced ref. */
++    /* Default ON (GCM_REFPOLL=0 disables): with only the 60 Hz ticker
++     * publishing, LBP's asset loading -- thousands of fence-waits -- crawled
++     * at ~28 fences/s (minutes-to-hours of [finspin]); read-driven pacing
++     * publishes at up to 1/ms and the loading progresses ~35x faster. */
++    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
++        if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
++        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
++    uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
++    g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
++#ifdef _WIN32
++    /* PT report: the hunted truncated value is being READ BACK from a slot we saw
++     * get truncated and never restored -> this read (about to free it) is the bug's
++     * consumption; print the ORIGINAL truncating writer we recorded. */
++    if (g_pt_val>=0 && g_last_rd_val==(uint32_t)g_pt_val) {
++        for (int i=0;i<g_pt_n;i++) if (g_pt_live[i] && g_pt_addr[i]==(uint32_t)a) {
++            static int _rn=0; if (_rn++<6) { char rb[300]; pt_bt(rb,300);
++                fprintf(stderr,"[PT-HIT] persistent trunc [0x%08X]=0x%08X\n  TRUNCATED-BY:%s\n  READ-BACK-BY:%s\n",
++                        (uint32_t)a,(uint32_t)g_pt_val, g_pt_bt[i], rb); }
++            g_pt_live[i]=0; break; } }
++#endif
++    static const bool traced = getenv("YDKJ_RWATCH") || getenv("PPU_RVAL") ||
++                               getenv("PPU_HOTMAP") || getenv("PPU_SPINBT") || ps3_log_hotread();
++#ifdef VM_SAMPLE_READS
++    ppu_read32_trace(a, v);
++#else
++    if (__builtin_expect(traced, 0)) ppu_read32_trace(a, v);
++#endif
+     ppu_poll_read((uint32_t)a, &v, 4);
+     return __builtin_bswap32(v); }
+ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
+@@ -1781,7 +1794,7 @@ static void ww_arm_inline_window(uint32_t ww)
+     g_ww_lo = ww & ~15u;
+     g_ww_hi = (ww & ~15u) + len;
+ }
+-static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
++static void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
+ {
+     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
+      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
+@@ -1902,6 +1915,15 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
+     }
+ }
+ 
++/* Keep the common store path small enough to inline. The barrier watch can
++ * be armed after startup; environment-controlled diagnostics are fixed. */
++static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
++{
++    static const bool watched = getenv("PPU_WVAL") || getenv("PPU_WWATCH");
++    if (__builtin_expect(watched || g_barrier_sync_watch, 0))
++        barrier_watch_hit_slow(a, v, width, ra);
++}
++
+ /* See the note on the forward declaration above ppu_stwcx32. */
+ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
+ {
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 0fca7f5..b06e7ab 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -17,6 +17,11 @@
+ #include <string.h>
+ #include <math.h>
+ 
++#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_HELPERS_SCALAR)
++#include <arm_neon.h>
++#define SPU_HELPERS_NEON 1
++#endif
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -180,28 +185,7 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
+  *   sel & 0xC0 == 0xC0 -> 0xFF
+  *   sel & 0xC0 == 0x80 -> 0x00
+  *   otherwise           -> concat{a,b}[sel & 0x1F] */
+-#if defined(__SSE4_1__)
+-#include <smmintrin.h>
+-/* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
+- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
+- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+-static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+-    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
+-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
+-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
+-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
+-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
+-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
+-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
+-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+-    u128 out; memcpy(&out, &r, 16); return out;
+-}
+-/* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
+-static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
++static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+      * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+      * control, and the result) through SPU_W so a control supplied as an immediate
+@@ -223,31 +207,43 @@ static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+     }
+     return r;
+ }
+-#else
+-static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+-    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+-     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+-     * control, and the result) through SPU_W so a control supplied as an immediate
+-     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
+-     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
+-     * SPU-byte-order selectors to match. */
+-    uint8_t cat[32];
+-    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+-    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
+-    u128 r;
+-    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+-        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+-        uint8_t v;
+-        if      ((s & 0xE0)==0xE0) v=0x80;
+-        else if ((s & 0xC0)==0xC0) v=0xFF;
+-        else if ((s & 0xC0)==0x80) v=0x00;
+-        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+-        r._u8[SPU_W(t)] = v;
+-    }
+-    return r;
+-}
+-#define spu_shufb_ref spu_shufb
+-#endif
++#if defined(SPU_HELPERS_NEON)
++static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
++    uint8x16_t control = vld1q_u8(c._u8);
++    uint8x16x2_t table = {{vld1q_u8(a._u8), vld1q_u8(b._u8)}};
++    /* W(selector) = selector XOR 3 within either source. Controls/results
++     * already share host byte order, so no input/output reversal is needed. */
++    uint8x16_t index = vandq_u8(veorq_u8(control, vdupq_n_u8(3)), vdupq_n_u8(31));
++    uint8x16_t special = vbslq_u8(vcgeq_u8(control, vdupq_n_u8(0xE0)),
++                                vdupq_n_u8(0x80), vcgeq_u8(control, vdupq_n_u8(0xC0)));
++    u128 r;
++    vst1q_u8(r._u8, vbslq_u8(vcgeq_u8(control, vdupq_n_u8(0x80)),
++                            special, vqtbl2q_u8(table, index)));
++    return r;
++}
++#elif defined(__SSE4_1__) && !defined(SPU_HELPERS_SCALAR)
++#include <smmintrin.h>
++/* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
++ * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
++ * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
++static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
++    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
++    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
++    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
++    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
++    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
++    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
++    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
++    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
++    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
++    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
++    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
++    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
++    u128 out; memcpy(&out, &r, 16); return out;
++}
++#else
++static inline u128 spu_shufb(u128 a, u128 b, u128 c) { return spu_shufb_ref(a, b, c); }
++#endif
+ 
+ /* ---- shift / rotate immediate (word lanes) ---- */
+ static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
+@@ -257,8 +253,31 @@ static inline u128 spu_rothi(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i
+ static inline u128 spu_rotmi(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); return r; }
+ static inline u128 spu_rotmai(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
+ static inline u128 spu_rotmhi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+-static inline u128 spu_shlqbyi(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+-static inline u128 spu_rotqbyi(u128 a, int sh) { u128 r; sh&=0x0F; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
++static inline u128 spu_shlqbyi_ref(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
++static inline u128 spu_shlqbyi(u128 a, int sh) {
++#if defined(SPU_HELPERS_NEON)
++    const uint8x16_t positions = {3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12};
++    uint8x16_t index = vaddq_u8(positions, vdupq_n_u8((uint8_t)(sh & 31)));
++    index = veorq_u8(index, vdupq_n_u8(3));
++    u128 r; vst1q_u8(r._u8, vqtbl1q_u8(vld1q_u8(a._u8), index)); return r;
++#else
++    return spu_shlqbyi_ref(a, sh);
++#endif
++}
++
++static inline u128 spu_rotqbyi_ref(u128 a, int sh) { u128 r; sh&=0x0F; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
++static inline u128 spu_rotqbyi(u128 a, int sh) {
++#if defined(SPU_HELPERS_NEON)
++    const uint8x16_t positions = {3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12};
++    uint8x16_t index = vaddq_u8(positions, vdupq_n_u8((uint8_t)(sh & 15)));
++    index = vandq_u8(index, vdupq_n_u8(15));
++    index = veorq_u8(index, vdupq_n_u8(3));
++    u128 r; vst1q_u8(r._u8, vqtbl1q_u8(vld1q_u8(a._u8), index)); return r;
++#else
++    return spu_rotqbyi_ref(a, sh);
++#endif
++}
++
+ /* Bit-level quadword shifts/rotates operate on the WHOLE 128-bit big-endian
+  * value. Our _u64[0]/_u64[1] are word-SCRAMBLED (host-LE: _u64[0] = word0 |
+  * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
+@@ -287,10 +306,53 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
+ static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
+-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
++#if defined(SPU_HELPERS_NEON)
++/* Scalar FMADD and vector FMLA may select different NaN payloads when more
++ * than one operand is NaN. Keep the reference result in those rare cases. */
++static inline int spu_has_nan(u128 a, u128 b, u128 c) {
++    uint32x4_t magnitude = vdupq_n_u32(0x7FFFFFFFu);
++    uint32x4_t largest = vmaxq_u32(vandq_u32(vld1q_u32(a._u32), magnitude),
++                                 vandq_u32(vld1q_u32(b._u32), magnitude));
++    largest = vmaxq_u32(largest, vandq_u32(vld1q_u32(c._u32), magnitude));
++    return vmaxvq_u32(largest) > 0x7F800000u;
++}
++#endif
++static inline u128 spu_fm_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
++static inline u128 spu_fm(u128 a, u128 b) {
++#if defined(SPU_HELPERS_NEON)
++    if (spu_has_nan(a, b, spu_zero())) return spu_fm_ref(a, b);
++    u128 r; vst1q_f32(r._f32, vmulq_f32(vld1q_f32(a._f32), vld1q_f32(b._f32))); return r;
++#else
++    return spu_fm_ref(a, b);
++#endif
++}
++static inline u128 spu_fma_ref(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
++static inline u128 spu_fma(u128 a, u128 b, u128 c) {
++#if defined(SPU_HELPERS_NEON)
++    if (spu_has_nan(a, b, c)) return spu_fma_ref(a, b, c);
++    u128 r; vst1q_f32(r._f32, vfmaq_f32(vld1q_f32(c._f32), vld1q_f32(a._f32), vld1q_f32(b._f32))); return r;
++#else
++    return spu_fma_ref(a, b, c);
++#endif
++}
++static inline u128 spu_fms_ref(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
++static inline u128 spu_fms(u128 a, u128 b, u128 c) {
++#if defined(SPU_HELPERS_NEON)
++    if (spu_has_nan(a, b, c)) return spu_fms_ref(a, b, c);
++    u128 r; vst1q_f32(r._f32, vfmaq_f32(vnegq_f32(vld1q_f32(c._f32)), vld1q_f32(a._f32), vld1q_f32(b._f32))); return r;
++#else
++    return spu_fms_ref(a, b, c);
++#endif
++}
++static inline u128 spu_fnms_ref(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
++static inline u128 spu_fnms(u128 a, u128 b, u128 c) {
++#if defined(SPU_HELPERS_NEON)
++    if (spu_has_nan(a, b, c)) return spu_fnms_ref(a, b, c);
++    u128 r; vst1q_f32(r._f32, vfmaq_f32(vld1q_f32(c._f32), vld1q_f32(a._f32), vnegq_f32(vld1q_f32(b._f32)))); return r;
++#else
++    return spu_fnms_ref(a, b, c);
++#endif
++}
+ static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
+ static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+ 
+@@ -352,10 +414,10 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+-static inline u128 spu_shlqby(u128 a, u128 b){ int sh=b._u32[0]&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+-static inline u128 spu_rotqby(u128 a, u128 b){ int sh=b._u32[0]&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+-static inline u128 spu_shlqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+-static inline u128 spu_rotqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
++static inline u128 spu_shlqby(u128 a, u128 b){ return spu_shlqbyi(a, (int)(b._u32[0])); }
++static inline u128 spu_rotqby(u128 a, u128 b){ return spu_rotqbyi(a, (int)(b._u32[0])); }
++static inline u128 spu_shlqbybi(u128 a, u128 b){ return spu_shlqbyi(a, (int)(b._u32[0]>>3)); }
++static inline u128 spu_rotqbybi(u128 a, u128 b){ return spu_rotqbyi(a, (int)(b._u32[0]>>3)); }
+ 
+ /* ---- Phase 2: rotmahi ---- */
+ static inline u128 spu_rotmahi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
+@@ -549,30 +611,70 @@ static inline u128 spu_fsmbi(int32_t imm) {
+  * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
+  * the right host index. Verified to compose correctly with the fixed shufb for
+  * both cbd-generated and immediate/LS-constant controls. */
+-static inline u128 spu_cbd_pos(int pos) {
++static inline u128 spu_cbd_pos_ref(int pos) {
+     u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+     r._u8[SPU_W(pos & 0xF)] = 0x03;                 /* a's preferred byte = SPU byte 3 */
+     return r;
+ }
+-static inline u128 spu_chd_pos(int pos) {
++static inline u128 spu_chd_pos_ref(int pos) {
+     u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+     int p = (pos & 0xF) & ~1;                       /* SPU halfword byte positions p, p+1 */
+     r._u8[SPU_W(p)]   = 0x02;                        /* a SPU byte 2 (hi byte of preferred hw) */
+     r._u8[SPU_W(p+1)] = 0x03;                        /* a SPU byte 3 (lo byte) */
+     return r;
+ }
+-static inline u128 spu_cwd_pos(int pos) {
++static inline u128 spu_cwd_pos_ref(int pos) {
+     u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+     int p = (pos & 0xF) & ~3;
+     for(int k=0;k<4;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..3 (preferred word) */
+     return r;
+ }
+-static inline u128 spu_cdd_pos(int pos) {
++static inline u128 spu_cdd_pos_ref(int pos) {
+     u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+     int p = (pos & 0xF) & ~7;
+     for(int k=0;k<8;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..7 (preferred dword) */
+     return r;
+ }
++#if defined(SPU_HELPERS_NEON)
++static inline u128 spu_insert_control(int pos, int width) {
++    const uint8x16_t positions = {3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12};
++    uint8x16_t mask = vdupq_n_u8((uint8_t)(16 - width));
++    uint8x16_t insert = vandq_u8(positions, vdupq_n_u8((uint8_t)(width - 1)));
++    if (width < 4) insert = vorrq_u8(insert, vdupq_n_u8((uint8_t)(4 - width)));
++    uint8x16_t match = vceqq_u8(vandq_u8(positions, mask),
++                              vdupq_n_u8((uint8_t)(pos & (16 - width))));
++    u128 r; vst1q_u8(r._u8, vbslq_u8(match, insert,
++                                    vorrq_u8(positions, vdupq_n_u8(0x10)))); return r;
++}
++#endif
++static inline u128 spu_cbd_pos(int pos) {
++#if defined(SPU_HELPERS_NEON)
++    return spu_insert_control(pos, 1);
++#else
++    return spu_cbd_pos_ref(pos);
++#endif
++}
++static inline u128 spu_chd_pos(int pos) {
++#if defined(SPU_HELPERS_NEON)
++    return spu_insert_control(pos, 2);
++#else
++    return spu_chd_pos_ref(pos);
++#endif
++}
++static inline u128 spu_cwd_pos(int pos) {
++#if defined(SPU_HELPERS_NEON)
++    return spu_insert_control(pos, 4);
++#else
++    return spu_cwd_pos_ref(pos);
++#endif
++}
++static inline u128 spu_cdd_pos(int pos) {
++#if defined(SPU_HELPERS_NEON)
++    return spu_insert_control(pos, 8);
++#else
++    return spu_cdd_pos_ref(pos);
++#endif
++}
+ static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
+ static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
+ static inline u128 spu_cwd(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
+diff --git a/runtime/spu/tests/test_spu_shufb.c b/runtime/spu/tests/test_spu_shufb.c
+index 98fa95f..bae3fc2 100644
+--- a/runtime/spu/tests/test_spu_shufb.c
++++ b/runtime/spu/tests/test_spu_shufb.c
+@@ -1,16 +1,33 @@
+-/* spu_shufb (pshufb path) must match the byte-loop reference for every
++/* spu_shufb (SSE4.1 or NEON path) must match the byte-loop reference for every
+  * selector class: a/b sources, 0x00 / 0xFF / 0x80 specials. Build with
+- * -msse4.1 so the SIMD version is the one under test. */
++ * -msse4.1 on x86; AArch64 enables NEON by default. */
+ #include "../spu_helpers.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+ int main(void)
+ {
+-#if !defined(__SSE4_1__)
+-    puts("test_spu_shufb: built without SSE4.1, nothing to compare");
+-    return 0;
+-#else
++    /* Exhaust every control value in every SPU output position, using
++     * distinct source bytes so endian or source-selection errors cannot hide. */
++    u128 a, b, c;
++    for (int i = 0; i < 16; i++) {
++        a._u8[SPU_W(i)] = (uint8_t)(i + 1);
++        b._u8[SPU_W(i)] = (uint8_t)(i + 33);
++        c._u8[SPU_W(i)] = (uint8_t)i;
++    }
++    for (int lane = 0; lane < 16; lane++) {
++        for (int sel = 0; sel < 256; sel++) {
++            c._u8[SPU_W(lane)] = (uint8_t)sel;
++            u128 x = spu_shufb(a, b, c), y = spu_shufb_ref(a, b, c);
++            uint8_t expected = sel >= 224 ? 0x80 : sel >= 192 ? 0xFF :
++                               sel >= 128 ? 0 : (uint8_t)((sel & 31) + ((sel & 16) ? 17 : 1));
++            if (memcmp(&x, &y, 16) || x._u8[SPU_W(lane)] != expected) {
++                printf("test_spu_shufb: MISMATCH lane=%d selector=%02x\n", lane, sel);
++                return 1;
++            }
++        }
++        c._u8[SPU_W(lane)] = (uint8_t)lane;
++    }
+     srand(12345);
+     for (int it = 0; it < 200000; it++) {
+         u128 a, b, c;
+@@ -24,7 +41,6 @@ int main(void)
+             return 1;
+         }
+     }
+-    puts("test_spu_shufb: ok (200000 random cases)");
++    puts("test_spu_shufb: ok (4096 exhaustive selectors + 200000 random cases)");
+     return 0;
+-#endif
+ }
+diff --git a/runtime/platform/tests/test_guest_poll_filter.c b/runtime/platform/tests/test_guest_poll_filter.c
+new file mode 100644
+index 0000000..0352cf2
+--- /dev/null
++++ b/runtime/platform/tests/test_guest_poll_filter.c
+@@ -0,0 +1,90 @@
++/* Standalone: clang -O2 -std=gnu17 -pthread test_guest_poll_filter.c -o test_guest_poll_filter
++ * Include the implementation to observe registration without production hooks.
++ * Extend only this test's wait to 200ms, so a missed notification cannot hide
++ * behind the runtime's normal 100us timeout. */
++#include <pthread.h>
++#include <stdatomic.h>
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <time.h>
++#include <sched.h>
++static atomic_uint broadcasts;
++static int test_broadcast(pthread_cond_t* cond)
++{
++    atomic_fetch_add(&broadcasts, 1);
++    return pthread_cond_broadcast(cond);
++}
++#ifdef __APPLE__
++static int test_wait(pthread_cond_t* cond, pthread_mutex_t* lock, const struct timespec* unused)
++{
++    (void)unused;
++    const struct timespec delay = {0, 200000000};
++    return pthread_cond_timedwait_relative_np(cond, lock, &delay);
++}
++#define pthread_cond_timedwait_relative_np test_wait
++#else
++static int test_wait(pthread_cond_t* cond, pthread_mutex_t* lock, const struct timespec* unused)
++{
++    (void)unused;
++    struct timespec deadline;
++    clock_gettime(CLOCK_MONOTONIC, &deadline);
++    deadline.tv_nsec += 200000000;
++    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
++    return pthread_cond_timedwait(cond, lock, &deadline);
++}
++#define pthread_cond_timedwait test_wait
++#endif
++#define pthread_cond_broadcast test_broadcast
++#include "../guest_poll.c"
++#undef pthread_cond_broadcast
++static uint8_t memory[1024];
++uint8_t* vm_base = memory;
++static double now(void)
++{
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec + t.tv_nsec / 1e9;
++}
++static void* wait_once(void* unused)
++{
++    (void)unused;
++    uint32_t zero = 0;
++    ps3_poll_backoff(40, 128, &zero, 4);
++    return NULL;
++}
++int main(void)
++{
++    ps3_poll_thread_start("poll filter test", 0);
++    uint32_t zero = 0;
++    uint32_t collision = 256;
++    while (poll_slot(collision) != poll_slot(128) ||
++           ((collision >> 7) & (POLL_LINES - 1)) == 1) collision += 128;
++    for (unsigned i = 0; i < 1000; i++) {
++        __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
++        pthread_t waiter;
++        assert(!pthread_create(&waiter, NULL, wait_once, NULL));
++        double start = now();
++        while (!atomic_load(&s_lines[1])) { sched_yield(); assert(now() - start < 1); }
++        /* Hash collision has no waiter on this line: no broadcast/lock. */
++        unsigned old = atomic_load(&broadcasts);
++        ps3_poll_notify(collision, 4);
++        assert(atomic_load(&broadcasts) == old);
++        __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
++        start = now();
++        ps3_poll_notify(127, 5); /* crosses into the watched line */
++        pthread_join(waiter, NULL);
++        assert(now() - start < 0.1); /* shorter than test timeout */
++        assert(!atomic_load(&s_lines[1]));
++        assert(!atomic_load(&poll_slot(128)->waiters));
++    }
++    /* Publication before registration must skip the condition wait. */
++    double start = now();
++    for (unsigned i = 0; i < 1000; i++) ps3_poll_backoff(40, 128, &zero, 4);
++    assert(now() - start < 0.1);
++    /* Unaligned cross-line reads safely yield instead of waiting on one bucket. */
++    start = now();
++    ps3_poll_backoff(40, 127, &zero, 4);
++    assert(now() - start < 0.1);
++    puts("guest poll filter: 1000 registration races, hash collision, crossing store, prior publication PASS");
++    return 0;
++}
+diff --git a/runtime/spu/tests/test_spu_vectors.c b/runtime/spu/tests/test_spu_vectors.c
+new file mode 100644
+index 0000000..f576adb
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_vectors.c
+@@ -0,0 +1,56 @@
++/* Standalone: clang -O2 -std=c17 test_spu_vectors.c -lm -o test_spu_vectors */
++#include "../spu_helpers.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++
++static uint32_t seed = 0x12345678;
++static uint32_t random_word(void)
++{
++    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed;
++}
++static void same(const char* name, u128 actual, u128 expected)
++{
++    if (memcmp(&actual, &expected, sizeof actual)) {
++        fprintf(stderr, "%s MISMATCH: %08x/%08x %08x/%08x %08x/%08x %08x/%08x\n",
++                name, actual._u32[0], expected._u32[0], actual._u32[1], expected._u32[1],
++                actual._u32[2], expected._u32[2], actual._u32[3], expected._u32[3]);
++        exit(1);
++    }
++}
++int main(void)
++{
++    const uint32_t edge[] = {0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x00800000,
++        0x3f800000, 0xbf800000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000,
++        0x7fc12345, 0xffc23456, 0x7f823456};
++    for (unsigned i = 0; i < 200000; i++) {
++        u128 a, b, c;
++        for (int k = 0; k < 4; k++) {
++            a._u32[k] = random_word(); b._u32[k] = random_word(); c._u32[k] = random_word();
++        }
++        if (i < 3375) {
++            for (int k = 0; k < 4; k++) {
++                a._u32[k] = edge[i % 15]; b._u32[k] = edge[(i / 15) % 15];
++                c._u32[k] = edge[(i / 225) % 15];
++            }
++        }
++        int sh = (int)(i % 256) - 128;
++        same("rotqbyi", spu_rotqbyi(a, sh), spu_rotqbyi_ref(a, sh));
++        same("rotqby", spu_rotqby(a, b), spu_rotqbyi_ref(a, (int)b._u32[0]));
++        same("rotqbybi", spu_rotqbybi(a, b), spu_rotqbyi_ref(a, (int)(b._u32[0] >> 3)));
++        same("shlqbyi", spu_shlqbyi(a, sh), spu_shlqbyi_ref(a, sh));
++        same("shlqby", spu_shlqby(a, b), spu_shlqbyi_ref(a, (int)b._u32[0]));
++        same("shlqbybi", spu_shlqbybi(a, b), spu_shlqbyi_ref(a, (int)(b._u32[0] >> 3)));
++        same("cbd", spu_cbd_pos(sh), spu_cbd_pos_ref(sh));
++        same("chd", spu_chd_pos(sh), spu_chd_pos_ref(sh));
++        same("cwd", spu_cwd_pos(sh), spu_cwd_pos_ref(sh));
++        same("cdd", spu_cdd_pos(sh), spu_cdd_pos_ref(sh));
++        same("fm", spu_fm(a, b), spu_fm_ref(a, b));
++        same("fma", spu_fma(a, b, c), spu_fma_ref(a, b, c));
++        same("fms", spu_fms(a, b, c), spu_fms_ref(a, b, c));
++        same("fnms", spu_fnms(a, b, c), spu_fnms_ref(a, b, c));
++    }
++    puts("SPU vectors: byte shifts/rotates, insertion controls, FP edge triples + 200000 random cases PASS");
++    return 0;
++}

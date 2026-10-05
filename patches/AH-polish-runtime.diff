@@ -1,0 +1,79 @@
+diff --git a/libs/video/rsx_metal_overlay.m b/libs/video/rsx_metal_overlay.m
+--- a/libs/video/rsx_metal_overlay.m
++++ b/libs/video/rsx_metal_overlay.m
+@@ -58,7 +58,9 @@
+     CGColorSpaceRelease(space);
+     if (!cg) return;
+     rectangle(cg, 0, 0, UI_WIDTH, UI_HEIGHT, 0, 0, 0, .48);
+-    rectangle(cg, 170, 105, 940, 510, .045, .065, .11, .96);
++    /* Guest dialogue may keep changing under the editor. Only the backdrop
++     * is translucent; text behind the panel must not show through. */
++    rectangle(cg, 170, 105, 940, 510, .045, .065, .11, 1);
+     rectangle(cg, 170, 105, 940, 4, .35, .65, .95, 1);
+     text(cg, ui->title, 210, 128, 860, 48, 30);
+     rectangle(cg, 210, 184, 860, 1, .45, .52, .65, .65);
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -3239,6 +3239,12 @@
+                 while (k < n_cc && cc_surf[k] != r->rt[0]) k++;
+                 if (k == n_cc) {
+                     if (n_cc == RSX_BE_MAX_COLOR_TARGETS) break;
++                    /* Independent clears can name differently sized targets.
++                     * They cannot share a Metal pass: stop before consuming
++                     * this clear so the next pass still executes it. */
++                    id<MTLTexture> first = n_cc ? eng_obj(cc_surf[0]) : nil;
++                    id<MTLTexture> next = eng_obj(r->rt[0]);
++                    if (first && next && (first.width != next.width || first.height != next.height)) break;
+                     cc_surf[n_cc++] = r->rt[0];
+                 }
+                 memcpy(cc_rgba[k], r->clear_rgba, sizeof cc_rgba[k]);
+diff --git a/libs/video/tests/test_metal_overlay.m b/libs/video/tests/test_metal_overlay.m
+--- a/libs/video/tests/test_metal_overlay.m
++++ b/libs/video/tests/test_metal_overlay.m
+@@ -24,7 +24,12 @@
+         rsx_metal_overlay_raster(&ui, pixels);
+         assert(pixels[3] > 100 && pixels[3] < 150); /* translucent backdrop */
+         size_t panel = (150 * 1280 + 180) * 4;
+-        assert(pixels[panel + 3] > 240);
++        assert(pixels[panel + 3] == 255);
++        /* A white guest title behind any part of the panel contributes zero
++         * to composition; outside the panel the backdrop remains translucent. */
++        for (unsigned y = 105; y < 615; y++) for (unsigned x = 170; x < 1110; x++)
++            assert(pixels[(y * 1280 + x) * 4 + 3] == 255);
++        puts("[AH-test] opaque panel rejects guest text bleed-through: PASS");
+         ppm("port/runs/P-overlay-notice.ppm", pixels);
+         ui.kind = SYS_OVERLAY_LIST; ui.count = 8; ui.selected = 6;
+         strcpy(ui.message, "Choose a save slot.");
+@@ -58,6 +63,31 @@
+         [display getBytes:pixels bytesPerRow:1280*4 fromRegion:MTLRegionMake2D(0,0,1280,720) mipmapLevel:0];
+         assert(pixels[0] > 15 && pixels[0] < 25 && pixels[1] > 45 && pixels[1] < 60);
+         assert(pixels[2] > 75 && pixels[2] < 90 && pixels[3] == 255);
++        unsigned char panel_color[4]; memcpy(panel_color, pixels + panel, 4);
++        /* Switch pages over a completely different guest frame. Panel pixels
++         * must match a fresh raster, without the previous snapshot or guest. */
++        ps3_overlay_finish(token, SYS_OVERLAY_OK); ps3_overlay_take_result(token, NULL, NULL);
++        ui.kind = SYS_OVERLAY_EDITOR;
++        token = ps3_overlay_open(&ui, SYS_OVERLAY_BACK); assert(token);
++        strcpy(ui.title, "D2 cheats / Characters");
++        assert(ps3_overlay_editor_update(token, &ui));
++        memset(pixels, 255, 1280 * 720 * 4);
++        [guest replaceRegion:MTLRegionMake2D(0,0,1280,720) mipmapLevel:0 withBytes:pixels bytesPerRow:1280*4];
++        cb = [queue commandBuffer];
++        rsx_metal_overlay_encode(cb, guest, display); [cb commit]; rsx_metal_overlay_end(); [cb waitUntilCompleted];
++        assert(!cb.error);
++        [display getBytes:pixels bytesPerRow:1280*4 fromRegion:MTLRegionMake2D(0,0,1280,720) mipmapLevel:0];
++        assert(!memcmp(panel_color, pixels + panel, 4));
++        unsigned char* expected = malloc(1280 * 720 * 4); assert(expected);
++        rsx_metal_overlay_raster(&ui, expected);
++        for (unsigned y = 110; y < 184; y++) for (unsigned x = 170; x < 1110; x++) {
++            size_t offset = (y*1280+x)*4;
++            for (unsigned c = 0; c < 3; c++)
++                assert(abs((int)pixels[offset+c] - expected[offset+c]) <= 1);
++            assert(pixels[offset+3] == 255);
++        }
++        free(expected);
++        puts("[AH-test] opaque title/panel across guest and editor page changes: PASS");
+         ppm("port/runs/P-overlay-metal.ppm", pixels);
+         ps3_overlay_finish(token, SYS_OVERLAY_OK); ps3_overlay_take_result(token, NULL, NULL);
+         rsx_metal_overlay_shutdown(); free(pixels);

@@ -1,0 +1,59 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index f036ca9..028ce41 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -188,8 +188,8 @@ static int audio_backend_init(void)
+     }
+ 
+     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
+-    printf("[cellAudio] SDL output driver=%s rate=%d channels=%u format=0x%04X\n",
+-           SDL_GetCurrentAudioDriver(), have.freq, have.channels, have.format);
++    printf("[cellAudio] SDL output driver=%s rate=%d channels=%u format=0x%04X samples=%u\n",
++           SDL_GetCurrentAudioDriver(), have.freq, have.channels, have.format, have.samples);
+     return 0;
+ }
+ 
+@@ -537,24 +537,23 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+     (void)arg;
+     printf("[cellAudio] Mixing thread started\n");
+ 
+-    /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
+-     * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
+-     * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
+-     * dropped the surplus: 20% of the audio thrown away, and a guest mixer
+-     * (GH3's FMOD) that could not keep ahead of the read index played gaps.
+-     * With no device, pace on the performance counter instead. */
++    /* Pace guest consumption/notifications at 256 frames / 48 kHz even with
++     * a device open. Device callbacks may consume several blocks at once;
++     * filling that room in a burst advances the guest read index before its
++     * mixer can render the next block (alternating silence on 512-frame SDL
++     * callbacks). Device room is backpressure, not the guest audio clock. */
+     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+     unsigned long long blocks = 0;
+     while (s_mix_thread_running) {
+         const int room = audio_backend_room();
+         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+-        if (room < 0) {
++        {
+             LARGE_INTEGER now; QueryPerformanceCounter(&now);
+             const long long due = q0.QuadPart +
+                 (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+             if (now.QuadPart < due) { Sleep(1); continue; }
+-            /* More than 50 ms behind (device just went away, a debugger
+-             * stop): drop the backlog instead of mixing it in a burst. */
++            /* More than 50 ms behind: drop the clock backlog instead of
++             * mixing it in a burst. */
+             if (now.QuadPart - due > qf.QuadPart / 20)
+                 q0.QuadPart = now.QuadPart -
+                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+@@ -646,7 +645,9 @@ static void* audio_mix_thread_func(void* arg)
+     while (s_mix_thread_running) {
+         const int room = audio_backend_room();
+         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+-        if (room < 0) {
++        /* Device room can arrive in multi-block bursts; preserve the guest
++         * period just as on the silent clock and the Windows path. */
++        {
+             struct timespec ts;
+             clock_gettime(CLOCK_MONOTONIC, &ts);
+             u64 now = (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;

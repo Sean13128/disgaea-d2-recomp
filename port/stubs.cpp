@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
@@ -27,10 +28,17 @@
  * -----------------------------------------------------------------------*/
 
 extern "C" void d2_register_psn_offline(void);
+extern "C" void d2_register_debug_warp(void);
+extern "C" void d2_register_cheats(void);
 
 extern "C" void ps3_load_prx_modules(void)
 {
+#if D2_GAME_VERSION == 140
+    setenv("PS3_GAME_UPDATE_ID", "BLUS31313", 0);
+#endif
     d2_register_psn_offline();
+    d2_register_debug_warp();
+    d2_register_cheats();
 }
 
 /* ---------------------------------------------------------------------------

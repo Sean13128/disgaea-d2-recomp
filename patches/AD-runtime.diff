@@ -1,0 +1,624 @@
+diff --git a/libs/filesystem/cellFs.c b/libs/filesystem/cellFs.c
+index bab57cc..0607f88 100644
+--- a/libs/filesystem/cellFs.c
++++ b/libs/filesystem/cellFs.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "cellFs.h"
++#include "edat.h"
+ #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+ #include "ps3emu/endian.h"
+ #include <stdio.h>
+@@ -130,6 +131,12 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
+     extern int ps3_vfs_hdd1_path(const char* path, char* out, size_t cap);
+     if (ps3_vfs_hdd1_path(ps3_path, host_buf, buf_size)) return 0;
+ 
++    const char* hdd0 = getenv("PS3_HDD0_ROOT");
++    if (hdd0 && (!strcmp(ps3_path, "/dev_hdd0") || !strncmp(ps3_path, "/dev_hdd0/", 10))) {
++        snprintf(host_buf, buf_size, "%s/%s", hdd0, ps3_path + (ps3_path[9] ? 10 : 9));
++        return 0;
++    }
++
+     /* Find longest matching prefix */
+     int best = -1;
+     size_t best_len = 0;
+@@ -426,6 +433,13 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
+         return (s32)CELL_ENOENT;
+     }
+ 
++    if ((flags & CELL_FS_O_ACCMODE) == CELL_FS_O_RDONLY) {
++        char cache[CELL_FS_MAX_FS_PATH_LENGTH];
++        const char* use = edat_resolve(host_path, cache, sizeof cache);
++        if (!use) return (s32)CELL_EIO;
++        if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use);
++    }
++
+     /* If creating, ensure parent directories exist */
+     if (flags & CELL_FS_O_CREAT) {
+         ensure_parent_dirs(host_path);
+diff --git a/libs/filesystem/edat.c b/libs/filesystem/edat.c
+index 64f0ff5..7fc1dd6 100644
+--- a/libs/filesystem/edat.c
++++ b/libs/filesystem/edat.c
+@@ -24,6 +24,13 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <ctype.h>
++#ifdef _WIN32
++#include <direct.h>
++#define EDAT_MKDIR(p) _mkdir(p)
++#else
++#define EDAT_MKDIR(p) mkdir(p, 0755)
++#endif
+ 
+ /* ---------------------------------------------------------------------------
+  * AES-128
+@@ -321,6 +328,8 @@ static const struct { const char* name; uint8_t key[16]; } KLIC_CANDIDATES[] = {
+ 
+ static const uint8_t NP_OMAC_KEY_2[16] = {
+     0x6B,0xA5,0x29,0x76,0xEF,0xDA,0x16,0xEF,0x3C,0x33,0x9F,0xB2,0x97,0x1E,0x25,0x6B };
++static const uint8_t NP_OMAC_KEY_3[16] = {
++    0x9B,0x51,0x5F,0xEA,0xCF,0x75,0x06,0x49,0x81,0xAA,0x60,0x4D,0x91,0xA5,0x4E,0x97 };
+ static const uint8_t SDAT_KEY[16] = {
+     0x0D,0x65,0x5E,0xF8,0xE6,0x74,0xA9,0x8A,0xB8,0x50,0x5C,0xFA,0x7D,0x01,0x29,0x33 };
+ 
+@@ -424,7 +433,7 @@ static int edat_rif_key(const char* in_path, uint8_t out[16])
+     return 0;
+ }
+ 
+-int edat_decrypt_file(const char* in_path, const char* out_path)
++int edat_decrypt_file_key(const char* in_path, const char* out_path, const uint8_t* klicensee)
+ {
+     static int checked = 0;
+     if (!checked) {
+@@ -444,6 +453,7 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+     uint8_t hdr[0x100];
+     if (fread(hdr, 1, sizeof hdr, in) != sizeof hdr) { fclose(in); return -2; }
+ 
++    if (memcmp(hdr, "NPD\0", 4) != 0) { fclose(in); return -2; }
+     uint32_t version  = be32(hdr + 0x04);
+     uint32_t license  = be32(hdr + 0x08);
+     const uint8_t* digest   = hdr + 0x40;
+@@ -456,7 +466,7 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+             in_path, version, license, flags, block_size,
+             (unsigned long long)file_size);
+ 
+-    if (flags & (EDAT_COMPRESSED_FLAG | EDAT_DEBUG_DATA_FLAG)) {
++    if (version > 4 || (flags & (EDAT_COMPRESSED_FLAG | EDAT_DEBUG_DATA_FLAG))) {
+         fprintf(stderr, "[edat] unsupported flags 0x%08X (per-block zlib compression "
+                         "and debug data are not implemented)\n", flags);
+         fclose(in); return -3;
+@@ -489,6 +499,16 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+         have_key = 1;
+     } else {
+         int found = -1;
++        if (klicensee) {
++            uint8_t ck[16], mac[16];
++            for (int i = 0; i < 16; i++) ck[i] = klicensee[i] ^ NP_OMAC_KEY_2[i];
++            aes128_cmac(ck, hdr, 0x60, mac);
++            if ((license & 3) == 3 && memcmp(mac, dev_hash, 16) != 0) {
++                fprintf(stderr, "[edat] supplied klicensee does not match dev_hash: %s\n", in_path);
++                fclose(in); return -6;
++            }
++            if ((license & 3) == 3) { memcpy(key, klicensee, 16); have_key = 1; }
++        }
+         for (int c = 0; c < (int)(sizeof KLIC_CANDIDATES / sizeof KLIC_CANDIDATES[0]); c++) {
+             uint8_t ck[16], mac[16];
+             for (int i = 0; i < 16; i++)
+@@ -496,7 +516,9 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+             aes128_cmac(ck, hdr, 0x60, mac);
+             if (memcmp(mac, dev_hash, 16) == 0) { found = c; break; }
+         }
+-        if (found >= 0 && (license & 3) == 3) {
++        if (have_key) {
++            fprintf(stderr, "[edat] supplied klicensee verified against dev_hash\n");
++        } else if (found >= 0 && (license & 3) == 3) {
+             memcpy(key, KLIC_CANDIDATES[found].key, 16);
+             have_key = 1;
+             fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
+@@ -506,17 +528,61 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+             fprintf(stderr, "[edat] license type %u: using the supplied RIF key%s\n",
+                     license, found >= 0 ? "" : " (dev_hash names an unknown klicensee)");
+         }
++        if (!have_key && (license & 3) == 3) {
++            fprintf(stderr, "[edat] free-license content needs its game's klicensee: %s\n", in_path);
++            fclose(in); return -6;
++        }
+         if (!have_key) {
++            fprintf(stderr, "[edat] missing license for content id %.48s (%s)\n", hdr + 0x10, in_path);
+             fprintf(stderr,
+                 "[edat] license type %u needs a RIF key and none was supplied.\n"
+                 "[edat]   set PS3_RIF_KEY=<32 hex chars>, or put the 16 raw bytes in\n"
+                 "[edat]   %s.rifkey -- it is derived from your own .rap for this\n"
+                 "[edat]   content id, which this runtime deliberately cannot do for you.\n",
+                 license, in_path);
+-            fclose(in); return -6;
++            fclose(in); return -13;
++        }
++    }
++
++    if (!(flags & SDAT_FLAG)) {
++        const char* name = strrchr(in_path, '/');
++        const char* win_name = strrchr(in_path, '\\');
++        if (!name || (win_name && win_name > name)) name = win_name;
++        name = name ? name + 1 : in_path;
++        size_t name_len = strlen(name);
++        uint8_t title[0x30 + 1024], mac[16];
++        if (name_len > 1024) { fclose(in); return -2; }
++        memcpy(title, hdr + 0x10, 0x30);
++        memcpy(title + 0x30, name, name_len);
++        int valid = 0;
++        const char* ext = strrchr(name, '.');
++        for (int mode = 0; mode < 3 && !valid; mode++) {
++            if (mode && ext) {
++                for (size_t i = (size_t)(ext - name); i < name_len; i++)
++                    title[0x30 + i] = mode == 1 ? tolower((unsigned char)name[i]) : toupper((unsigned char)name[i]);
++            }
++            aes128_cmac(NP_OMAC_KEY_3, title, 0x30 + name_len, mac);
++            valid = memcmp(mac, hdr + 0x50, 16) == 0;
++        }
++        if (!valid) {
++            fprintf(stderr, "[edat] invalid title hash: %s\n", in_path);
++            fclose(in); return -11;
+         }
+     }
+ 
++    // RPCS3 check_data: the header CMAC uses the file key (unwrapped for 0x08).
++    static const uint8_t zero_iv_header[16] = {0};
++    uint8_t header_key[16], header_mac[16];
++    if (flags & EDAT_ENCRYPTED_KEY_FLAG)
++        aes128_cbc_decrypt(version == 4 ? EDAT_KEY_1 : EDAT_KEY_0,
++                           zero_iv_header, key, header_key, 16);
++    else memcpy(header_key, key, 16);
++    aes128_cmac(header_key, hdr, 0xA0, header_mac);
++    if (memcmp(header_mac, hdr + 0xA0, 16) != 0) {
++        fprintf(stderr, "[edat] invalid header hash: %s\n", in_path);
++        fclose(in); return -11;
++    }
++
+     uint32_t total_blocks = (uint32_t)((file_size + block_size - 1) / block_size);
+ 
+     /* Layout. With FLAG_0x20 (or compression) each block carries a 0x20-byte
+@@ -560,7 +626,8 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+             fread(meta, 1, meta_size, in) != meta_size) { rc = -9; break; }
+ 
+         /* With FLAG_0x20 the stored hash is the xor of the two halves. */
+-        uint8_t block_hash[16];
++        uint8_t block_hash[20] = {0};
++        if (meta_size == 0x20) memcpy(block_hash, meta, 20);
+         if (meta_size == 0x20)
+             for (int k = 0; k < 16; k++) block_hash[k] = (uint8_t)(meta[k] ^ meta[k + 16]);
+         else
+@@ -608,14 +675,15 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+         if (hash_alg == 2) aes128_cmac(hkey, enc, (size_t)padded, mac);
+         else               hmac_sha1(hkey, (hash_alg == 1) ? 20 : 16,
+                                      enc, (size_t)padded, mac);
+-        if (memcmp(mac, block_hash, 16) != 0) {
++        if (memcmp(mac, block_hash, hash_alg == 1 ? 20 : 16) != 0) {
+             fprintf(stderr, "[edat] block %u hash mismatch -- wrong key or corrupt "
+                             "file; stopping rather than writing garbage\n", b);
+             rc = -11; break;
+         }
+ 
+-        aes128_cbc_decrypt(ckey, (version <= 1) ? zero_iv : digest,
+-                           enc, dec, (size_t)padded);
++        if (flags & EDAT_FLAG_0x02) memcpy(dec, enc, (size_t)padded);
++        else aes128_cbc_decrypt(ckey, (version <= 1) ? zero_iv : digest,
++                               enc, dec, (size_t)padded);
+         if (fwrite(dec, 1, (size_t)len, out) != len) { rc = -12; break; }
+         written += len;
+     }
+@@ -632,21 +700,50 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+     return rc;
+ }
+ 
+-const char* edat_resolve(const char* host_path, char* buf, size_t cap)
++int edat_decrypt_file(const char* in_path, const char* out_path)
+ {
+-    static int enabled = -1;
+-    if (enabled < 0) {
+-        const char* e = getenv("PS3_EDAT");
+-        enabled = (e && e[0] == '0') ? 0 : 1;
+-    }
+-    if (!enabled || !host_path || !edat_is_npd(host_path)) return host_path;
+-
+-    if ((size_t)snprintf(buf, cap, "%s.dec", host_path) >= cap) return host_path;
++    return edat_decrypt_file_key(in_path, out_path, NULL);
++}
+ 
++const char* edat_resolve_key(const char* host_path, char* buf, size_t cap,
++                             const uint8_t* klicensee)
++{
++    if (!host_path || !edat_is_npd(host_path)) return host_path;
++    const char* disabled = getenv("PS3_EDAT");
++    if (disabled && disabled[0] == '0') return NULL;
+     struct stat ss, ds;
+-    if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime)
+-        return buf;                                    /* cache still valid */
++    if (stat(host_path, &ss)) return NULL;
++    uint64_t hash = 1469598103934665603ULL;
++    for (const unsigned char* p = (const unsigned char*)host_path; *p; p++)
++        hash = (hash ^ *p) * 1099511628211ULL;
++    hash = (hash ^ (uint64_t)ss.st_size) * 1099511628211ULL;
++    hash = (hash ^ (uint64_t)ss.st_mtime) * 1099511628211ULL;
++#ifdef __APPLE__
++    hash = (hash ^ (uint64_t)ss.st_mtimespec.tv_nsec) * 1099511628211ULL;
++#elif !defined(_WIN32)
++    hash = (hash ^ (uint64_t)ss.st_mtim.tv_nsec) * 1099511628211ULL;
++#endif
++    const char* root = getenv("PS3_EDAT_CACHE");
++    char cache_root[1100];
++    if (!root || !*root) {
++        const char* hdd0 = getenv("PS3_HDD0_ROOT");
++        const char* tmp = getenv("TMPDIR");
++        snprintf(cache_root, sizeof cache_root, "%s/%s", hdd0 && *hdd0 ? hdd0 : tmp && *tmp ? tmp : ".",
++                 hdd0 && *hdd0 ? "cache/edat" : "ps3recomp-edat");
++        root = cache_root;
++    }
++    if ((size_t)snprintf(buf, cap, "%s/%016llx.dec", root, (unsigned long long)hash) >= cap) return NULL;
++    // Caches live in writable storage, never beside a read-only disc/EDAT.
++    for (char* p = buf + 1; *p; p++) {
++        if (*p != '/' && *p != '\\') continue;
++        char saved = *p; *p = 0; EDAT_MKDIR(buf); *p = saved;
++    }
++    if (!klicensee && stat(buf, &ds) == 0) return buf;
++    int rc = edat_decrypt_file_key(host_path, buf, klicensee);
++    return rc == 0 ? buf : NULL;
++}
+ 
+-    if (edat_decrypt_file(host_path, buf) != 0) return host_path;
+-    return buf;
++const char* edat_resolve(const char* host_path, char* buf, size_t cap)
++{
++    return edat_resolve_key(host_path, buf, cap, NULL);
+ }
+diff --git a/libs/filesystem/edat.h b/libs/filesystem/edat.h
+index 36b2559..af62988 100644
+--- a/libs/filesystem/edat.h
++++ b/libs/filesystem/edat.h
+@@ -14,13 +14,11 @@
+  * path above then works unchanged, which is why this is a path substitution rather
+  * than a read hook.
+  *
+- * Scope: uncompressed EDATs with AES-CMAC block hashes -- the common case, and what
+- * PSOne Classics use. Compressed blocks and the SHA1-HMAC hash modes are detected and
+- * refused by name rather than silently mis-decrypted.
+- *
+- * Keys are the published NPDRM constants (the same ones RPCS3, scetool and every EDAT
+- * tool carry); a license-type-3 "free" EDAT needs no per-console RAP. A type-1/2 EDAT
+- * is bound to a RAP we do not have, and is refused with that stated.
++ * Scope: uncompressed EDATs with AES-CMAC/HMAC-SHA1 block hashes, optional
++ * wrapped keys, and CBC or plaintext blocks. Unsupported compression/debug
++ * data is refused. Header, title, dev and block hashes are checked.
++ * Free-license content uses the game's supplied klicensee. License type 1/2
++ * requires operator-supplied RIF key material; missing content IDs are logged.
+  */
+ #ifndef PS3RECOMP_EDAT_H
+ #define PS3RECOMP_EDAT_H
+@@ -37,15 +35,14 @@ int edat_is_npd(const char* host_path);
+ 
+ /* Decrypt in_path -> out_path. 0 on success, negative on failure (reason logged). */
+ int edat_decrypt_file(const char* in_path, const char* out_path);
++int edat_decrypt_file_key(const char* in_path, const char* out_path, const uint8_t* klicensee);
+ 
+-/* The path the FS layer should actually open for `host_path`.
+- *
+- * Returns host_path unchanged when it is not an EDAT, or when decryption fails (the
+- * caller then opens the original and the guest reports its own error -- better than
+- * an open() failure it cannot attribute). Otherwise returns a cache path, written
+- * into `buf`. The cache lives beside the source as "<name>.dec" and is reused while
+- * it is newer than the source. Set PS3_EDAT=0 to disable the whole path. */
++/* Plaintext cache under PS3_EDAT_CACHE, else PS3_HDD0_ROOT/cache/edat.
++ * NULL means failed decryption: callers must return EIO, not ciphertext.
++ * The keyed form always authenticates the source, even with a cached view. */
+ const char* edat_resolve(const char* host_path, char* buf, size_t cap);
++const char* edat_resolve_key(const char* host_path, char* buf, size_t cap,
++                             const uint8_t* klicensee);
+ 
+ /* Self-check of the AES-128 and AES-CMAC primitives against the FIPS-197 and
+  * RFC 4493 vectors. Returns 0 if both match. Run once on first use: silently
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 440d870..6385820 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -188,6 +188,9 @@ static void cellFsOpen(ppu_context* ctx)
+      * file and that is opened in its place. */
+     { char dec_path[1200];
+       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
++      if (!use) {
++          ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
++      }
+       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
+ 
+     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
+@@ -294,6 +297,9 @@ static void cellFsSdataOpen(ppu_context* ctx)
+      * cellFsOpen. One decryptor, reached from both doors. */
+     { char dec_path[1200];
+       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
++      if (!use) {
++          ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
++      }
+       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
+ 
+     int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
+@@ -322,8 +328,8 @@ static void cellFsSdataOpen(ppu_context* ctx)
+         free(enc);
+         if (!dec) {
+             fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
+-                    "EDAT/needs license); returning success without a handle\n", gpath);
+-            ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
++                    "EDAT/needs license); returning EIO\n", gpath);
++            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+         }
+         char dmagic[4] = {0};
+         if (dec_sz >= 4) memcpy(dmagic, dec, 4);
+@@ -401,6 +407,8 @@ static void cellFsRead(ppu_context* ctx)
+     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
+     fs_prefault(buf, nbytes);
+     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
++    if (getenv("PS3_NPDRM_TRACE") && strstr(g_fd_path[fd], ".edat"))
++        fprintf(stderr, "[NPDRM] read path='%s' offset=%ld bytes=%zu\n", g_fd_path[fd], fpos_before, n);
+     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
+      * The intro cinematic is 28 seconds and this port renders it at a few frames
+      * a second, so it cannot be watched to its end -- truncating the stream makes
+@@ -941,8 +949,38 @@ static void hle_prx_load_fd(ppu_context* ctx)
+     ctx->gpr[3] = id ? id : (uint64_t)(int64_t)(int32_t)0x80011148;
+ }
+ 
++/* NPDRM is local content licensing and works without a PSN login. Validate
++ * the supplied klicensee and payload before making a plaintext view available. */
++static void sceNpDrmIsAvailable(ppu_context* ctx)
++{
++    uint32_t key_ea = (uint32_t)ctx->gpr[3], path_ea = (uint32_t)ctx->gpr[4];
++    if (!path_ea || !fs_guest_range(path_ea, 1) ||
++        (key_ea && !fs_guest_range(key_ea, 16))) {
++        ctx->gpr[3] = 0x80029502u; return;
++    }
++    char guest[1024], host[1100], cache[1200];
++    guest_strcpy(guest, path_ea, sizeof guest);
++    host_path(host, sizeof host, guest);
++    FILE* f = fopen(host, "rb");
++    uint32_t result = 0;
++    if (!f) result = 0x80010006u;
++    else {
++        fclose(f);
++        if (edat_is_npd(host)) {
++            uint8_t key[16] = {0};
++            if (key_ea) memcpy(key, vm_base + key_ea, 16);
++            if (!edat_resolve_key(host, cache, sizeof cache, key)) result = 0x80029513u;
++        }
++    }
++    fprintf(stderr, "[NPDRM] %s path='%s' caller=0x%08X result=0x%08X\n",
++            result ? "rejected" : "accepted", guest, (uint32_t)ctx->lr, result);
++    ctx->gpr[3] = result;
++}
++
+ extern "C" void ppu_fs_register(void)
+ {
++    ps3_hle_register_ctx(0xAD218FAFu, "sceNpDrmIsAvailable", sceNpDrmIsAvailable);
++    ps3_hle_register_ctx(0xF042B14Fu, "sceNpDrmIsAvailable2", sceNpDrmIsAvailable);
+     ps3_hle_register_ctx(0x26090058u, "sys_prx_load_module", hle_prx_load_path);
+     ps3_hle_register_ctx(0xAA6D9BFFu, "sys_prx_load_module_on_memcontainer", hle_prx_load_path);
+     ps3_hle_register_ctx(0xEF68C17Cu, "sys_prx_load_module_by_fd", hle_prx_load_fd);
+diff --git a/runtime/spu/spu_lifted_thread.c b/runtime/spu/spu_lifted_thread.c
+index 945829d..3915645 100644
+--- a/runtime/spu/spu_lifted_thread.c
++++ b/runtime/spu/spu_lifted_thread.c
+@@ -2,6 +2,9 @@
+ 
+ #include "spu_lifted_thread.h"
+ #include "spu_context.h"
++#include "spu_workload.h"
++
++extern uint32_t ps3_spu_image_source_ea(uint32_t img_ea);
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -11,7 +14,6 @@ extern uint8_t* vm_base;
+ 
+ /* The lifted-code registry, the dispatcher and the per-context MFC engine
+  * table, all in spu_channels.c. */
+-int  spu_have_function(uint32_t addr);
+ int  spu_image_of_function(uint32_t addr);
+ void spu_indirect_branch(struct spu_context* ctx);
+ int  spu_run_with_halt(void (*entry)(struct spu_context*), struct spu_context* ctx);
+@@ -64,9 +66,22 @@ static void spu_deploy_image(spu_context* ctx, uint32_t img_ea)
+     }
+ }
+ 
+-int spu_lifted_thread_available(uint32_t entry)
++static int spu_thread_image(uint32_t entry, uint32_t img_ea)
++{
++    uint32_t src = img_ea ? ps3_spu_image_source_ea(img_ea) : 0;
++    if (src && vm_base) {
++        size_t size = spu_elf_image_size(vm_base + src, 1u << 20);
++        int img = -1;
++        if (size && spu_workload_find_img(spu_workload_fingerprint(vm_base + src, size), &img))
++            return img;
++        return -1; /* An unknown ELF must not run another image's CRT. */
++    }
++    return spu_image_of_function(entry & SPU_LS_MASK);
++}
++
++int spu_lifted_thread_available(uint32_t entry, uint32_t img_ea)
+ {
+-    return spu_have_function(entry & SPU_LS_MASK);
++    return spu_thread_image(entry, img_ea) >= 0;
+ }
+ 
+ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
+@@ -78,16 +93,10 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
+     ctx->spu_group_id = d->group_id;
+     ctx->pc           = d->entry & SPU_LS_MASK;
+ 
+-    /* Start the thread in the image its entry point belongs to, rather than in
+-     * image 0. Zero is the registry's wildcard, so a context that keeps it will
+-     * happily resolve a later branch into whatever other image registered that
+-     * LS address -- SPURS loads its kernel, policy modules and job binaries at
+-     * overlapping addresses, so that is not a rare collision but the normal
+-     * case. Asking the registry which image owns the entry point gets the same
+-     * answer the title's own registration order implies, without the lv2 layer
+-     * having to know any image ids. */
+-    { int img = spu_image_of_function(ctx->pc);
+-      ctx->image_id = (img >= 0) ? img : 0; }
++    /* CRT entry addresses overlap between images. Match the imported ELF's
++     * content, rather than whichever image registered that LS address first. */
++    int img = spu_thread_image(ctx->pc, d->img_ea);
++    ctx->image_id = img >= 0 ? img : 0;
+ 
+     if (d->img_ea) spu_deploy_image(ctx, d->img_ea);
+ 
+diff --git a/runtime/spu/spu_lifted_thread.h b/runtime/spu/spu_lifted_thread.h
+index 5805cdb..36c5a4b 100644
+--- a/runtime/spu/spu_lifted_thread.h
++++ b/runtime/spu/spu_lifted_thread.h
+@@ -44,9 +44,10 @@ typedef struct spu_lifted_thread_result {
+     int     faulted;        /* stopped outside the documented exit protocol   */
+ } spu_lifted_thread_result;
+ 
+-/* Is there lifted code for an image whose entry point is `entry`? This is what
++/* Is there lifted code for the imported image (or a manually registered entry
++ * when img_ea has no recorded ELF source)? This is what
+  * decides between real SPU execution and the fallback/interpreter paths. */
+-int spu_lifted_thread_available(uint32_t entry);
++int spu_lifted_thread_available(uint32_t entry, uint32_t img_ea);
+ 
+ /* Bring `ctx` up to the state lv2 hands a freshly started SPU thread: image
+  * deployed into local store, arguments in r3..r6, pc at the entry, and the
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index 9eafda1..ea1e7d1 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -38,7 +38,7 @@
+  *         runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
+  *         runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
+  *         runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+- *         runtime/platform/win32_compat.c \
++ *         runtime/platform/win32_compat.c runtime/platform/guest_poll.c \
+  *         -lpthread
+  *
+  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
+@@ -755,6 +755,37 @@ static void test_nonzero_link_return(void)
+     free(ctx);
+ }
+ 
++static void test_imported_image_collision(void)
++{
++    // Two valid ELF containers with a shared CRT PC and different contents.
++    for (unsigned i = 0; i < 3; i++) {
++        uint32_t ea = 0x18000 + i * 0x100;
++        memcpy(vm_base + ea, "\177ELF\1\2", 6);
++        wr_be32(ea + 0x20, 0x100); // Size from the empty section table boundary.
++        vm_base[ea + 0x80] = (uint8_t)i;
++    }
++    spu_begin_image(90); spu_register_function(0xD0, code_a);
++    spu_begin_image(91); spu_register_function(0xD0, code_b);
++    spu_begin_image(0);
++    for (unsigned i = 0; i < 2; i++) {
++        uint32_t ea = 0x18000 + i * 0x100;
++        spu_workload_register_img(spu_workload_fingerprint(vm_base + ea, 0x100),
++                                  i ? code_b : code_a, 90 + i, "collision fixture");
++    }
++    spu_context* ctx = calloc(1, sizeof *ctx);
++    CHECK(ctx != NULL);
++    if (!ctx) return;
++    for (unsigned i = 0; i < 2; i++) {
++        spu_lifted_thread_desc d = {0};
++        d.entry = 0xD0; d.img_ea = 0x18400 + i * 0x100;
++        CHECK(spu_lifted_thread_available(d.entry, d.img_ea));
++        spu_lifted_thread_setup(ctx, &d);
++        CHECK(ctx->image_id == (int)(90 + i));
++    }
++    CHECK(!spu_lifted_thread_available(0xD0, 0x18600));
++    free(ctx);
++}
++
+ int main(void)
+ {
+     printf("SPU lifted thread-group start\n");
+@@ -896,10 +927,11 @@ int main(void)
+     CHECK(g_guest_mem[OUT_EA + 15] == (uint8_t)(RESULT_BYTE + (int)(tid0 & 1u)));
+ 
+     /* An image with no lifted code must still take the old path. */
+-    CHECK(!spu_lifted_thread_available(IMG_ENTRY + 4));
++    CHECK(!spu_lifted_thread_available(IMG_ENTRY + 4, 0));
+ 
+     /* The registry is sized for a whole game's SPU workload. Last, so its
+      * filler registrations cannot affect the lookups above. */
++    test_imported_image_collision();
+     test_registry_capacity();
+ 
+     printf("SPU lifted thread-group start: %d passed, %d failed\n",
+@@ -980,7 +1012,10 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
+ 
+ /* Upstream raw-SPU and RSX services are outside this group-start fixture. */
+ uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+-uint32_t ps3_spu_image_source_ea(uint32_t ea) { return ea; }
++uint32_t ps3_spu_image_source_ea(uint32_t ea)
++{
++    return ea >= 0x18400 && ea <= 0x18600 ? ea - 0x400 : 0;
++}
+ /* cellSpurs owns this; 0 = "not a SPURS port", the plain lv2 event path. */
+ uint32_t spurs_port_queue(uint32_t port)        { (void)port; return 0; }
+ void sys_raw_spu_init(lv2_syscall_table* t) { (void)t; }
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index d16c53a..9a77a9d 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -977,7 +977,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+          * as a real SPU would, with group_join waiting on it exactly as it
+          * waits on a fallback thread. Images with no lifted code fall through
+          * to the fallback and interpreter paths below, unchanged. */
+-        if (spu_lifted_thread_available(t->entry_point)) {
++        if (spu_lifted_thread_available(t->entry_point, t->img_ea)) {
+             if (!t->sctx) t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
+             if (t->sctx) {
+                 spu_lifted_thread_desc d;
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+index ef0c58b..a3bf157 100644
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -89,8 +89,33 @@ static void fs_normalize_sep(char* p) {
+  *
+  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
+  * their own translation (see docs), and a guest path can arrive at any of them. */
++/* Disc ports select an installed title update with PS3_GAME_UPDATE_ID. Only
++ * existing USRDIR files overlay disc assets; DLC and explicit hdd0 paths keep
++ * their own mount. All filesystem entry points share this helper. */
++static int ps3_vfs_game_overlay(char* path, size_t cap)
++{
++    const char* title = getenv("PS3_GAME_UPDATE_ID");
++    const char* hdd0 = getenv("PS3_HDD0_ROOT");
++    const char* disc = getenv("PS3_VFS_ROOT");
++    if (!path || !title || !*title || !hdd0 || !disc) return 0;
++    if (strspn(title, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != strlen(title)) return 0;
++    size_t n = strlen(disc);
++    if (strncmp(path, disc, n) || path[n] != '/') return 0;
++    const char* rel = path + n;
++    if (!strncmp(rel, "/PS3_GAME/USRDIR/", 17)) rel += 17;
++    else if (!strncmp(rel, "/USRDIR/", 8)) rel += 8;
++    else return 0;
++    char update[1024];
++    snprintf(update, sizeof update, "%s/game/%s/USRDIR/%s", hdd0, title, rel);
++    struct stat st;
++    if (stat(update, &st) || (st.st_mode & S_IFMT) != S_IFREG) return 0;
++    snprintf(path, cap, "%s", update);
++    return 1;
++}
++
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+ {
++    if (ps3_vfs_game_overlay(path, cap)) return;
+     struct stat st;
+     if (!path || !*path || stat(path, &st) == 0)
+         return;
+@@ -369,6 +394,7 @@ int64_t sys_fs_open(ppu_context* ctx)
+      * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
+     { char dec_path[1200];
+       const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
++      if (!use) return (int64_t)(int32_t)CELL_EIO;
+       if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
+ 
+     /* Find free fd slot */

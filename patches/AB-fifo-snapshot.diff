@@ -1,0 +1,560 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -147,7 +147,11 @@
+ /* Keep each submitted flip distinct. FIFO producers stop at a flip; direct
+  * HLE producers may queue more than one. Backpressure bounds that queue. */
+ #define GCM_FLIP_QUEUE_SIZE 64u
+-static struct { u32 buffer, fifo_end; int waiting_fifo; u64 earliest_vblank; }
++static atomic_int s_host_enabled;
++static atomic_ullong s_host_flip_ticket = UINT64_MAX;
++static u64 gcm_host_snapshot(int flip_buffer);
++static void gcm_host_shutdown(void);
++static struct { u32 buffer, fifo_end; int waiting_fifo; u64 earliest_vblank, fifo_ticket; }
+     s_flip_queue[GCM_FLIP_QUEUE_SIZE];
+ static SRWLOCK s_flip_lock = SRWLOCK_INIT;
+ static u64 s_last_present_vblank;
+@@ -217,7 +221,7 @@
+ 
+ void cellGcm_fifo_kick(void);
+ 
+-static u32 gcm_queue_flip_at(u32 bufferId, int waiting_fifo, u32 fifo_end)
++static u32 gcm_queue_flip_at(u32 bufferId, int waiting_fifo, u32 fifo_end, u64 fifo_ticket)
+ {
+     for (;;) {
+         u64 generation = gcm_progress_begin();
+@@ -227,12 +231,16 @@
+             u32 slot = requested % GCM_FLIP_QUEUE_SIZE;
+             s_flip_queue[slot].buffer = bufferId;
+             s_flip_queue[slot].fifo_end = fifo_end;
++            s_flip_queue[slot].fifo_ticket = fifo_ticket;
+             s_flip_queue[slot].waiting_fifo = waiting_fifo;
+             s_flip_queue[slot].earliest_vblank = gcm_vblank_at(gcm_vblank_elapsed_ns()) + 1;
+             s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+             s_flip_request_count = requested + 1;
+             if (!waiting_fifo) gcm_flip_trace("reach", requested + 1);
+-            if (requested == s_completed_flip_count) s_fifo_flip_reached = !waiting_fifo;
++            if (requested == s_completed_flip_count) {
++                s_fifo_flip_reached = !waiting_fifo;
++                s_host_flip_ticket = waiting_fifo ? fifo_ticket : 0;
++            }
+             s_flip_pending = 1;
+             ReleaseSRWLockExclusive(&s_flip_lock);
+             cellGcm_fifo_kick();
+@@ -247,7 +255,7 @@
+ /* A FIFO flip is queued by the walker after its preceding draws execute. */
+ static u32 gcm_queue_flip(u32 bufferId)
+ {
+-    return gcm_queue_flip_at(bufferId, 0, 0);
++    return gcm_queue_flip_at(bufferId, 0, 0, 0);
+ }
+ 
+ int cellGcm_take_flip_pending(void)
+@@ -599,6 +607,7 @@
+     s_flip_request_count = s_presented_flip_count = s_completed_flip_count = 0;
+     s_flip_pending = 0;
+     s_fifo_flip_reached = 0;
++    s_host_flip_ticket = UINT64_MAX;
+     s_last_present_vblank = 0;
+     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
+     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+@@ -913,6 +922,9 @@
+         s_flip_pending = (presented != s_flip_request_count);
+         s_fifo_flip_reached = s_flip_pending &&
+             !s_flip_queue[presented % GCM_FLIP_QUEUE_SIZE].waiting_fifo;
++        s_host_flip_ticket = s_flip_pending ?
++            s_flip_queue[presented % GCM_FLIP_QUEUE_SIZE].fifo_ticket : UINT64_MAX;
++        if (s_fifo_flip_reached) s_host_flip_ticket = 0;
+         if (!s_flip_pending) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+         vm_write32(GCM_LABEL_GUEST_BASE + 0x10, 0);
+         GCM_PENDING_SET(2);
+@@ -980,6 +992,9 @@
+ static u32 s_fifo_getoff  = 0;
+ static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
+ static u32 s_fifo_calloff = 0;
++static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
++
++#include "cellGcm_fifo_snapshot.h"
+ 
+ /* ---------------------------------------------------------------------------
+  * 2D transfer engines (FIFO subchannels != 0).
+@@ -1688,7 +1703,6 @@
+ /* Serializes the FIFO walker between the 60 Hz present thread and the
+  * poll-path below. TryAcquire on the poll path avoids re-entrancy (the walker
+  * itself performs guest reads) and never blocks a spinning game thread. */
+-static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
+ static void gcm_rsx_process_fifo_unlocked(void);
+ 
+ /* Kick event: a game thread whose fence wait finds the queue DRY signals the
+@@ -1736,6 +1750,7 @@
+ 
+ static void gcm_start_put_watch(void)
+ {
++    gcm_host_start();
+     int expected = 0;
+     if (s_gcm_initialized &&
+         atomic_compare_exchange_strong(&s_put_watch_started, &expected, 1)) {
+@@ -1760,6 +1775,7 @@
+ {
+     if (gcm_recycle_trace_enabled()) s_recycle_trace_kicks++;
+     SetEvent((HANDLE)cellGcm_fifo_kick_event());
++    if (s_host_enabled) SetEvent(s_host_event);
+ }
+ 
+ /* Guest stores (including inline libgcm flushes) call this after committing.
+@@ -1815,7 +1831,8 @@
+     gcm_ref_publish_one();
+     int dry = (s_ref_qhead == s_ref_qtail);
+     ReleaseSRWLockExclusive(&s_ref_pub_lock);
+-    if (dry && vm_read32(GCM_CONTROL_GUEST_ADDR + 4) != vm_read32(GCM_CONTROL_GUEST_ADDR))
++    if (dry && (s_host_enabled ? s_host_head != s_host_tail :
++                vm_read32(GCM_CONTROL_GUEST_ADDR + 4) != vm_read32(GCM_CONTROL_GUEST_ADDR)))
+         cellGcm_fifo_kick(); /* only submitted work can satisfy a dry fence */
+ }
+ 
+@@ -1901,6 +1918,7 @@
+     AcquireSRWLockExclusive(&s_flip_lock);
+     u32 flip_slot = s_completed_flip_count % GCM_FLIP_QUEUE_SIZE;
+     int waiting_flip = s_flip_pending && s_flip_queue[flip_slot].waiting_fifo;
++    u64 host_limit = waiting_flip ? s_flip_queue[flip_slot].fifo_ticket : UINT64_MAX;
+     if (waiting_flip) put = s_flip_queue[flip_slot].fifo_end;
+     ReleaseSRWLockExclusive(&s_flip_lock);
+ 
+@@ -1980,7 +1998,7 @@
+     const char* why = "caught-up";
+     const u64 chunk_start = get_timestamp_ns();
+     u32 chunk_packets = 0;
+-    while (s_fifo_getoff != put && budget-- > 0) {
++    while ((s_host_enabled ? gcm_host_peek(host_limit) : s_fifo_getoff != put) && budget-- > 0) {
+         /* Yield only between complete packets. Publish real progress below,
+          * then self-kick so the runner checks its presentation deadline before
+          * continuing. A single expensive draw is never split or reordered. */
+@@ -1989,7 +2007,7 @@
+             why = "chunk";
+             break;
+         }
+-        u32 ea = gcm_io2ea(s_fifo_getoff);
++        u32 ea = s_host_enabled ? s_host_packet->ea : gcm_io2ea(s_fifo_getoff);
+         if (!ea) {
+             /* get is sitting on an IO offset with no mapping -- the title
+              * branched into a region and then unmapped it, or the offset was
+@@ -2011,7 +2029,7 @@
+             why = "no-io-mapping";
+             break;
+         }
+-        u32 w = vm_read32(ea);
++        u32 w = gcm_command_read(s_fifo_getoff);
+         /* Only remember offsets BELOW put -- those are positions in the
+          * ring the title is writing. A park in another region is where the
+          * walker gave up, not how far it got through the ring. */
+@@ -2029,6 +2047,7 @@
+              * on would mix the next frame's head into the batch (wave: every
+              * frame split across 4 presents, layout flashing/zooming). */
+             s_fifo_getoff += 4;
++            gcm_host_finish();
+             /* Count the flip WORDS the title actually writes into the FIFO,
+              * separately from the presents that result. When a title stops
+              * appearing on screen the first question is which side stopped:
+@@ -2059,6 +2078,10 @@
+             break;
+         }
+ 
++        if (s_host_enabled && (type == 1 || (w & 3u) == 2 || w == 0x00020000u)) {
++            gcm_host_finish(); /* successor was resolved against guest memory at copy time */
++            continue;
++        }
+         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
+@@ -2135,10 +2158,10 @@
+             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
+                 int sem_blocked = 0;
+                 for (u32 i = 0; i < count; i++) {
+-                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
++                    u32 dea = s_host_enabled ? ea : gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                     if (!dea) break;
+                     u32 m = (type == 0) ? method + i * 4 : method;
+-                    u32 v = vm_read32(dea);
++                    u32 v = gcm_command_read(s_fifo_getoff + 4 + i * 4);
+                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
+                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+@@ -2162,12 +2185,13 @@
+                 }
+                 if (sem_blocked) break;
+                 s_fifo_getoff += 4 + count * 4;
++                gcm_host_finish();
+                 continue;
+             }
+             for (u32 i = 0; i < count; i++) {
+-                u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
++                u32 dea = s_host_enabled ? ea : gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                 if (!dea) break;
+-                const u32 data = vm_read32(dea);
++                const u32 data = gcm_command_read(s_fifo_getoff + 4 + i * 4);
+                 u32 m = (type == 0) ? method + i * 4 : method;
+                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
+                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
+@@ -2318,14 +2342,16 @@
+                     gcm_2d_method(subch, m, data);
+                 }
+             }
+-            rsx_draw_engine_record_packet(s_fifo_getoff, vm_base + ea, 4 + count * 4);
++            rsx_draw_engine_record_packet(s_fifo_getoff, s_host_enabled ? (const void*)(s_host_packet + 1) : vm_base + ea, 4 + count * 4);
+             s_fifo_getoff += 4 + count * 4;
++            gcm_host_finish();
+             if (s_fifo_flip_reached) { why = "flip"; break; }
+             continue;
+         }
+         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
+             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+         s_fifo_getoff += 4;                    /* unknown word: skip */
++        gcm_host_finish();
+     }
+ 
+     /* Walker watchdog. Everything above recovers from a *recognised* stall --
+@@ -2356,7 +2382,7 @@
+     { static int burned = 0, passes = -1;
+       if (passes < 0) { const char* e = getenv("GCM_FIFO_CIRCLE_PASSES");
+                         passes = e ? atoi(e) : 4; }
+-      if (passes && budget <= 0 && s_fifo_getoff != put) {
++      if (!s_host_enabled && passes && budget <= 0 && s_fifo_getoff != put) {
+           if (++burned >= passes) {
+               static int n = 0;
+               if (n++ < 8)
+@@ -2369,7 +2395,7 @@
+       } else burned = 0; }
+ 
+     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
+-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
++      if (!s_host_enabled && !s_fifo_wait_label_ea && s_fifo_getoff == last && s_fifo_getoff != put) {
+           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
+                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+       } else { stuck = 0; last = s_fifo_getoff; } }
+@@ -2410,7 +2436,7 @@
+         const char* e = getenv("GCM_FORCE_RECYCLE");
+         force_recycle = e && atoi(e) != 0;
+     }
+-    if (force_recycle && s_gcm_ctx_out_ea) {
++    if (!s_host_enabled && force_recycle && s_gcm_ctx_out_ea) {
+         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
+         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
+@@ -2477,29 +2503,36 @@
+         }
+     }
+ 
+-    atomic_store_explicit(&g_gcm_fifo_drained_ea, gcm_io2ea(s_fifo_getoff), memory_order_release);
+-    /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
+-     * the walker actually is. A probe, not a fix -- it removes the back-pressure
+-     * a title uses to avoid overwriting commands the GPU has not read. It exists
+-     * to answer one question for a title that reports its ring full while the
+-     * walker says it is drained: is the title reading `get`, or something else?
+-     * If the overflow survives this, `get` is not what it consults. */
+-    { static int eq = -1;
+-      if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+-      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+-    ps3_poll_notify(GCM_CONTROL_GUEST_ADDR + 4, 4);
+-    if (waiting_flip && s_fifo_getoff == put) {
+-        AcquireSRWLockExclusive(&s_flip_lock);
++    if (!s_host_enabled) {
++        atomic_store_explicit(&g_gcm_fifo_drained_ea, gcm_io2ea(s_fifo_getoff), memory_order_release);
++        /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
++         * the walker actually is. A probe, not a fix -- it removes the back-pressure
++         * a title uses to avoid overwriting commands the GPU has not read. It exists
++         * to answer one question for a title that reports its ring full while the
++         * walker says it is drained: is the title reading `get`, or something else?
++         * If the overflow survives this, `get` is not what it consults. */
++        { static int eq = -1;
++          if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
++          vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
++        ps3_poll_notify(GCM_CONTROL_GUEST_ADDR + 4, 4);
++    }
++    AcquireSRWLockExclusive(&s_flip_lock);
++    if (s_host_enabled) {
++        flip_slot = s_completed_flip_count % GCM_FLIP_QUEUE_SIZE;
++        waiting_flip = s_flip_pending && s_flip_queue[flip_slot].waiting_fifo;
++        host_limit = s_flip_queue[flip_slot].fifo_ticket;
++    }
++    if (waiting_flip && (s_host_enabled ? s_host_executed >= host_limit : s_fifo_getoff == put)) {
+         s_flip_queue[flip_slot].waiting_fifo = 0;
+         s_fifo_flip_reached = 1;
+         gcm_flip_trace("reach", s_completed_flip_count + 1);
+-        ReleaseSRWLockExclusive(&s_flip_lock);
+-    }
++    }
++    ReleaseSRWLockExclusive(&s_flip_lock);
+ 
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();
+     ReleaseSRWLockExclusive(&s_ref_pub_lock);
+-    if (!strcmp(why, "chunk") && !s_fifo_flip_reached)
++    if ((!strcmp(why, "chunk") || (s_host_enabled && s_host_head != s_host_tail && !s_fifo_wait_label_ea)) && !s_fifo_flip_reached)
+         cellGcm_fifo_kick();
+ }
+ 
+@@ -2743,7 +2776,8 @@
+         u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR);
+         atomic_thread_fence(memory_order_acquire);
+         u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+-        gcm_queue_flip_at(bufferId, put != get, put);
++        if (s_host_enabled) gcm_host_snapshot((int)bufferId);
++        else gcm_queue_flip_at(bufferId, put != get, put, 0);
+     } else s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+     cellGcm_fifo_kick();
+ 
+@@ -3555,11 +3589,13 @@
+     printf("[cellGcmSys] Terminate\n");
+ 
+     s_gcm_initialized = 0;
++    gcm_host_shutdown();
+     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+     s_flip_request_count = s_presented_flip_count = s_completed_flip_count = 0;
+     s_flip_pending = 0;
+     s_fifo_flip_reached = 0;
++    s_host_flip_ticket = UINT64_MAX;
+     s_last_present_vblank = 0;
+     gcm_progress_notify();
+     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+@@ -3940,9 +3976,23 @@
+  * from a stale offset through whatever the driver has since overwritten. */
+ void cellGcm_syscall_set_fifo(u32 put, u32 get)
+ {
++    if (s_host_enabled) {
++        AcquireSRWLockExclusive(&s_host_copy_lock);
++        AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++        s_host_get = get;
++        s_host_call = s_host_read = 0;
++        s_host_head = s_host_tail = 0;
++        s_host_executed = s_host_submitted;
++        s_host_packet = NULL;
++        s_host_initialized = 1;
++    }
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, put);
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
+     s_fifo_getoff  = get;
+     s_fifo_calloff = 0;
++    if (s_host_enabled) {
++        ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++        ReleaseSRWLockExclusive(&s_host_copy_lock);
++    }
+     cellGcm_fifo_kick();
+ }
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -247,6 +247,7 @@
+ u32  cellGcm_syscall_bringup(u32 local_size);   /* -> RSX local memory base */
+ void cellGcm_notify_guest_write(u32 ea, u32 size); /* after a committed guest store */
+ void cellGcm_fifo_kick(void);
++void cellGcm_fifo_enable_snapshot(void); /* before the runner starts draining */
+ void cellGcm_wait_flip_count(u32 target);
+ u32 cellGcm_flip_request_count(void);
+ void cellGcm_fifo_kick_wait(unsigned ms);
+--- a/templates/project/main.cpp
++++ b/templates/project/main.cpp
+@@ -101,6 +101,7 @@
+ uint32_t cellGcmGetCurrentDisplayBufferId(void);
+ void     cellGcm_fifo_kick_wait(unsigned ms);
+ int      cellGcm_take_flip_pending(void);
++void     cellGcm_fifo_enable_snapshot(void);
+ void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+ unsigned cellGcm_flip_request_count(void);
+ }
+@@ -200,6 +201,7 @@
+ 
+ static DWORD WINAPI frame_clock(LPVOID)
+ {
++    cellGcm_fifo_enable_snapshot();
+     const char* title = getenv("PS3_TITLE");
+     if (!title || !*title) title = "ps3recomp";
+ 
+--- /dev/null
++++ b/libs/video/cellGcm_fifo_snapshot.h
+@@ -0,0 +1,187 @@
++/* Internal FIFO staging. One copy worker, one render consumer. Guest command
++ * bytes are immutable here; referenced vertex/texture memory stays live. */
++void* cellGcm_fifo_kick_event(void);
++
++#define GCM_HOST_SLOTS 64u
++#define GCM_HOST_BYTES 65536u
++static struct { u32 used; _Alignas(8) u8 data[GCM_HOST_BYTES]; } s_host_slots[GCM_HOST_SLOTS];
++static atomic_ullong s_host_head, s_host_tail, s_host_executed;
++static u64 s_host_submitted;
++static u32 s_host_get, s_host_call, s_host_read;
++static int s_host_initialized;
++static SRWLOCK s_host_copy_lock = SRWLOCK_INIT;
++static HANDLE s_host_event;
++static atomic_int s_host_started;
++/* Records include the resolved successor, so branches never reread a reused
++ * guest ring. Tickets disambiguate identical offsets on successive laps. */
++typedef struct { u64 ticket; u32 off, next, size, ea; } GcmHostPacket;
++static const GcmHostPacket* s_host_packet;
++
++static int gcm_host_copy_bytes(void* dst, u32 off, u32 size)
++{
++    while (size) {
++        u32 ea = gcm_io2ea(off);
++        if (!ea) return 0;
++        u32 n = 0x100000u - (off & 0xfffffu);
++        if (n > size) n = size;
++        memcpy(dst, vm_base + ea, n);
++        dst = (u8*)dst + n; off += n; size -= n;
++    }
++    return 1;
++}
++
++/* Called on the copy worker, or to establish a direct HLE flip boundary.
++ * Never takes the render lock or executes a guest-visible command. */
++static u64 gcm_host_snapshot(int flip_buffer)
++{
++    AcquireSRWLockExclusive(&s_host_copy_lock);
++    if (!s_host_initialized) {
++        s_host_get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
++        s_host_initialized = 1;
++    }
++    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR);
++    atomic_thread_fence(memory_order_acquire);
++    u32 budget = 0x100000;
++    while (s_host_get != put && budget) {
++        u64 tail = s_host_tail;
++        while (tail - atomic_load_explicit(&s_host_head, memory_order_acquire) >= GCM_HOST_SLOTS) {
++            u64 generation = gcm_progress_begin();
++            if (tail - s_host_head < GCM_HOST_SLOTS) break;
++            gcm_progress_wait(generation, 100);
++            if (!s_gcm_initialized) goto done;
++        }
++        u32 used = 0;
++        while (s_host_get != put && budget) {
++            budget--;
++            u32 raw, off = s_host_get;
++            if (!gcm_host_copy_bytes(&raw, off, 4)) goto publish;
++            u32 w = ps3_bswap32(raw), type = w >> 29;
++            u32 size = 4, next = off + 4, call = s_host_call;
++            int branch = (w & 0xffff0000u) != 0xfead0000u;
++            if (branch && type == 1) next = w & 0x1ffffffcu;
++            else if (branch && (w & 3u) == 2) { next = w & 0x1ffffffcu; call = off + 4; }
++            else if (branch && w == 0x00020000u) { next = call; call = 0; }
++            else {
++                branch = 0;
++                if (type == 0 || type == 2) size += ((w >> 18) & 0x7ffu) * 4;
++                next = off + size;
++            }
++            /* A partial packet at the committed write head is not readable.
++             * Subroutine bodies outside the linear ring are reached by CALL. */
++            if ((!branch && off < put && (u64)off + size > put) ||
++                (branch && (next == off || !gcm_io2ea(next)))) goto publish;
++            u32 span = (sizeof(GcmHostPacket) + size + 7u) & ~7u;
++            if (used + span > GCM_HOST_BYTES) break;
++            GcmHostPacket* p = (GcmHostPacket*)((u8*)s_host_slots[tail % GCM_HOST_SLOTS].data + used);
++            if (!gcm_host_copy_bytes(p + 1, off, size)) goto publish;
++            p->ticket = ++s_host_submitted;
++            p->off = off; p->next = next; p->size = size; p->ea = gcm_io2ea(off);
++            used += span;
++            s_host_get = next; s_host_call = call;
++        }
++    publish:
++        if (!used) break;
++        s_host_slots[tail % GCM_HOST_SLOTS].used = used;
++        atomic_store_explicit(&s_host_tail, tail + 1, memory_order_release);
++        /* Copy publication precedes GET: the producer may now overwrite every
++         * byte consumed above, including a JUMP at the end of a ring lap. */
++        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_host_get);
++        atomic_store_explicit(&g_gcm_fifo_drained_ea, gcm_io2ea(s_host_get), memory_order_release);
++        ps3_poll_notify(GCM_CONTROL_GUEST_ADDR + 4, 4);
++        gcm_progress_notify();
++        SetEvent((HANDLE)cellGcm_fifo_kick_event());
++    }
++ done:;
++    u64 ticket = s_host_submitted;
++    /* Arm a direct flip while the copy lock still excludes later submissions.
++     * A render slice already in flight observes this ticket on every packet. */
++    if (flip_buffer >= 0)
++        gcm_queue_flip_at((u32)flip_buffer, 1, put, ticket);
++    ReleaseSRWLockExclusive(&s_host_copy_lock);
++    return ticket;
++}
++
++static int gcm_host_peek(u64 limit)
++{
++    if (s_host_head == atomic_load_explicit(&s_host_tail, memory_order_acquire)) return 0;
++    s_host_packet = (const GcmHostPacket*)((const u8*)s_host_slots[s_host_head % GCM_HOST_SLOTS].data + s_host_read);
++    u64 boundary = s_host_flip_ticket;
++    if (boundary < limit) limit = boundary;
++    if (s_host_packet->ticket > limit) { s_host_packet = NULL; return 0; }
++    s_fifo_getoff = s_host_packet->off;
++    return 1;
++}
++
++static void gcm_host_finish(void)
++{
++    if (!s_host_enabled) return;
++    s_fifo_getoff = s_host_packet->next;
++    atomic_store_explicit(&s_host_executed, s_host_packet->ticket, memory_order_release);
++    s_host_read += (sizeof(GcmHostPacket) + s_host_packet->size + 7u) & ~7u;
++    if (s_host_read == s_host_slots[s_host_head % GCM_HOST_SLOTS].used) {
++        s_host_read = 0;
++        atomic_fetch_add_explicit(&s_host_head, 1, memory_order_release);
++        gcm_progress_notify();
++    }
++    s_host_packet = NULL;
++}
++
++static u32 gcm_command_read(u32 off)
++{
++    if (!s_host_enabled) return vm_read32(gcm_io2ea(off));
++    u32 raw;
++    memcpy(&raw, (const u8*)(s_host_packet + 1) + off - s_host_packet->off, 4);
++    return ps3_bswap32(raw);
++}
++
++static DWORD WINAPI gcm_host_worker(LPVOID unused)
++{
++    (void)unused;
++    ps3_poll_thread_start("RSX copy", 1);
++    while (s_gcm_initialized) {
++        WaitForSingleObject(s_host_event, 100);
++        if (s_gcm_initialized) gcm_host_snapshot(-1);
++    }
++    s_host_started = 0;
++    return 0;
++}
++
++static void gcm_host_start(void)
++{
++    int expected = 0;
++    if (s_host_enabled && s_gcm_initialized &&
++        atomic_compare_exchange_strong(&s_host_started, &expected, 1)) {
++        HANDLE thread = CreateThread(NULL, 0, gcm_host_worker, NULL, 0, NULL);
++        if (thread) CloseHandle(thread);
++        else { s_host_started = 0; fprintf(stderr, "[cellGcmSys] FIFO copy worker creation failed\n"); abort(); }
++    }
++}
++
++void cellGcm_fifo_enable_snapshot(void)
++{
++    /* Runner enables before the first drain. Legacy consumers keep their
++     * synchronous API; GCM_FIFO_SNAPSHOT=0 permits matched host comparisons. */
++    if (s_host_enabled) return;
++    const char* e = getenv("GCM_FIFO_SNAPSHOT");
++    if (e && !atoi(e)) return;
++    s_host_event = CreateEventA(NULL, FALSE, TRUE, NULL);
++    if (!s_host_event) abort();
++    s_host_enabled = 1;
++}
++
++static void gcm_host_shutdown(void)
++{
++    if (!s_host_enabled) return;
++    gcm_progress_notify();
++    SetEvent(s_host_event);
++    while (s_host_started) Sleep(1);
++    AcquireSRWLockExclusive(&s_host_copy_lock);
++    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++    s_host_head = s_host_tail = s_host_executed = 0;
++    s_host_submitted = 0;
++    s_host_get = s_host_call = s_host_read = 0;
++    s_host_packet = NULL;
++    s_host_initialized = 0;
++    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++    ReleaseSRWLockExclusive(&s_host_copy_lock);
++}

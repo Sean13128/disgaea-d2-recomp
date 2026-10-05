@@ -1,0 +1,313 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -125,6 +125,9 @@
+  * presenting on a raw flip-count change raced the drain and showed empty or
+  * mixed batches (wave: black flashes, layout flicker). */
+ static atomic_int s_flip_pending = 0;
++/* A pending refresh may still have submitted commands ahead of it. Only a
++ * reached frame boundary holds the backend batch, never the request itself. */
++static atomic_int s_fifo_flip_reached;
+ /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+ #define GCM_FLIP_MARKER 0xFEAD0100u
+ 
+@@ -140,7 +143,8 @@
+ /* Keep each submitted flip distinct. FIFO producers stop at a flip; direct
+  * HLE producers may queue more than one. Backpressure bounds that queue. */
+ #define GCM_FLIP_QUEUE_SIZE 64u
+-static struct { u32 buffer; u64 earliest_vblank; } s_flip_queue[GCM_FLIP_QUEUE_SIZE];
++static struct { u32 buffer, fifo_end; int waiting_fifo; u64 earliest_vblank; }
++    s_flip_queue[GCM_FLIP_QUEUE_SIZE];
+ static SRWLOCK s_flip_lock = SRWLOCK_INIT;
+ static u64 s_last_present_vblank;
+ 
+@@ -181,6 +185,22 @@
+     return value;
+ }
+ 
++/* Ring-full diagnostics stay off the normal render path unless requested. */
++static atomic_uint s_recycle_trace_active;
++static atomic_uint s_recycle_trace_count;
++static atomic_ullong s_recycle_trace_kicks;
++static atomic_ullong s_recycle_trace_drains;
++static int gcm_recycle_trace_enabled(void)
++{
++    static atomic_int enabled = -1;
++    int value = enabled;
++    if (value < 0) {
++        value = getenv("GCM_RECYCLE_TRACE") != NULL;
++        enabled = value;
++    }
++    return value;
++}
++
+ static void gcm_flip_trace(const char* event, u32 sequence)
+ {
+     if (gcm_flip_trace_enabled()) {
+@@ -193,7 +213,7 @@
+ 
+ void cellGcm_fifo_kick(void);
+ 
+-static u32 gcm_queue_flip(u32 bufferId)
++static u32 gcm_queue_flip_at(u32 bufferId, int waiting_fifo, u32 fifo_end)
+ {
+     for (;;) {
+         u64 generation = gcm_progress_begin();
+@@ -202,10 +222,13 @@
+         if (requested - s_completed_flip_count < GCM_FLIP_QUEUE_SIZE) {
+             u32 slot = requested % GCM_FLIP_QUEUE_SIZE;
+             s_flip_queue[slot].buffer = bufferId;
++            s_flip_queue[slot].fifo_end = fifo_end;
++            s_flip_queue[slot].waiting_fifo = waiting_fifo;
+             s_flip_queue[slot].earliest_vblank = gcm_vblank_at(gcm_vblank_elapsed_ns()) + 1;
+             s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+             s_flip_request_count = requested + 1;
+-            gcm_flip_trace("reach", requested + 1);
++            if (!waiting_fifo) gcm_flip_trace("reach", requested + 1);
++            if (requested == s_completed_flip_count) s_fifo_flip_reached = !waiting_fifo;
+             s_flip_pending = 1;
+             ReleaseSRWLockExclusive(&s_flip_lock);
+             cellGcm_fifo_kick();
+@@ -217,6 +240,12 @@
+     }
+ }
+ 
++/* A FIFO flip is queued by the walker after its preceding draws execute. */
++static u32 gcm_queue_flip(u32 bufferId)
++{
++    return gcm_queue_flip_at(bufferId, 0, 0);
++}
++
+ int cellGcm_take_flip_pending(void)
+ {
+     int ready = 0;
+@@ -224,7 +253,8 @@
+     u32 completed = s_completed_flip_count;
+     u64 vblank = gcm_vblank_at(gcm_vblank_elapsed_ns());
+     u32 slot = completed % GCM_FLIP_QUEUE_SIZE;
+-    if (s_flip_pending && s_presented_flip_count == completed &&
++    if (s_flip_pending && !s_flip_queue[slot].waiting_fifo &&
++        s_presented_flip_count == completed &&
+         (s_flip_mode != CELL_GCM_DISPLAY_VSYNC ||
+          (vblank >= s_flip_queue[slot].earliest_vblank && vblank > s_last_present_vblank))) {
+         s_current_display_buffer_id = s_flip_queue[slot].buffer;
+@@ -564,6 +594,7 @@
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+     s_flip_request_count = s_presented_flip_count = s_completed_flip_count = 0;
+     s_flip_pending = 0;
++    s_fifo_flip_reached = 0;
+     s_last_present_vblank = 0;
+     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
+     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+@@ -876,6 +907,8 @@
+         s_completed_flip_count = presented;
+         gcm_flip_trace("retire", presented);
+         s_flip_pending = (presented != s_flip_request_count);
++        s_fifo_flip_reached = s_flip_pending &&
++            !s_flip_queue[presented % GCM_FLIP_QUEUE_SIZE].waiting_fifo;
+         if (!s_flip_pending) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+         vm_write32(GCM_LABEL_GUEST_BASE + 0x10, 0);
+         GCM_PENDING_SET(2);
+@@ -1722,6 +1755,7 @@
+ 
+ void cellGcm_fifo_kick(void)
+ {
++    if (gcm_recycle_trace_enabled()) s_recycle_trace_kicks++;
+     SetEvent((HANDLE)cellGcm_fifo_kick_event());
+ }
+ 
+@@ -1768,11 +1802,25 @@
+ void cellGcm_rsx_process_fifo(void)
+ {
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+-    /* Hold the completed batch until presentation; do not mix the next
+-     * frame into it on a put notification arriving before vblank. */
+-    if (!s_flip_pending) {
++    u32 recycle = s_recycle_trace_active;
++    u64 started = recycle ? get_timestamp_ns() : 0;
++    u32 get_before = recycle ? vm_read32(GCM_CONTROL_GUEST_ADDR + 4) : 0;
++    int held = s_fifo_flip_reached;
++    /* Consume commands ahead of the flip immediately, including ring-full
++     * flushes. Hold only after reaching the frame boundary, so later draws
++     * cannot overwrite the batch awaiting presentation. */
++    if (!s_fifo_flip_reached) {
+         s_fifo_wait_label_ea = 0;
+         gcm_rsx_process_fifo_unlocked();
++    }
++    if (gcm_recycle_trace_enabled()) {
++        u64 drain = ++s_recycle_trace_drains;
++        if (recycle)
++            fprintf(stderr, "[gcm-recycle-drain] id=%u drain=%llu start_ns=%llu end_ns=%llu held=%d get_before=%08X get=%08X put=%08X kicks=%llu\n",
++                    recycle, (unsigned long long)drain, (unsigned long long)started,
++                    (unsigned long long)get_timestamp_ns(), held, get_before,
++                    vm_read32(GCM_CONTROL_GUEST_ADDR + 4), vm_read32(GCM_CONTROL_GUEST_ADDR),
++                    (unsigned long long)s_recycle_trace_kicks);
+     }
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     gcm_progress_notify();
+@@ -1819,6 +1867,13 @@
+      * then runs off the end of the previous frame's bytes until it meets a
+      * word that is not a command, and parks there forever. */
+     atomic_thread_fence(memory_order_acquire);
++    /* Direct HLE flips snapshot the submitted FIFO boundary. They are not
++     * presentable until these commands have executed, even if vblank arrives. */
++    AcquireSRWLockExclusive(&s_flip_lock);
++    u32 flip_slot = s_completed_flip_count % GCM_FLIP_QUEUE_SIZE;
++    int waiting_flip = s_flip_pending && s_flip_queue[flip_slot].waiting_fifo;
++    if (waiting_flip) put = s_flip_queue[flip_slot].fifo_end;
++    ReleaseSRWLockExclusive(&s_flip_lock);
+ 
+     /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
+      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
+@@ -1934,7 +1989,6 @@
+              * flip-gated present shows exactly the completed frame -- draining
+              * on would mix the next frame's head into the batch (wave: every
+              * frame split across 4 presents, layout flashing/zooming). */
+-            extern s32 cellGcmSetFlipCommand(u32 bufferId);
+             s_fifo_getoff += 4;
+             /* Count the flip WORDS the title actually writes into the FIFO,
+              * separately from the presents that result. When a title stops
+@@ -1954,7 +2008,11 @@
+                 if (gcm_flip_trace_enabled())
+                     fprintf(stderr, "[gcm-fifo-flip] event=reach ea=%08X seq=%u\n", ea, sequence);
+             } else {
+-                cellGcmSetFlipCommand(w & 0xFFu);
++                u32 buffer = w & 0xFFu;
++                if (buffer < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[buffer]) {
++                    gcm_flip_trace("submit", s_flip_request_count + 1);
++                    gcm_queue_flip(buffer);
++                }
+             }
+             /* Preserve this batch even with a full ring. The next vblank
+              * releases it, then event-driven draining resumes immediately. */
+@@ -2192,7 +2250,11 @@
+                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                     cellGcmQueueUserCommand(vm_read32(dea));
+                 } else if (mfull == 0xE920u || mfull == 0xE924u || mfull == 0xE944u) {
+-                    cellGcmSetFlipCommand(vm_read32(dea) & 7u);
++                    u32 buffer = vm_read32(dea) & 7u;
++                    if (s_display_buffer_set[buffer]) {
++                        gcm_flip_trace("submit", s_flip_request_count + 1);
++                        gcm_queue_flip(buffer);
++                    }
+                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                     rsx_process_method(&s_state, m, vm_read32(dea));
+                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
+@@ -2216,7 +2278,7 @@
+                 }
+             }
+             s_fifo_getoff += 4 + count * 4;
+-            if (s_flip_pending) { why = "flip"; break; }
++            if (s_fifo_flip_reached) { why = "flip"; break; }
+             continue;
+         }
+         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
+@@ -2384,6 +2446,13 @@
+       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+       vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+     ps3_poll_notify(GCM_CONTROL_GUEST_ADDR + 4, 4);
++    if (waiting_flip && s_fifo_getoff == put) {
++        AcquireSRWLockExclusive(&s_flip_lock);
++        s_flip_queue[flip_slot].waiting_fifo = 0;
++        s_fifo_flip_reached = 1;
++        gcm_flip_trace("reach", s_completed_flip_count + 1);
++        ReleaseSRWLockExclusive(&s_flip_lock);
++    }
+ 
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();
+@@ -2415,6 +2484,19 @@
+     u32 current = vm_read32(ctx_ea + 0x8);
+     if (current <= begin) return;                       /* nothing to recycle */
+ 
++    int trace = gcm_recycle_trace_enabled();
++    u32 trace_id = trace ? ++s_recycle_trace_count : 0;
++    u64 trace_start = trace ? get_timestamp_ns() : 0;
++    u64 trace_kicks = s_recycle_trace_kicks, trace_drains = s_recycle_trace_drains;
++    unsigned tail_waits = 0, jump_waits = 0;
++    if (trace) {
++        s_recycle_trace_active = trace_id;
++        fprintf(stderr, "[gcm-recycle] event=begin id=%u time_ns=%llu begin=%08X current=%08X put=%08X get=%08X pending=%d kicks=%llu drains=%llu\n",
++                trace_id, (unsigned long long)trace_start, begin, current,
++                vm_read32(GCM_CONTROL_GUEST_ADDR), vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
++                s_flip_pending, (unsigned long long)trace_kicks, (unsigned long long)trace_drains);
++    }
++
+     if (getenv("CELLMARK_BLINKDBG"))
+         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
+ 
+@@ -2437,6 +2519,10 @@
+         atomic_thread_fence(memory_order_release);
+         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_current);
+         cellGcm_fifo_kick();
++        if (trace)
++            fprintf(stderr, "[gcm-recycle] event=kick phase=tail id=%u time_ns=%llu kicks=%llu drains=%llu\n",
++                    trace_id, (unsigned long long)get_timestamp_ns(),
++                    (unsigned long long)s_recycle_trace_kicks, (unsigned long long)s_recycle_trace_drains);
+         u64 warn_at = get_timestamp_ns() + 2000000000ULL;
+         for (;;) {
+             u64 generation = gcm_progress_begin();
+@@ -2446,6 +2532,7 @@
+                 fprintf(stderr, "[cellGcmSys] fifo recycle waiting for tail 0x%08X (drained=0x%08X)\n",
+                         current, g_gcm_fifo_drained_ea);
+             }
++            tail_waits++;
+             gcm_progress_wait(generation, 2000);
+         }
+         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+@@ -2456,6 +2543,10 @@
+         atomic_thread_fence(memory_order_release);
+         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+         cellGcm_fifo_kick();
++        if (trace)
++            fprintf(stderr, "[gcm-recycle] event=kick phase=jump id=%u time_ns=%llu kicks=%llu drains=%llu\n",
++                    trace_id, (unsigned long long)get_timestamp_ns(),
++                    (unsigned long long)s_recycle_trace_kicks, (unsigned long long)s_recycle_trace_drains);
+     }
+ 
+     /* The tail ack above makes this a new-lap acknowledgment. Never overwrite
+@@ -2466,6 +2557,7 @@
+         u64 generation = gcm_progress_begin();
+         if (gcm_fifo_drained() == begin) break;
+         spins++;
++        jump_waits++;
+         if (warn_at && get_timestamp_ns() >= warn_at) {
+             warn_at = 0;
+             fprintf(stderr, "[cellGcmSys] fifo recycle waiting for jump (drained=0x%08X begin=0x%08X)\n",
+@@ -2475,6 +2567,14 @@
+     }
+ 
+     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
++    if (trace) {
++        u64 now = get_timestamp_ns();
++        fprintf(stderr, "[gcm-recycle] event=end id=%u time_ns=%llu wait_ns=%llu tail_waits=%u jump_waits=%u kicks=%llu drains=%llu pending=%d\n",
++                trace_id, (unsigned long long)now, (unsigned long long)(now - trace_start),
++                tail_waits, jump_waits, (unsigned long long)(s_recycle_trace_kicks - trace_kicks),
++                (unsigned long long)(s_recycle_trace_drains - trace_drains), s_flip_pending);
++        s_recycle_trace_active = 0;
++    }
+ 
+     if (s_recdbg)
+         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+@@ -2595,8 +2695,12 @@
+                 vm_read32(GCM_CONTROL_GUEST_ADDR), vm_read32(GCM_CONTROL_GUEST_ADDR + 4));
+         gcm_flip_trace("submit", s_flip_request_count + 1);
+     }
+-    if (!in_fifo) gcm_queue_flip(bufferId);
+-    else s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
++    if (!in_fifo) {
++        u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR);
++        atomic_thread_fence(memory_order_acquire);
++        u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
++        gcm_queue_flip_at(bufferId, put != get, put);
++    } else s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+     cellGcm_fifo_kick();
+ 
+     return CELL_OK;
+@@ -3411,6 +3515,7 @@
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+     s_flip_request_count = s_presented_flip_count = s_completed_flip_count = 0;
+     s_flip_pending = 0;
++    s_fifo_flip_reached = 0;
+     s_last_present_vblank = 0;
+     gcm_progress_notify();
+     s_debug_level = CELL_GCM_DEBUG_LEVEL0;

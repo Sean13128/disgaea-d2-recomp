@@ -1,6 +1,15 @@
 /* BLUS31313 optional movie skip. Playback uses the SDK by default.
  * D2_MOVIE_SKIP=1 keeps the clean completion path for troubleshooting. */
 #include "ppu_recomp.h"
+
+#if D2_GAME_VERSION == 140
+#define func_0015FD14 func_001686AC
+#define func_0015F9F4 func_00168304
+#define func_0015F680 func_00167FC8
+#define d2_original_0015FD14 d2_original_001686AC
+#define d2_original_0015F9F4 d2_original_00168304
+#define d2_original_0015F680 d2_original_00167FC8
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,7 +29,11 @@ static bool native_movie()
 
 static uint32_t movie_state(ppu_context* ctx)
 {
+    #if D2_GAME_VERSION == 140
+    return vm_read32(ctx->gpr[2] - 0x4584);
+#else
     return vm_read32(ctx->gpr[2] - 0x487C);
+#endif
 }
 
 /* _NisMovie_Open: the original transitions idle (1) -> ready (2). */

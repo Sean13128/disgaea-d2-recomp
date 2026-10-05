@@ -1,0 +1,5 @@
+#pragma once
+static const char d2_cheats_data[] = R"D2JSON(@D2_CHEATS_JSON@)D2JSON";
+#define D2_CHEAT_EXP_FUNCTION func_@D2_CHEAT_exp_ADDR@
+#define D2_CHEAT_SP_FUNCTION func_@D2_CHEAT_sp_ADDR@
+#define D2_CHEAT_SHOP_FUNCTION func_@D2_CHEAT_shop_ADDR@

@@ -1,0 +1,203 @@
+diff --git a/libs/input/pad_macos.m b/libs/input/pad_macos.m
+index d886178..b7e925b 100644
+--- a/libs/input/pad_macos.m
++++ b/libs/input/pad_macos.m
+@@ -6,6 +6,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++extern int ps3_host_key_event(unsigned code, unsigned modifiers, int down, int repeat) __attribute__((weak));
++
+ static pthread_mutex_t s_keys_lock = PTHREAD_MUTEX_INITIALIZER;
+ static unsigned char s_keys[128];
+ static NSWindow* s_input_window;
+@@ -42,10 +44,13 @@ static void release_keys(void)
+ int pad_macos_process_event(void* native_event)
+ {
+     NSEvent* event = (__bridge NSEvent*)native_event;
+-    if (!s_input_window || !pad_macos_keyboard_enabled() ||
++    if (!s_input_window ||
+         [event window] != s_input_window || ![s_input_window isKeyWindow]) return 0;
+     unsigned code = [event keyCode];
+-    if (code >= sizeof(s_keys)) return 0;
++    if (ps3_host_key_event && [event type] != NSEventTypeFlagsChanged &&
++        ps3_host_key_event(code, (unsigned)[event modifierFlags],
++            [event type] == NSEventTypeKeyDown, [event isARepeat])) return 1;
++    if (!pad_macos_keyboard_enabled() || code >= sizeof(s_keys)) return 0;
+     switch (code) {
+     case 126: case 125: case 123: case 124: case 6: case 36: case 76:
+     case 7: case 53: case 51: case 0: case 1: case 12: case 13:
+diff --git a/libs/system/sys_overlay.c b/libs/system/sys_overlay.c
+index 5dce7ed..3bc1217 100644
+--- a/libs/system/sys_overlay.c
++++ b/libs/system/sys_overlay.c
+@@ -12,8 +12,11 @@ static SRWLOCK s_poll_lock = SRWLOCK_INIT;
+ static SysOverlaySnapshot s_ui;
+ static uint64_t s_serial, s_headless_deadline;
+ static int s_renderer, s_completed, s_result, s_armed, s_auto_result;
+-static uint16_t s_previous;
+-#define OVERLAY_INPUT 0x60F8u
++static uint16_t s_previous, s_repeat_button;
++static uint64_t s_repeat_deadline;
++#define OVERLAY_INPUT 0xFFFFu
++static struct { uint16_t buttons; int selected; } s_actions[32];
++static unsigned s_action_read, s_action_write;
+ 
+ static void finish_locked(int result)
+ {
+@@ -30,7 +33,7 @@ void ps3_overlay_set_renderer(int available)
+ {
+     AcquireSRWLockExclusive(&s_lock);
+     s_renderer = available;
+-    if (!available && s_ui.active) s_headless_deadline = GetTickCount64() + 1;
++    if (!available && s_ui.active && s_ui.kind != SYS_OVERLAY_EDITOR) s_headless_deadline = GetTickCount64() + 1;
+     ReleaseSRWLockExclusive(&s_lock);
+ }
+ 
+@@ -48,14 +51,15 @@ uint64_t ps3_overlay_open(const SysOverlaySnapshot* request, int headless_result
+     s_ui.revision = s_serial << 32;
+     s_ui.active = 1;
+     if (s_ui.selected < 0 || s_ui.selected >= (s_ui.count ? s_ui.count : 2)) s_ui.selected = 0;
+-    s_previous = 0;
++    s_previous = s_repeat_button = 0; s_repeat_deadline = 0;
++    s_action_read = s_action_write = 0;
+     s_armed = 0; /* require release of the button that opened the UI */
+     s_auto_result = headless_result;
+     const char* ui = getenv("PS3_SAVEDATA_UI");
+     const char* headless = getenv("PS3RECOMP_METAL_HEADLESS");
+     int automatic = !s_renderer || (ui && !strcmp(ui, "headless")) ||
+                     (headless && *headless && strcmp(headless, "0"));
+-    s_headless_deadline = automatic ? GetTickCount64() +
++    s_headless_deadline = automatic && s_ui.kind != SYS_OVERLAY_EDITOR ? GetTickCount64() +
+         (s_ui.kind == SYS_OVERLAY_PROGRESS ? 2000 : 0) : 0;
+     ps3_pad_overlay_capture(1);
+     fprintf(stderr, "[sys overlay] open token=%llu title='%s' message='%s' items=%d%s\n",
+@@ -80,7 +84,23 @@ static void input_locked(uint16_t buttons)
+         if (!s_armed) { if (!current) s_armed = 1; }
+         else {
+             uint16_t pressed = current & ~s_previous;
+-            if ((pressed & 0x2000) && !s_ui.cancel_disabled) finish_locked(SYS_OVERLAY_BACK);
++            if (s_ui.kind == SYS_OVERLAY_EDITOR) {
++                uint16_t direction = current & 0xF0;
++                uint64_t now = GetTickCount64();
++                if (direction != s_repeat_button) {
++                    s_repeat_button = direction; s_repeat_deadline = now + 400;
++                } else if (direction && now >= s_repeat_deadline) {
++                    pressed |= direction; s_repeat_deadline = now + 80;
++                }
++                if ((pressed & 0x10) && s_ui.selected > 0) { s_ui.selected--; s_ui.revision++; }
++                if ((pressed & 0x40) && s_ui.selected + 1 < s_ui.count) { s_ui.selected++; s_ui.revision++; }
++                uint16_t action = pressed & ~0x50u;
++                if (action && s_action_write - s_action_read < 32) {
++                    unsigned index = s_action_write++ % 32;
++                    s_actions[index].buttons = action;
++                    s_actions[index].selected = s_ui.selected;
++                }
++            } else if ((pressed & 0x2000) && !s_ui.cancel_disabled) finish_locked(SYS_OVERLAY_BACK);
+             else if ((pressed & 0x4000) && s_ui.buttons)
+                 finish_locked(s_ui.kind == SYS_OVERLAY_YESNO && s_ui.selected ? SYS_OVERLAY_NO : SYS_OVERLAY_OK);
+             else if (s_ui.kind == SYS_OVERLAY_LIST && s_ui.count) {
+@@ -178,3 +198,34 @@ int ps3_overlay_progress(uint64_t token, unsigned index, const char* message,
+     ReleaseSRWLockExclusive(&s_lock);
+     return valid;
+ }
++
++int ps3_overlay_editor_update(uint64_t token, const SysOverlaySnapshot* request)
++{
++    AcquireSRWLockExclusive(&s_lock);
++    int valid = s_ui.active && s_ui.token == token && s_ui.kind == SYS_OVERLAY_EDITOR &&
++        request->kind == SYS_OVERLAY_EDITOR && request->count >= 0 && request->count <= SYS_OVERLAY_MAX_ITEMS;
++    if (valid) {
++        uint64_t revision = s_ui.revision + 1;
++        int selected = request->selected < 0 ? s_ui.selected : request->selected;
++        if (strcmp(s_ui.title, request->title)) s_action_read = s_action_write;
++        s_ui = *request; s_ui.selected = selected < s_ui.count ? selected : 0; s_ui.token = token; s_ui.revision = revision; s_ui.active = 1;
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    return valid;
++}
++
++uint16_t ps3_overlay_editor_action(uint64_t token, int* selected)
++{
++    AcquireSRWLockExclusive(&s_lock);
++    uint16_t action = 0;
++    if (s_ui.active && s_ui.token == token && s_ui.kind == SYS_OVERLAY_EDITOR) {
++        if (selected) *selected = s_ui.selected;
++        if (s_action_read != s_action_write) {
++            unsigned index = s_action_read++ % 32;
++            action = s_actions[index].buttons;
++            if (selected) *selected = s_actions[index].selected;
++        }
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    return action;
++}
+diff --git a/libs/system/sys_overlay.h b/libs/system/sys_overlay.h
+index d523d33..9c7217b 100644
+--- a/libs/system/sys_overlay.h
++++ b/libs/system/sys_overlay.h
+@@ -11,13 +11,13 @@ extern "C" {
+ #define SYS_OVERLAY_NO 2
+ #define SYS_OVERLAY_BACK 3
+ typedef enum { SYS_OVERLAY_NOTICE, SYS_OVERLAY_YESNO, SYS_OVERLAY_LIST,
+-               SYS_OVERLAY_PROGRESS } SysOverlayKind;
++               SYS_OVERLAY_PROGRESS, SYS_OVERLAY_EDITOR } SysOverlayKind;
+ typedef struct { char label[96]; char id[32]; } SysOverlayItem;
+ typedef struct {
+     uint64_t token, revision;
+     int active, selected, count, cancel_disabled, buttons, progress_count;
+     SysOverlayKind kind;
+-    char title[96], message[512];
++    char title[96], message[512], footer[128];
+     SysOverlayItem items[SYS_OVERLAY_MAX_ITEMS];
+     unsigned progress[2];
+     char progress_message[2][256];
+@@ -28,6 +28,9 @@ void ps3_overlay_set_renderer(int available);
+ void ps3_overlay_snapshot(SysOverlaySnapshot* snapshot);
+ void ps3_overlay_input(uint16_t buttons);
+ void ps3_overlay_poll(void);
++/* Persistent editors consume actions on their guest thread. */
++int ps3_overlay_editor_update(uint64_t token, const SysOverlaySnapshot* request);
++uint16_t ps3_overlay_editor_action(uint64_t token, int* selected);
+ void ps3_overlay_finish(uint64_t token, int result);
+ void ps3_overlay_close_after(uint64_t token, unsigned delay_ms, int result);
+ int ps3_overlay_take_result(uint64_t token, int* result, int* selected);
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index acbaf12..1655114 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -106,6 +106,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd,
+                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
+ /* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
+ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
++extern "C" __attribute__((weak)) void ps3_guest_frame_hook(ppu_context*);
+ /* The SPURS SPU kernel spawn hook, whose real definition is per-port
+  * (flow_spurs_kernel.c). This used to be a weak extern DECLARATION written at
+  * block scope inside ps3_hle_call, guarded by a test of its own address -- so
+@@ -226,6 +227,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+      * guest execution -- the vblank ticker only marks ticks pending; the handlers
+      * run here so guest code never executes concurrently on the ticker thread. */
+     if (ppu_gcm_pump) ppu_gcm_pump();
++    if (ps3_guest_frame_hook) ps3_guest_frame_hook(ctx);
+ 
+     /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
+      * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
+diff --git a/libs/video/rsx_metal_overlay.m b/libs/video/rsx_metal_overlay.m
+--- a/libs/video/rsx_metal_overlay.m
++++ b/libs/video/rsx_metal_overlay.m
+@@ -63,6 +63,6 @@
+     text(cg, ui->title, 210, 128, 860, 48, 30);
+     rectangle(cg, 210, 184, 860, 1, .45, .52, .65, .65);
+-    text(cg, ui->message, 210, 205, 860, ui->kind == SYS_OVERLAY_LIST ? 65 : 140, 25);
+-    if (ui->kind == SYS_OVERLAY_LIST) {
++    text(cg, ui->message, 210, 205, 860, (ui->kind == SYS_OVERLAY_LIST || ui->kind == SYS_OVERLAY_EDITOR) ? 65 : 140, 25);
++    if ((ui->kind == SYS_OVERLAY_LIST || ui->kind == SYS_OVERLAY_EDITOR)) {
+         int first = ui->selected >= 5 ? ui->selected - 4 : 0;
+         for (int row = 0; row < 5 && first + row < ui->count; row++) {
+@@ -88,5 +88,5 @@
+     }
+     rectangle(cg, 210, 567, 860, 1, .45, .52, .65, .65);
+-    text(cg, ui->buttons ? (ui->cancel_disabled ? "✕ OK" : "✕ OK     ○ Back") :
++    text(cg, ui->footer[0] ? ui->footer : ui->buttons ? (ui->cancel_disabled ? "✕ OK" : "✕ OK     ○ Back") :
+                           (ui->cancel_disabled ? "Please wait…" : "○ Back"),
+          215, 580, 850, 30, 22);

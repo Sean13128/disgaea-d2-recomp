@@ -1,0 +1,161 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -168,9 +168,32 @@
+     ReleaseSRWLockExclusive(&s_progress_lock);
+ }
+ 
++/* Opt-in per-request timeline. Sequence numbers identify guest frames rather
++ * than repeated drawable presentations; timestamps share the vblank clock. */
++static int gcm_flip_trace_enabled(void)
++{
++    static atomic_int enabled = -1;
++    int value = enabled;
++    if (value < 0) {
++        value = getenv("GCM_FLIP_TRACE") != NULL;
++        enabled = value;
++    }
++    return value;
++}
++
++static void gcm_flip_trace(const char* event, u32 sequence)
++{
++    if (gcm_flip_trace_enabled()) {
++        u64 now = get_timestamp_ns();
++        fprintf(stderr, "[gcm-flip] event=%s seq=%u time_ns=%llu vblank=%llu\n",
++                event, sequence, (unsigned long long)now,
++                (unsigned long long)gcm_vblank_at(gcm_vblank_elapsed_ns()));
++    }
++}
++
+ void cellGcm_fifo_kick(void);
+ 
+-static void gcm_queue_flip(u32 bufferId)
++static u32 gcm_queue_flip(u32 bufferId)
+ {
+     for (;;) {
+         u64 generation = gcm_progress_begin();
+@@ -182,10 +205,11 @@
+             s_flip_queue[slot].earliest_vblank = gcm_vblank_at(gcm_vblank_elapsed_ns()) + 1;
+             s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+             s_flip_request_count = requested + 1;
++            gcm_flip_trace("reach", requested + 1);
+             s_flip_pending = 1;
+             ReleaseSRWLockExclusive(&s_flip_lock);
+             cellGcm_fifo_kick();
+-            return;
++            return requested + 1;
+         }
+         ReleaseSRWLockExclusive(&s_flip_lock);
+         cellGcm_fifo_kick();
+@@ -206,6 +230,7 @@
+         s_current_display_buffer_id = s_flip_queue[slot].buffer;
+         s_presented_flip_count = completed + 1;
+         s_last_present_vblank = vblank;
++        gcm_flip_trace("select", completed + 1);
+         ready = 1;
+     }
+     ReleaseSRWLockExclusive(&s_flip_lock);
+@@ -694,12 +719,14 @@
+  * subsequently queued a GCM flip or reset the global status. */
+ void cellGcm_wait_flip_count(u32 target)
+ {
++    gcm_flip_trace("wait", target);
+     cellGcm_fifo_kick();
+     for (;;) {
+         u64 generation = gcm_progress_begin();
+         if ((s32)(s_completed_flip_count - target) >= 0) break;
+         gcm_progress_wait(generation, INFINITE);
+     }
++    gcm_flip_trace("wake", target);
+ }
+ 
+ /* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
+@@ -847,6 +874,7 @@
+          * release the flip semaphore and publish callbacks/wakeups together. */
+         s_last_flip_time = get_timestamp_ns() / 1000;
+         s_completed_flip_count = presented;
++        gcm_flip_trace("retire", presented);
+         s_flip_pending = (presented != s_flip_request_count);
+         if (!s_flip_pending) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+         vm_write32(GCM_LABEL_GUEST_BASE + 0x10, 0);
+@@ -1922,7 +1950,9 @@
+             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+                 /* Queued by _cellGcmSetFlipCommand, which already did the
+                  * guest-visible half of the request. */
+-                gcm_queue_flip(w & 7u);
++                u32 sequence = gcm_queue_flip(w & 7u);
++                if (gcm_flip_trace_enabled())
++                    fprintf(stderr, "[gcm-fifo-flip] event=reach ea=%08X seq=%u\n", ea, sequence);
+             } else {
+                 cellGcmSetFlipCommand(w & 0xFFu);
+             }
+@@ -2559,6 +2589,12 @@
+ 
+     /* In-FIFO requests become ready only after their preceding draws.
+      * Flip callbacks belong solely to completion, never to submission. */
++    if (!in_fifo && gcm_flip_trace_enabled()) {
++        fprintf(stderr, "[gcm-submit] seq=%u fifo=%d put=%08X get=%08X\n",
++                s_flip_request_count + 1, in_fifo,
++                vm_read32(GCM_CONTROL_GUEST_ADDR), vm_read32(GCM_CONTROL_GUEST_ADDR + 4));
++        gcm_flip_trace("submit", s_flip_request_count + 1);
++    }
+     if (!in_fifo) gcm_queue_flip(bufferId);
+     else s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+     cellGcm_fifo_kick();
+@@ -2586,6 +2622,10 @@
+      * ring wraps, and the recycle above keys on them. */
+     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
++    if (gcm_flip_trace_enabled())
++        fprintf(stderr, "[gcm-fifo-flip] event=submit ea=%08X time_ns=%llu vblank=%llu\n",
++                cur, (unsigned long long)get_timestamp_ns(),
++                (unsigned long long)gcm_vblank_at(gcm_vblank_elapsed_ns()));
+     /* Leave recycling to the producer's buffer-full callback. A flip must not
+      * rewind current without acknowledging the outstanding FIFO tail. */
+     vm_write32(ctx + 8, cur + 4);
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -708,23 +708,34 @@
+     return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
+ }
+ 
+-/* One hash per cached texture per presented frame. Word-at-a-time FNV over
+- * the whole span is deliberately cheap: this is a mutation detector, not a
+- * content id (rsx_live_draw.c:2002-2026). */
++/* One full-span mutation check per cached texture per presented frame.
++ * Four independent FNV streams remove the multiply dependency across every
++ * eight bytes. This is an in-memory cache key, never a persisted content id. */
+ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
+                                     int* readable)
+ {
+     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+     if (!src) { *readable = 0; return 0; }
+-    u64 hash = 1469598103934665603ull;
++    u64 h0 = 1469598103934665603ull, h1 = h0 + 1, h2 = h0 + 2, h3 = h0 + 3;
+     u32 i = 0;
+-    for (; i + 8 <= span; i += 8) {
++    for (; span - i >= 32; i += 32) {
++        u64 words[4];
++        memcpy(words, src + i, sizeof(words));
++        h0 = (h0 ^ words[0]) * 1099511628211ull;
++        h1 = (h1 ^ words[1]) * 1099511628211ull;
++        h2 = (h2 ^ words[2]) * 1099511628211ull;
++        h3 = (h3 ^ words[3]) * 1099511628211ull;
++    }
++    u64 hash = h0;
++    hash = (hash ^ h1) * 1099511628211ull;
++    hash = (hash ^ h2) * 1099511628211ull;
++    hash = (hash ^ h3) * 1099511628211ull;
++    for (; span - i >= 8; i += 8) {
+         u64 word;
+         memcpy(&word, src + i, sizeof(word));
+-        hash ^= word;
+-        hash *= 1099511628211ull;
+-    }
+-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
++        hash = (hash ^ word) * 1099511628211ull;
++    }
++    for (; i < span; i++) hash = (hash ^ src[i]) * 1099511628211ull;
+     *readable = 1;
+     return hash;
+ }

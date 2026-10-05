@@ -1,0 +1,91 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index d105230..33168b9 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -171,6 +171,13 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
+      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
+     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+ 
++    /* NV40 stencil write masks reset to all eight bits enabled. A title can
++     * set stencil ops without ever writing these registers (D2's circular
++     * portrait clip does); zero would silently suppress every stencil write.
++     * Seed the registers so an explicit zero still means "write no bits". */
++    rsx->regs[0x032C >> 2] = 0xFFu;
++    rsx->regs[0x034C >> 2] = 0xFFu;
++
+     /* Execution methods */
+     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
+     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 704ccef..d567e3c 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -84,6 +84,7 @@ typedef struct {
+     rsx_topology draw_topology;
+     u32 scissor[4];
+     u32 stencil_ref;
++    rsx_be_render_state pipeline_state;
+     u32 last_created_texture, last_created_color;
+     u32 last_released;
+ } StubState;
+@@ -157,10 +158,11 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
+                                 const rsx_vertex_layout_plan* layout,
+                                 u32 stride, rsx_be_format rt, u32 rt_count)
+ {
+-    (void)u; (void)rs; (void)layout; (void)stride; (void)rt;
++    (void)u; (void)layout; (void)stride; (void)rt;
+     if (!vs || !ps || !*vs || !*ps) return 0;
+     stub.n_pipeline_create++;
+     stub.pipeline_rt_count = rt_count;
++    stub.pipeline_state = *rs;
+     return stub_handle();
+ }
+ 
+@@ -640,6 +642,39 @@ static void test_pipeline_key(void)
+     engine_down();
+ }
+ 
++static void test_stencil_reset(void)
++{
++    printf("-- stencil reset\n");
++    rsx_dispatch rsx;
++    rsx_dispatch_init(&rsx, NULL);
++    CHECK(rsx_dsp_reg(&rsx, 0x032C) == 0xFF &&
++          rsx_dsp_reg(&rsx, 0x034C) == 0xFF,
++          "front and back stencil write masks reset to FF");
++    rsx_dispatch_method(&rsx, 0x032C, 0);
++    rsx_dispatch_method(&rsx, 0x034C, 0);
++    CHECK(!rsx_dsp_reg(&rsx, 0x032C) && !rsx_dsp_reg(&rsx, 0x034C),
++          "explicit zero stencil masks remain zero");
++
++    /* D2 writes an inverse circular mask via REPLACE on depth failure,
++     * without setting STENCIL_MASK. The backing quad then tests 1 > stencil. */
++    engine_up();
++    m(0x0328, 1); m(0x0330, 0x0207); m(0x0334, 255); m(0x0338, 255);
++    m(0x033C, 0x1E01); m(0x0340, 0x1E01); m(0x0344, 0x1E01);
++    m(0x0A6C, 0x0200); m(0x0A70, 0); m(0x0A74, 1);
++    draw_triangle();
++    CHECK(stub.pipeline_state.s_write_mask == 255 &&
++          stub.pipeline_state.s_zfail == 0x1E01 && stub.stencil_ref == 255 &&
++          stub.pipeline_state.depth_test && stub.pipeline_state.depth_func == 0x0200,
++          "depth-fail mask pass can replace stencil without an explicit write mask");
++    const int pipelines = stub.n_pipeline_create;
++    m(0x032C, 0);
++    draw_triangle();
++    CHECK(stub.pipeline_state.s_write_mask == 0 &&
++          stub.n_pipeline_create == pipelines + 1,
++          "explicit zero mask builds a pipeline that disables stencil writes");
++    engine_down();
++}
++
+ /* ---- 5. restart cuts and topology expansion ------------------------------ */
+ 
+ static void test_restart_expansion(void)
+@@ -980,6 +1015,7 @@ int main(void)
+     test_mrt_set();
+     test_texture_cache();
+     test_pipeline_key();
++    test_stencil_reset();
+     test_restart_expansion();
+     test_indexed_draws();
+     test_scissor();

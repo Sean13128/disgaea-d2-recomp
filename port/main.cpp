@@ -96,8 +96,13 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 void     rsx_set_backend(struct rsx_backend*);
 void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
+unsigned cellGcm_vblank_wait_ms(void);
+uint64_t cellGcmGetVBlankCount(void);
+uint32_t cellGcm_flip_mode(void);
+uint32_t cellGcmGetCurrentDisplayBufferId(void);
 void     cellGcm_fifo_kick_wait(unsigned ms);
 int      cellGcm_take_flip_pending(void);
+void     cellGcm_fifo_enable_snapshot(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
 }
@@ -120,6 +125,8 @@ extern "C" int  rsx_d3d12_backend_pump_messages(void);
 #elif defined(__APPLE__)
 extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_metal_backend_present(void);
+extern "C" void rsx_metal_backend_set_vsync(int enabled);
+extern "C" void rsx_metal_backend_set_flip_buffer(uint32_t buffer);
 extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_metal_backend_init
 #  define rsx_backend_present rsx_metal_backend_present
@@ -181,6 +188,10 @@ extern "C" unsigned ppu_boot_frames_presented(void)
 
 static void present_guest_frame(void)
 {
+#ifdef __APPLE__
+    rsx_metal_backend_set_flip_buffer(cellGcmGetCurrentDisplayBufferId());
+    rsx_metal_backend_set_vsync(cellGcm_flip_mode() == 2); /* DISPLAY_VSYNC */
+#endif
     s_backend_present();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
@@ -197,6 +208,7 @@ extern "C" void ppu_report_guest_lrs(void);
 static DWORD WINAPI frame_clock(LPVOID)
 {
     ps3_poll_thread_start("RSX render", 1);
+    cellGcm_fifo_enable_snapshot();
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "ps3recomp";
 
@@ -223,23 +235,16 @@ static DWORD WINAPI frame_clock(LPVOID)
         s_backend_present = rsx_draw_engine_present;
     d2_install_shader_trace();
 
-    LARGE_INTEGER frequency, counter;
-    QueryPerformanceFrequency(&frequency);
-    QueryPerformanceCounter(&counter);
-    const LONGLONG period = frequency.QuadPart / 60;
-    LONGLONG next_tick = counter.QuadPart + period;
+    uint64_t previous_vblank = cellGcmGetVBlankCount();
     ULONGLONG next_report = GetTickCount64() + 5000;
     const int boot_trace = getenv("D2_BOOT_TRACE") != nullptr;
 
     for (;;) {
-        QueryPerformanceCounter(&counter);
-        LONGLONG remaining = next_tick - counter.QuadPart;
-        unsigned wait_ms = remaining > 0
-            ? (unsigned)((remaining * 1000 + frequency.QuadPart - 1) / frequency.QuadPart) : 0;
-        /* put/label/flip notifications drain immediately; the timeout only
-         * services vblank and the window when the guest has nothing to submit. */
-        cellGcm_fifo_kick_wait(wait_ms);
-        QueryPerformanceCounter(&counter);
+        /* A kick drains immediately. VSYNC readiness is enforced by GCM,
+         * using the same clock as its counters; HSYNC need not await vblank. */
+        cellGcm_fifo_kick_wait(cellGcm_vblank_wait_ms());
+        cellGcmTickVBlank();
+        uint64_t vblank = cellGcmGetVBlankCount();
         ULONGLONG now = GetTickCount64();
         if (boot_trace && now >= next_report) {
             fprintf(stderr, "[d2-boot] frames=%u flip_requests=%u\n",
@@ -247,21 +252,15 @@ static DWORD WINAPI frame_clock(LPVOID)
             ppu_report_guest_lrs();
             next_report = now + 5000;
         }
-        if (counter.QuadPart >= next_tick) {
-            cellGcmTickVBlank();
-            /* Present the completed batch before allowing the next drain.
-             * Flip completion wakes the producer only AFTER presentation. */
-            if (rsx_ok && cellGcm_take_flip_pending()) {
-                present_guest_frame();
-                cellGcmTickFlip();
-            } else if (rsx_ok && cellGcm_flip_request_count() == 0) {
-                s_backend_present();
-            }
-            /* Preserve clock phase, skipping missed refreshes rather than
-             * bursting multiple presents/callbacks faster than 60 Hz. */
-            QueryPerformanceCounter(&counter);
-            next_tick += ((counter.QuadPart - next_tick) / period + 1) * period;
+        /* Hold the batch until its scheduled refresh, submit it, then wake
+         * the producer. Missed refreshes advance counters without bursts. */
+        if (rsx_ok && cellGcm_take_flip_pending()) {
+            present_guest_frame();
+            cellGcmTickFlip();
+        } else if (rsx_ok && vblank != previous_vblank && cellGcm_flip_request_count() == 0) {
+            s_backend_present();
         }
+        previous_vblank = vblank;
         if (rsx_ok) {
             cellGcm_rsx_process_fifo();
             if (s_backend_pump() != 0) rsx_ok = 0;
@@ -340,8 +339,17 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
     ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
+#ifdef __APPLE__
+extern "C" void d2_settings_init(void);
+extern "C" int d2_settings_self_test(void);
+#endif
+
 int main(int argc, char** argv)
 {
+#ifdef __APPLE__
+    if (argc == 2 && strcmp(argv[1], "--settings-test") == 0) return d2_settings_self_test();
+    d2_settings_init();
+#endif
     if (argc < 2) {
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;
@@ -366,6 +374,13 @@ int main(int argc, char** argv)
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {
         fprintf(stderr, "ERROR: could not load %s\n", argv[1]);
+        return 1;
+    }
+
+    const uint32_t expected_toc = D2_GAME_VERSION == 140 ? 0x47DF98u : 0x3FDE60u;
+    if (vm_read32(entry + 4) != expected_toc) {
+        fprintf(stderr, "ERROR: this build requires D2 version %d (%s)\n",
+                D2_GAME_VERSION, D2_GAME_VERSION == 140 ? "work/v140/EBOOT.elf" : "work/EBOOT.elf");
         return 1;
     }
 

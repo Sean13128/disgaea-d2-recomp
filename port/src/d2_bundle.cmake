@@ -1,5 +1,11 @@
 # Keep the CLI runner intact; Finder launches a small AppKit path resolver.
 enable_language(OBJC)
+target_sources(${PROJECT_NAME} PRIVATE src/d2_settings.m)
+# Mach-O needs an explicitly optional undefined symbol for an unlinked cheat UI.
+target_link_options(${PROJECT_NAME} PRIVATE "LINKER:-U,_d2_cheats_toggle_menu")
+set_source_files_properties(src/d2_settings.m PROPERTIES
+    COMPILE_OPTIONS "-fobjc-arc;-UNDEBUG"
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${PS3RECOMP_DIR}/libs/video;${PS3RECOMP_DIR}/libs/audio")
 set(D2_GAME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../Disgaea D2 A Brighter Darkness - [BLUS31313]"
     CACHE PATH "Game dump used to generate the local app icon (never bundled)")
 set(D2_ICON "${CMAKE_CURRENT_BINARY_DIR}/DisgaeaD2.icns")
@@ -10,7 +16,9 @@ add_custom_command(OUTPUT "${D2_ICON}"
     COMMENT "Generating Disgaea D2 app icon from the local dump")
 set_source_files_properties("${D2_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 configure_file(src/d2_launcher_paths.h.in d2_launcher_paths.h @ONLY)
-add_executable(DisgaeaD2App MACOSX_BUNDLE src/d2_launcher.m "${D2_ICON}")
+set(D2_SAVE_IMPORT "${CMAKE_CURRENT_SOURCE_DIR}/../tools/d2_save_import.py")
+set_source_files_properties("${D2_SAVE_IMPORT}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+add_executable(DisgaeaD2App MACOSX_BUNDLE src/d2_launcher.m "${D2_ICON}" "${D2_SAVE_IMPORT}")
 target_include_directories(DisgaeaD2App PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_options(DisgaeaD2App PRIVATE -fobjc-arc)
 target_link_libraries(DisgaeaD2App PRIVATE "-framework AppKit")

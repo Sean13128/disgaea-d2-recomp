@@ -10,7 +10,7 @@ echo "Capturing to $out — reproduce the issue, then quit the game window."
 D2_MOVIE_SKIP="${D2_MOVIE_SKIP:-1}" PS3_TITLE="Disgaea D2 (capture)" \
 PS3_VFS_ROOT="$PWD/Disgaea D2 A Brighter Darkness - [BLUS31313]" \
 PS3_HDD0_ROOT="$out/hdd0" PS3_HDD1_ROOT="$out/hdd1" \
-D2_BOOT_TRACE=1 PS3RECOMP_TRACE_HOTREAD=1 PAD_TRACE=1 \
-PS3RECOMP_METAL_FRAME_DUMP="$out/frames/f%u.ppm" PS3RECOMP_METAL_FRAME_DUMP_EVERY=120 \
+D2_BOOT_TRACE=1 PS3RECOMP_TRACE_HOTREAD=1 PAD_TRACE=1 AUDIO_PEAK=1 AUDIO_RATE=1 AUDIO_WAV="$out/mix.f32le" \
+PS3RECOMP_METAL_FRAME_DUMP="$out/frames/f%u.ppm" PS3RECOMP_METAL_FRAME_DUMP_EVERY=600 \
   ./port/build/DisgaeaD2Recomp work/EBOOT.elf > "$out/run.log" 2>&1
 echo "Done: $out"
