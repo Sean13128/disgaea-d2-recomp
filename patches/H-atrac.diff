@@ -1,0 +1,728 @@
+diff --git a/libs/codec/cellAtrac.c b/libs/codec/cellAtrac.c
+index 6138658..fb59dc6 100644
+--- a/libs/codec/cellAtrac.c
++++ b/libs/codec/cellAtrac.c
+@@ -1,8 +1,8 @@
+ /*
+  * ps3recomp - cellAtrac HLE
+  *
+- * All-data-on-memory decoding of ATRAC3plus RIFF files, with looping. The
+- * title hands over the whole .at3 file (SetDataAndGetMemSize), creates a
++ * Buffered decoding of ATRAC3plus RIFF files, with looping. The
++ * title hands over the start of an .at3 file (SetDataAndGetMemSize), creates a
+  * decoder, and then pulls one frame of float PCM per cellAtracDecode.
+  *
+  * Sample positions. FFmpeg's decoder output is a linear stream of 2048-sample
+@@ -14,10 +14,10 @@
+  * Game's three tracks: first + fact[0] lands exactly on the last frame
+  * boundary of the data chunk, and each loop spans the whole track.
+  *
+- * ponytail: no streaming (GetStreamDataInfo/AddStreamData/second buffer) and
+- * no plain ATRAC3 -- nothing that runs needs them yet. A title that streams
+- * gets a loud log line from SetDataAndGetMemSize; add the ring-buffer
+- * bookkeeping then (PPSSPP's sceAtrac is the model).
++ * Streaming uses the guest buffer as a staging ring. Submitted compressed
++ * bytes are retained on the host, so looping/seek preroll never reads an
++ * overwritten guest buffer and no second guest buffer is necessary. Only
++ * submitted ranges may be decoded; an underrun returns NODATA_IN_BUFFER.
+  */
+ 
+ #include "cellAtrac.h"
+@@ -25,13 +25,15 @@
+ #include "../../third_party/at3_standalone/at3_bridge.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
++#include <limits.h>
+ 
+ #define AT3P_SAMPLES   2048
+ #define AT3P_DELAY     0x170
+ #define ATRAC_MAX_SLOTS 16
+ 
+ typedef struct {
+-    u32 channels, block_align;
++    u32 channels, block_align, sample_rate;
+     u32 data_off, data_bytes;  /* the data chunk, relative to the file start */
+     s32 first, end;            /* decoder-stream indices; end is exclusive   */
+     s32 loop_start, loop_end;  /* same space, loop_end exclusive; -1 = none  */
+@@ -39,7 +41,14 @@ typedef struct {
+ 
+ typedef struct {
+     u32 handle_ea;             /* 0 = free */
+-    const u8* file;
++    u8* file;                 /* owned compressed data, not a guest pointer */
++    u32 buffer_ea, buffer_bytes, file_bytes;
++    u32 read_pos, buffered_from, write_off;
++    u32 prefix, range_start, range_end; /* submitted file ranges */
++    u32 reset_sample, reset_min;
++    u32 decode_calls, refill_calls;
++    int reset_pending, all_on_memory;
++    s32 internal_error;
+     AtracTrackInfo t;
+     void* dec;
+     s32 pos;                   /* next decoder-stream index to output */
+@@ -66,15 +75,22 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
+     if (bytes < 12 || memcmp(f, "RIFF", 4) || memcmp(f + 8, "WAVE", 4))
+         return (int)CELL_ATRAC_ERROR_UNKNOWN_FORMAT;
+     u32 total = 0, off1 = 0, off2 = 0, has_fact = 0, lstart = 0, lend = 0, has_loop = 0;
++    const u64 riff_end = (u64)le32(f + 4) + 8;
+     u32 o = 12;
+-    while (o + 8 <= bytes && !t->data_off) {
++    while ((u64)o + 8 <= bytes && !t->data_off) {
+         const u8* c = f + o;
+         const u32 cs = le32(c + 4);
++        const u64 next = (u64)o + 8 + cs + (cs & 1);
++        if ((u64)o + 8 + cs > riff_end || next > UINT32_MAX)
++            return (int)CELL_ATRAC_ERROR_ILLEGAL_DATA;
++        if (memcmp(c, "data", 4) && (u64)o + 8 + cs > bytes)
++            return (int)CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
+         if (!memcmp(c, "fmt ", 4)) {
+             if (o + 8 + 40 > bytes || cs < 40 || le16(c + 8) != 0xFFFE ||
+                 memcmp(c + 8 + 24, k_at3p_guid, 16))
+                 return (int)CELL_ATRAC_ERROR_UNKNOWN_FORMAT;   /* ATRAC3plus only */
+             t->channels = le16(c + 10);
++            t->sample_rate = le32(c + 12);
+             t->block_align = le16(c + 20);
+         } else if (!memcmp(c, "fact", 4) && cs >= 8 && o + 16 <= bytes) {
+             has_fact = 1;
+@@ -90,10 +106,16 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
+             t->data_off = o + 8;
+             t->data_bytes = cs;
+         }
+-        o += 8 + cs;
++        o = (u32)next;
+     }
+     if (!t->data_off || !t->block_align || t->channels < 1 || t->channels > 2)
+         return (int)CELL_ATRAC_ERROR_ILLEGAL_DATA;
++    if (t->data_bytes % t->block_align ||
++        (u64)(t->data_bytes / t->block_align) * AT3P_SAMPLES > INT32_MAX ||
++        (u64)off1 + AT3P_DELAY + total > INT32_MAX)
++        return (int)CELL_ATRAC_ERROR_ILLEGAL_DATA;
++    if (t->sample_rate != 44100 && t->sample_rate != 48000)
++        return (int)CELL_ATRAC_ERROR_ILLEGAL_SAMPLING_RATE;
+     const s32 stream = (s32)(t->data_bytes / t->block_align) * AT3P_SAMPLES;
+     t->first = (s32)off1 + AT3P_DELAY;
+     t->end = has_fact ? t->first + (s32)total : stream;
+@@ -103,6 +125,7 @@ int atrac_parse_riff(const u8* f, u32 bytes, AtracTrackInfo* t)
+         t->loop_end = t->first + (s32)(lend - off2) + 1;
+         if (t->loop_end > t->end) t->loop_end = t->end;
+     }
++    if (t->first >= t->end) return (int)CELL_ATRAC_ERROR_ILLEGAL_DATA;
+     return 0;
+ }
+ 
+@@ -113,24 +136,86 @@ static AtracSlot* slot_of(u32 handle_ea)
+     return NULL;
+ }
+ 
++/* A prefix plus the latest seek range covers normal streaming, loops, and
++ * discontinuous resets without treating unsubmitted cache bytes as audio. */
++static int cached(const AtracSlot* s, u32 at, u32 bytes)
++{
++    return at <= s->file_bytes && bytes <= s->file_bytes - at &&
++           (at + bytes <= s->prefix ||
++            (at >= s->range_start && at + bytes <= s->range_end));
++}
++
++static void submit_data(AtracSlot* s, u32 at, u32 ea, u32 bytes)
++{
++    memcpy(s->file + at, vm_base + ea, bytes);
++    if (at <= s->prefix) {
++        if (at + bytes > s->prefix) s->prefix = at + bytes;
++        if (s->range_start <= s->prefix && s->range_end > s->prefix)
++            s->prefix = s->range_end;
++    } else if (at >= s->range_start && at <= s->range_end) {
++        if (at + bytes > s->range_end) s->range_end = at + bytes;
++    } else {
++        s->range_start = at;
++        s->range_end = at + bytes;
++    }
++}
++
++static s32 remain_frames(const AtracSlot* s)
++{
++    if (s->all_on_memory) return CELL_ATRAC_ALLDATA_IS_ON_MEMORY;
++    const u32 at = s->t.data_off + (u32)s->next_frame * s->t.block_align;
++    const u32 end = at <= s->prefix ? s->prefix :
++                    at >= s->range_start && at <= s->range_end ? s->range_end : at;
++    if (end == s->file_bytes) return CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY;
++    return (s32)((end - at) / s->t.block_align);
++}
++
++static u32 writable_bytes(const AtracSlot* s)
++{
++    u32 n = s->buffer_bytes - (s->read_pos - s->buffered_from);
++    if (n > s->buffer_bytes - s->write_off) n = s->buffer_bytes - s->write_off;
++    if (n > s->file_bytes - s->read_pos) n = s->file_bytes - s->read_pos;
++    return n;
++}
++
+ /* Puts decoder-stream frame k in s->pcm, decoding forward from wherever the
+  * decoder is. The decoder overlaps adjacent frames, so a jump backwards
+  * restarts one frame early and discards that frame's output. */
+ static int decode_frame(AtracSlot* s, s32 k)
+ {
+     if (s->pcm_frame == k) return 0;
++    s32 first = s->next_frame > k ? (k > 0 ? k - 1 : 0) : s->next_frame;
++    /* Preflight before changing decoder state, including discarded preroll. */
++    const u32 start = s->t.data_off + (u32)first * s->t.block_align;
++    const u32 bytes = (u32)(k - first + 1) * s->t.block_align;
++    if (!cached(s, start, bytes)) {
++        /* A loop after a discontinuous seek may revisit an uncached range.
++         * Redirect the next guest refill to its first missing byte. */
++        u32 missing = start;
++        if (missing < s->prefix) missing = s->prefix;
++        if (missing >= s->range_start && missing < s->range_end) missing = s->range_end;
++        if (s->read_pos != missing) {
++            s->read_pos = s->buffered_from = missing;
++            s->write_off = 0;
++        }
++        return (s32)CELL_ATRAC_ERROR_NODATA_IN_BUFFER;
++    }
+     if (s->next_frame > k) {
+         at3p_flush(s->dec);
+-        s->next_frame = k > 0 ? k - 1 : 0;
++        s->next_frame = first;
+     }
+     while (s->next_frame <= k) {
+         const u32 at = s->t.data_off + (u32)s->next_frame * s->t.block_align;
+         int n = 0;
+-        if (at3p_decode(s->dec, s->pcm[0], s->pcm[1], &n, s->file + at,
+-                        (int)s->t.block_align) < 0 || n != AT3P_SAMPLES) {
+-            /* A bad frame decodes as silence rather than ending the track. */
+-            memset(s->pcm, 0, sizeof(s->pcm));
++        int rc = at3p_decode(s->dec, s->pcm[0], s->pcm[1], &n, s->file + at,
++                            (int)s->t.block_align);
++        if (rc < 0 || n != AT3P_SAMPLES) {
++            s->internal_error = rc < 0 ? rc : -1;
++            return (s32)CELL_ATRAC_ERROR_API_FAIL;
+         }
++        const u32 consumed = at + s->t.block_align;
++        if (consumed > s->buffered_from)
++            s->buffered_from = consumed < s->read_pos ? consumed : s->read_pos;
+         s->next_frame++;
+     }
+     s->pcm_frame = k;
+@@ -143,6 +228,7 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
+                                   u32 uiBufferByte, u32 puiWorkMemByte)
+ {
+     if (!pHandle || !pucBufferAddr) return (s32)CELL_ATRAC_ERROR_API_FAIL;
++    if (uiReadByte > uiBufferByte) return (s32)CELL_ATRAC_ERROR_READSIZE_OVER_BUFFER;
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) s = slot_of(0);
+     if (!s) return (s32)CELL_ATRAC_ERROR_API_FAIL;
+@@ -153,23 +239,32 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
+         fprintf(stderr, "[cellAtrac] SetData: not an ATRAC3plus file (0x%08X)\n", (u32)rc);
+         return rc;
+     }
+-    if (uiReadByte < t.data_off + t.data_bytes)
+-        fprintf(stderr, "[cellAtrac] SetData: %u of %u bytes on memory -- STREAMING is "
+-                        "not implemented; this track will decode garbage\n",
+-                uiReadByte, t.data_off + t.data_bytes);
++    const u32 file_bytes = t.data_off + t.data_bytes;
++    if (uiBufferByte < t.block_align || uiReadByte > file_bytes)
++        return (s32)CELL_ATRAC_ERROR_ILLEGAL_DATA;
++    u8* copy = (u8*)malloc(file_bytes);
++    if (!copy) return (s32)CELL_ATRAC_ERROR_API_FAIL;
++    memcpy(copy, file, uiReadByte);
+     if (s->dec) at3p_close(s->dec);
++    free(s->file);
+     memset(s, 0, sizeof(*s));
+     s->handle_ea = pHandle;
+-    s->file = file;
++    s->file = copy;
++    s->buffer_ea = pucBufferAddr;
++    s->buffer_bytes = uiBufferByte;
++    s->file_bytes = file_bytes;
++    s->read_pos = s->prefix = uiReadByte;
++    s->buffered_from = t.data_off < uiReadByte ? t.data_off : uiReadByte;
++    s->write_off = uiReadByte % uiBufferByte;
++    s->all_on_memory = uiReadByte == file_bytes;
+     s->t = t;
+     s->pos = t.first;
+     s->next_frame = 0;         /* start of the stream, like the console */
+     s->pcm_frame = -1;
+-    (void)uiBufferByte;
+     if (puiWorkMemByte) vm_write32(puiWorkMemByte, 0x1000);
+-    fprintf(stderr, "[cellAtrac] SetData handle=0x%08X ch=%u frames=%u first=%d end=%d loop=[%d,%d)\n",
++    fprintf(stderr, "[cellAtrac] SetData handle=0x%08X ch=%u frames=%u first=%d end=%d loop=[%d,%d) buffer=%u/%u file=%u\n",
+             pHandle, t.channels, t.data_bytes / t.block_align, t.first, t.end,
+-            t.loop_start, t.loop_end);
++            t.loop_start, t.loop_end, uiReadByte, uiBufferByte, file_bytes);
+     return CELL_OK;
+ }
+ 
+@@ -197,6 +292,7 @@ s32 cellAtracDeleteDecoder(u32 pHandle)
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+     if (s->dec) at3p_close(s->dec);
++    free(s->file);
+     memset(s, 0, sizeof(*s));
+     return CELL_OK;
+ }
+@@ -210,6 +306,8 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+     if (!s->dec) return (s32)CELL_ATRAC_ERROR_NO_DECODER;
+     if (puiSamples) vm_write32(puiSamples, 0);
++    if (puiFinishflag) vm_write32(puiFinishflag, 0);
++    if (piRemainFrame) vm_write32(piRemainFrame, (u32)remain_frames(s));
+     if (s->pos >= (looping(s) ? s->t.loop_end : s->t.end)) {
+         if (!looping(s)) {
+             if (puiFinishflag) vm_write32(puiFinishflag, 1);
+@@ -222,7 +320,8 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
+     const s32 k = s->pos / AT3P_SAMPLES, at = s->pos - k * AT3P_SAMPLES;
+     s32 n = AT3P_SAMPLES - at;
+     if (n > limit - s->pos) n = limit - s->pos;
+-    decode_frame(s, k);
++    const int rc = decode_frame(s, k);
++    if (rc) return rc;
+     const u32 ch = s->t.channels;
+     for (s32 i = 0; i < n; i++)
+         for (u32 c = 0; c < ch; c++) {
+@@ -231,16 +330,28 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
+             vm_write32(pfOutAddr + ((u32)i * ch + c) * 4, bits);
+         }
+     s->pos += n;
++    if (++s->decode_calls % 100 == 1 && getenv("PS3RECOMP_ATRAC_TRACE")) {
++        float peak = 0;
++        for (s32 i = 0; i < n; i++)
++            for (u32 c = 0; c < ch; c++) {
++                float v = s->pcm[c][at + i];
++                if (v < 0) v = -v;
++                if (v > peak) peak = v;
++            }
++        fprintf(stderr, "[cellAtrac] Decode handle=0x%08X call=%u samples=%d pos=%d peak=%.4f remain=%d\n",
++                pHandle, s->decode_calls, n, s->pos - s->t.first, peak, remain_frames(s));
++    }
+     if (puiSamples) vm_write32(puiSamples, (u32)n);
+     if (puiFinishflag) vm_write32(puiFinishflag, !looping(s) && s->pos >= s->t.end);
+-    if (piRemainFrame) vm_write32(piRemainFrame, (u32)CELL_ATRAC_ALLDATA_IS_ON_MEMORY);
++    if (piRemainFrame) vm_write32(piRemainFrame, (u32)remain_frames(s));
+     return CELL_OK;
+ }
+ 
+ s32 cellAtracGetRemainFrame(u32 pHandle, u32 piRemainFrame)
+ {
+-    if (!slot_of(pHandle)) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+-    vm_write32(piRemainFrame, (u32)CELL_ATRAC_ALLDATA_IS_ON_MEMORY);
++    AtracSlot* s = slot_of(pHandle);
++    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    vm_write32(piRemainFrame, (u32)remain_frames(s));
+     return CELL_OK;
+ }
+ 
+@@ -294,8 +405,8 @@ s32 cellAtracGetBitrate(u32 pHandle, u32 puiBitrate)
+ {
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+-    /* kbps: block_align bytes per 2048 samples at 48 kHz. */
+-    vm_write32(puiBitrate, s->t.block_align * 8u * 48000u / AT3P_SAMPLES / 1000u);
++    /* kbps: block_align bytes per 2048 samples. */
++    vm_write32(puiBitrate, s->t.block_align * 8u * s->t.sample_rate / AT3P_SAMPLES / 1000u);
+     return CELL_OK;
+ }
+ 
+@@ -317,13 +428,98 @@ s32 cellAtracSetLoopNum(u32 pHandle, s32 iLoopNum)
+     return CELL_OK;
+ }
+ 
++s32 cellAtracGetStreamDataInfo(u32 pHandle, u32 ppucWritePointer,
++                               u32 puiWritableByte, u32 puiReadPosition)
++{
++    AtracSlot* s = slot_of(pHandle);
++    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    vm_write32(ppucWritePointer, s->buffer_ea + s->write_off);
++    vm_write32(puiWritableByte, writable_bytes(s));
++    vm_write32(puiReadPosition, s->read_pos);
++    return CELL_OK;
++}
++
++s32 cellAtracAddStreamData(u32 pHandle, u32 uiAddByte)
++{
++    AtracSlot* s = slot_of(pHandle);
++    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    if (s->all_on_memory) return (s32)CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY;
++    if (uiAddByte > writable_bytes(s)) return (s32)CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG;
++    submit_data(s, s->read_pos, s->buffer_ea + s->write_off, uiAddByte);
++    s->read_pos += uiAddByte;
++    s->write_off = (s->write_off + uiAddByte) % s->buffer_bytes;
++    if ((++s->refill_calls <= 4 || s->refill_calls % 32 == 1) && getenv("PS3RECOMP_ATRAC_TRACE"))
++        fprintf(stderr, "[cellAtrac] AddStreamData handle=0x%08X call=%u bytes=%u read=%u/%u remain=%d\n",
++                pHandle, s->refill_calls, uiAddByte, s->read_pos, s->file_bytes, remain_frames(s));
++    return CELL_OK;
++}
++
++s32 cellAtracIsSecondBufferNeeded(u32 pHandle)
++{
++    if (!slot_of(pHandle)) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    /* Already submitted compressed bytes survive guest ring reuse. */
++    return 0;
++}
++
++s32 cellAtracGetBufferInfoForResetting(u32 pHandle, u32 uiSample, u32 pBufferInfo)
++{
++    AtracSlot* s = slot_of(pHandle);
++    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    if (uiSample >= (u32)(s->t.end - s->t.first))
++        return (s32)CELL_ATRAC_ERROR_ILLEGAL_SAMPLE;
++    const u32 k = ((u32)s->t.first + uiSample) / AT3P_SAMPLES;
++    const u32 first = k ? k - 1 : 0;
++    const u32 at = s->t.data_off + first * s->t.block_align;
++    const u32 need = (k - first + 1) * s->t.block_align;
++    const u32 min = cached(s, at, need) ? 0 : need;
++    u32 n = min ? s->file_bytes - at : 0;
++    if (n > s->buffer_bytes) n = s->buffer_bytes;
++    if (min > n) return (s32)CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
++    /* CellAtracBufferInfo: four big-endian 32-bit words (16 bytes). */
++    vm_write32(pBufferInfo, s->buffer_ea);
++    vm_write32(pBufferInfo + 4, n);
++    vm_write32(pBufferInfo + 8, min);
++    vm_write32(pBufferInfo + 12, at);
++    s->reset_sample = uiSample;
++    s->reset_min = min;
++    s->reset_pending = 1;
++    return CELL_OK;
++}
++
+ s32 cellAtracResetPlayPosition(u32 pHandle, u32 uiSample, u32 uiWriteByte)
+ {
+-    (void)uiWriteByte;
+     AtracSlot* s = slot_of(pHandle);
+     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    if (!s->dec) return (s32)CELL_ATRAC_ERROR_NO_DECODER;
++    if (uiSample >= (u32)(s->t.end - s->t.first))
++        return (s32)CELL_ATRAC_ERROR_ILLEGAL_SAMPLE;
+     const s32 p = s->t.first + (s32)uiSample;
+-    if (p >= s->t.end) return (s32)CELL_ATRAC_ERROR_ILLEGAL_SAMPLE;
++    const u32 k = (u32)p / AT3P_SAMPLES, first = k ? k - 1 : 0;
++    const u32 at = s->t.data_off + first * s->t.block_align;
++    const u32 need = (k - first + 1) * s->t.block_align;
++    if (uiWriteByte) {
++        if (!s->reset_pending || s->reset_sample != uiSample ||
++            uiWriteByte < s->reset_min || uiWriteByte > s->buffer_bytes ||
++            uiWriteByte > s->file_bytes - at)
++            return (s32)CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE;
++        submit_data(s, at, s->buffer_ea, uiWriteByte);
++        s->buffered_from = at;
++        s->read_pos = at + uiWriteByte;
++        s->write_off = uiWriteByte % s->buffer_bytes;
++    }
++    if (!cached(s, at, need)) return (s32)CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE;
++    at3p_flush(s->dec);
++    s->next_frame = (s32)first;
++    s->pcm_frame = -1;
+     s->pos = p;
++    s->reset_pending = 0;
++    return CELL_OK;
++}
++
++s32 cellAtracGetInternalErrorInfo(u32 pHandle, u32 piResult)
++{
++    AtracSlot* s = slot_of(pHandle);
++    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
++    vm_write32(piResult, (u32)s->internal_error);
+     return CELL_OK;
+ }
+diff --git a/libs/codec/cellAtrac.h b/libs/codec/cellAtrac.h
+index 3a473eb..e9cb94a 100644
+--- a/libs/codec/cellAtrac.h
++++ b/libs/codec/cellAtrac.h
+@@ -22,16 +22,21 @@ extern "C" {
+ #define CELL_ATRAC_ERROR_READSIZE_OVER_BUFFER  0x80610311
+ #define CELL_ATRAC_ERROR_UNKNOWN_FORMAT        0x80610312
+ #define CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL 0x80610313
++#define CELL_ATRAC_ERROR_ILLEGAL_SAMPLING_RATE 0x80610314
+ #define CELL_ATRAC_ERROR_ILLEGAL_DATA          0x80610315
+ #define CELL_ATRAC_ERROR_NO_DECODER            0x80610321
+ #define CELL_ATRAC_ERROR_UNSET_DATA            0x80610322
+ #define CELL_ATRAC_ERROR_DECODER_WAS_CREATED   0x80610323
+ #define CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED   0x80610331
++#define CELL_ATRAC_ERROR_NODATA_IN_BUFFER      0x80610332
+ #define CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY   0x80610341
++#define CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG   0x80610342
+ #define CELL_ATRAC_ERROR_UNSET_LOOP_NUM        0x80610361
+ #define CELL_ATRAC_ERROR_ILLEGAL_SAMPLE        0x80610371
++#define CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE    0x80610372
+ 
+ #define CELL_ATRAC_ALLDATA_IS_ON_MEMORY  (-1)
++#define CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY (-2)
+ 
+ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte,
+                                   u32 uiBufferByte, u32 puiWorkMemByte);
+@@ -43,6 +48,12 @@ s32 cellAtracDeleteDecoder(u32 pHandle);
+ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishflag,
+                     u32 piRemainFrame);
+ s32 cellAtracGetRemainFrame(u32 pHandle, u32 piRemainFrame);
++s32 cellAtracGetStreamDataInfo(u32 pHandle, u32 ppucWritePointer,
++                               u32 puiWritableByte, u32 puiReadPosition);
++s32 cellAtracAddStreamData(u32 pHandle, u32 uiAddByte);
++s32 cellAtracIsSecondBufferNeeded(u32 pHandle);
++s32 cellAtracGetBufferInfoForResetting(u32 pHandle, u32 uiSample, u32 pBufferInfo);
++s32 cellAtracGetInternalErrorInfo(u32 pHandle, u32 piResult);
+ s32 cellAtracGetChannel(u32 pHandle, u32 puiChannel);
+ s32 cellAtracGetMaxSample(u32 pHandle, u32 puiMaxSample);
+ s32 cellAtracGetNextSample(u32 pHandle, u32 puiNextSample);
+diff --git a/libs/codec/tests/test_cellAtrac.c b/libs/codec/tests/test_cellAtrac.c
+index 8cfd2ec..9a36435 100644
+--- a/libs/codec/tests/test_cellAtrac.c
++++ b/libs/codec/tests/test_cellAtrac.c
+@@ -13,7 +13,7 @@
+  *
+  * Build (from the repo root; no runtime lib needed):
+  *   clang-cl /O2 -w /Iinclude libs/codec/tests/test_cellAtrac.c
+- *            third_party/at3_standalone/*.cpp
++ *            third_party/at3_standalone/(decoder sources)
+  *   test_cellAtrac.exe track.at3 [out.wav]
+  */
+ #include <assert.h>
+@@ -39,6 +39,23 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
+ enum { MEM = 64u << 20, H = 0x100, WORK = 0x200, OUT = 0x10000, ARGS = 0x20,
+        FILE_EA = 0x100000 };
+ 
++static const u8* stream_source;
++static u32 stream_bytes, stream_refills;
++
++static void refill(void)
++{
++    assert(cellAtracGetStreamDataInfo(H, ARGS + 12, ARGS + 16, ARGS + 20) == CELL_OK);
++    u32 ea = vm_read32(ARGS + 12), n = vm_read32(ARGS + 16), at = vm_read32(ARGS + 20);
++    assert(ea >= FILE_EA && ea + n <= FILE_EA + 102400);
++    assert(at <= stream_bytes && n <= stream_bytes - at);
++    assert(n > 0);
++    /* Deliberately split compressed frames and wrap the guest staging ring. */
++    if (n > 1493) n = 1493;
++    memcpy(vm_base + ea, stream_source + at, n);
++    assert(cellAtracAddStreamData(H, n) == CELL_OK);
++    stream_refills++;
++}
++
+ static u32 rd32(u32 ea) { return vm_read32(ea); }
+ 
+ /* Decodes until finished; returns interleaved host floats (caller frees). */
+@@ -50,6 +67,14 @@ static float* decode_all(u32 ch, s32 loops, u32* samples)
+     for (;;) {
+         s32 rc = cellAtracDecode(H, OUT, ARGS, ARGS + 4, ARGS + 8);
+         if (rc == (s32)CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED) break;
++        if (rc == (s32)CELL_ATRAC_ERROR_NODATA_IN_BUFFER && stream_source) {
++            assert(rd32(ARGS) == 0 && rd32(ARGS + 4) == 0);
++            const s32 pos = slot_of(H)->pos, frame = slot_of(H)->next_frame;
++            assert(cellAtracDecode(H, OUT, ARGS, ARGS + 4, ARGS + 8) == rc);
++            assert(slot_of(H)->pos == pos && slot_of(H)->next_frame == frame);
++            refill();
++            continue;
++        }
+         assert(rc == CELL_OK);
+         const u32 got = rd32(ARGS);
+         assert(got <= 2048);
+@@ -131,7 +156,82 @@ int main(int argc, char** argv)
+         }
+         fclose(w);
+     }
++    assert(cellAtracDeleteDecoder(H) == CELL_OK);
++    u8* source = malloc(bytes);
++    memcpy(source, vm_base + FILE_EA, bytes);
++    stream_source = source;
++    stream_bytes = bytes;
++    const u32 initial = bytes < 102400 ? bytes : 102400;
++    memset(vm_base + FILE_EA, 0xA5, bytes);
++    memcpy(vm_base + FILE_EA, source, initial);
++    assert(cellAtracSetDataAndGetMemSize(H, FILE_EA, initial, 102400, ARGS) == CELL_OK);
++    assert(cellAtracCreateDecoder(H, WORK, 0, 0) == CELL_OK);
++    assert(cellAtracIsSecondBufferNeeded(H) == 0);
++    assert(cellAtracAddStreamData(H, 102401) == (s32)(initial == bytes ?
++           CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY : CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG));
++    u32 ns;
++    float* streamed = decode_all(ch, 0, &ns);
++    assert(ns == n1 && memcmp(once, streamed, n1 * ch * sizeof(float)) == 0);
++    assert(cellAtracGetInternalErrorInfo(H, ARGS) == CELL_OK && rd32(ARGS) == 0);
++    printf("stream: %u refills, %u samples, identical to full-memory PCM; underrun retry PASS\n",
++           stream_refills, ns);
++    free(streamed);
++
++    if (t.loop_start >= 0) {
++        assert(cellAtracGetBufferInfoForResetting(H, 0, ARGS + 24) == CELL_OK);
++        assert(rd32(ARGS + 32) == 0); /* cached reset needs no file read */
++        assert(cellAtracResetPlayPosition(H, 0, 0) == CELL_OK);
++        const u32 old_refills = stream_refills;
++        streamed = decode_all(ch, 1, &ns);
++        const u32 lap = (u32)(t.loop_end - t.loop_start), head = (u32)(t.loop_start - t.first);
++        assert(ns == head + 2 * lap);
++        assert(stream_refills == old_refills);
++        double err = 0;
++        for (u32 i = 0; i < lap * ch; i++)
++            err = fmax(err, fabs(streamed[(head + lap) * ch + i] - streamed[head * ch + i]));
++        assert(err < 1e-3);
++        printf("stream loop/reset: %u samples, seam error %.2e; cached replay PASS\n", ns, err);
++        free(streamed);
++    }
++    assert(cellAtracDeleteDecoder(H) == CELL_OK);
++
++    /* Seek into data that has never been submitted. BufferInfo includes the
++     * preceding frame needed by decoder overlap; reset must not start at 0. */
++    memcpy(vm_base + FILE_EA, source, initial);
++    assert(cellAtracSetDataAndGetMemSize(H, FILE_EA, initial, 102400, ARGS) == CELL_OK);
++    assert(cellAtracCreateDecoder(H, WORK, 0, 0) == CELL_OK);
++    const u32 sample = fact0 * 9 / 10;
++    assert(cellAtracGetBufferInfoForResetting(H, sample, ARGS + 24) == CELL_OK);
++    const u32 ea = rd32(ARGS + 24), n = rd32(ARGS + 28), min = rd32(ARGS + 32), at = rd32(ARGS + 36);
++    assert(min > 0 && min <= n && n <= 102400 && at + n <= bytes);
++    assert(cellAtracResetPlayPosition(H, sample, 0) == (s32)CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE);
++    memcpy(vm_base + ea, source + at, n);
++    assert(cellAtracResetPlayPosition(H, sample, n) == CELL_OK);
++    streamed = decode_all(ch, 0, &ns);
++    assert(ns == fact0 - sample);
++    double seek_err = 0;
++    for (u32 i = 2048 * ch; i < ns * ch; i++)
++        seek_err = fmax(seek_err, fabs(streamed[i] - once[sample * ch + i]));
++    assert(seek_err < 1e-3);
++    printf("uncached seek: %u samples, post-preroll error %.2e PASS\n", ns, seek_err);
++    free(streamed);
++    if (t.loop_start == t.first && t.loop_end == t.end) {
++        assert(cellAtracResetPlayPosition(H, sample, 0) == CELL_OK);
++        const u32 before = stream_refills;
++        streamed = decode_all(ch, 1, &ns);
++        assert(ns == fact0 - sample + fact0 && stream_refills > before);
++        double err = 0;
++        for (u32 i = 2048 * ch; i < fact0 * ch; i++)
++            err = fmax(err, fabs(streamed[(fact0 - sample) * ch + i] - once[i]));
++        assert(err < 1e-3);
++        printf("loop after seek: uncached gap refilled (%u calls), error %.2e PASS\n",
++               stream_refills - before, err);
++        free(streamed);
++    }
++    assert(cellAtracDeleteDecoder(H) == CELL_OK);
++    free(source);
+     free(once);
++    free(vm_base);
+     puts("ok");
+     return 0;
+ }
+diff --git a/third_party/at3_standalone/README.txt b/third_party/at3_standalone/README.txt
+index 5acc566..3d416b4 100644
+--- a/third_party/at3_standalone/README.txt
++++ b/third_party/at3_standalone/README.txt
+@@ -4,7 +4,8 @@ ps3recomp: vendored from PPSSPP ext/at3_standalone at commit
+ ebc151f8f28beca7c07c9ec5d183fc6171c4a1fc, unmodified except that aac_defines.h
+ (unused) and PPSSPP's CMakeLists.txt were dropped. ppsspp_config.h and
+ Common/*.h are small shims standing in for PPSSPP headers; at3_bridge.* is a
+-C interface for libs/codec/cellAtrac.c.
++C interface for libs/codec/cellAtrac.c, with padded packets and synchronization
++for the decoder's global tables.
+ 
+ The decoder sources are LGPL-2.1-or-later (see COPYING.LGPLv2.1 and the
+ headers of each file). They are kept in this directory as a separable
+diff --git a/third_party/at3_standalone/at3_bridge.cpp b/third_party/at3_standalone/at3_bridge.cpp
+index 519a0dd..c518ceb 100644
+--- a/third_party/at3_standalone/at3_bridge.cpp
++++ b/third_party/at3_standalone/at3_bridge.cpp
+@@ -1,13 +1,33 @@
+ /* See at3_bridge.h. */
+ #include "at3_bridge.h"
+ #include "at3_decoders.h"
++#include <mutex>
++#include <shared_mutex>
++#include <vector>
++#include <cstring>
+ 
+-extern "C" void* at3p_open(int channels, int* block_align) { return atrac3p_alloc(channels, block_align); }
++/* Allocation rebuilds global VLC/DSP/FFT tables in the standalone decoder.
++ * Keep it exclusive with both other allocations and in-flight decodes. */
++static std::shared_mutex s_at3p_tables;
++
++extern "C" void* at3p_open(int channels, int* block_align)
++{
++    std::unique_lock<std::shared_mutex> lock(s_at3p_tables);
++    return atrac3p_alloc(channels, block_align);
++}
+ extern "C" void  at3p_close(void* dec) { atrac3p_free((ATRAC3PContext*)dec); }
+ extern "C" void  at3p_flush(void* dec) { atrac3p_flush_buffers((ATRAC3PContext*)dec); }
+ extern "C" int   at3p_decode(void* dec, float* left, float* right, int* samples,
+                              const uint8_t* frame, int frame_bytes)
+ {
++    std::shared_lock<std::shared_mutex> lock(s_at3p_tables);
++    /* The FFmpeg bit reader requires zero padding after every packet, even
++     * when a caller's frame is the last bytes of an allocation. */
++    if (frame_bytes <= 0) return -1;
++    thread_local std::vector<uint8_t> packet;
++    packet.resize((size_t)frame_bytes + 64);
++    std::memcpy(packet.data(), frame, (size_t)frame_bytes);
++    std::memset(packet.data() + frame_bytes, 0, 64);
+     float* out[2] = { left, right };
+-    return atrac3p_decode_frame((ATRAC3PContext*)dec, out, samples, frame, frame_bytes);
++    return atrac3p_decode_frame((ATRAC3PContext*)dec, out, samples, packet.data(), frame_bytes);
+ }
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -188,6 +188,8 @@
+     }
+ 
+     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
++    printf("[cellAudio] SDL output driver=%s rate=%d channels=%u format=0x%04X\n",
++           SDL_GetCurrentAudioDriver(), have.freq, have.channels, have.format);
+     return 0;
+ }
+ 
+@@ -202,8 +204,11 @@
+ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+ {
+     if (s_sdl_audio_dev) {
+-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
+-                       num_samples * 2 * sizeof(float));
++        if (SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
++                          num_samples * 2 * sizeof(float)) < 0) {
++            static int warned;
++            if (!warned++) fprintf(stderr, "[cellAudio] SDL_QueueAudio failed: %s\n", SDL_GetError());
++        }
+     }
+ }
+ 
+@@ -595,6 +600,40 @@
+     return 0;
+ }
+ #else
++/* Match the existing Windows diagnostics on POSIX, including macOS. */
++static void audio_trace_block(u64 blocks, u64 base_ns)
++{
++    static int peak = -1, rate, silent;
++    static FILE* wav;
++    static u64 last_ns, count;
++    if (peak < 0) {
++        peak = getenv("AUDIO_PEAK") != NULL;
++        rate = getenv("AUDIO_RATE") != NULL;
++        const char* path = getenv("AUDIO_WAV");
++        wav = path ? fopen(path, "wb") : NULL;
++        last_ns = base_ns;
++    }
++    if (peak || rate) {
++        float pk = 0;
++        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
++            pk = fmaxf(pk, fabsf(s_mix_buffer[i]));
++        if (peak && (blocks % 200 == 0 || (pk > 0.001f && blocks < 40)))
++            fprintf(stderr, "[audio-peak] block#%llu peak=%.4f\n", (unsigned long long)blocks, pk);
++        count++;
++        if (pk == 0) silent++;
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        const u64 now = (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
++        if (rate && now - last_ns >= 5000000000ULL) {
++            fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%\n",
++                    count * 1000000000.0 / (now - last_ns), 100.0 * silent / count);
++            count = silent = 0;
++            last_ns = now;
++        }
++    }
++    if (wav) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wav);
++}
++
+ static void* audio_mix_thread_func(void* arg)
+ {
+     (void)arg;
+@@ -617,6 +656,7 @@
+         }
+         blocks++;
+         audio_mix_one_block();
++        audio_trace_block(blocks, base_ns);
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+         audio_notify_event_queues();
+     }

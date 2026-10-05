@@ -1,0 +1,1383 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -87,6 +87,11 @@
+     ${HLE_SOURCES}
+     ${RUNTIME_SOURCES}
+ )
++
++if(NOT WIN32)
++    find_package(Iconv REQUIRED)
++    target_link_libraries(ps3recomp_runtime PRIVATE Iconv::Iconv)
++endif()
+ 
+ target_include_directories(ps3recomp_runtime PUBLIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+--- a/libs/font/cellL10n.c
++++ b/libs/font/cellL10n.c
+@@ -3,13 +3,20 @@
+  *
+  * Character encoding conversion using hand-rolled UTF codecs.
+  * Covers the common UTF-8/16/32 conversions that PS3 games rely on.
+- * Exotic encodings (Shift-JIS, EUC-JP, GB18030) return NOT_SUPPORTED
+- * unless a future CJK table is added.
++ * The firmware Shift-JIS string exports use CP932 through host codecs.
++ * Other exotic encodings still return NOT_SUPPORTED.
+  */
+ 
+ #include "cellL10n.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <errno.h>
++#include "../../runtime/ppu/ppu_memory.h"
++#ifndef _WIN32
++#include <iconv.h>
++#else
++#include <windows.h>
++#endif
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal UTF helpers
+@@ -551,3 +558,144 @@
+                           (u32)dst_code, dst, out_len, dst_len);
+     return rc;
+ }
++
++/* Firmware string converters take byte counts by reference (BE in guest
++ * memory), do not add a terminator, and allow dst=NULL to query the size.
++ * RPCS3 _L10nConvertStr leaves src_len unchanged, including on failure. */
++static const void* l10n_ptr(const void* p)
++{
++    uintptr_t ea = (uintptr_t)p;
++    return ea && ea < 0x100000000ull ? vm_base + (u32)ea : p;
++}
++static u32 l10n_length(const u32* p)
++{
++    return (uintptr_t)p < 0x100000000ull ? vm_read32((uintptr_t)p) : *p;
++}
++static void l10n_set_length(u32* p, u32 n)
++{
++    if ((uintptr_t)p < 0x100000000ull) vm_write32((uintptr_t)p, n);
++    else *p = n;
++}
++
++static s32 l10n_sjis_string(const u8* src, const u32* src_len,
++                            u8* dst, u32* dst_len, int to_utf8)
++{
++    if (!src || !src_len || !dst_len) return 1; /* SRCIllegal */
++    size_t remaining = l10n_length(src_len);
++    size_t capacity = dst ? l10n_length(dst_len) : 0;
++    char* input = (char*)l10n_ptr(src);
++    char* output = (char*)l10n_ptr(dst);
++    u32 written = 0;
++    s32 result = 0;
++#ifndef _WIN32
++    /* CP932, rather than strict JIS X 0208, includes the firmware's vendor
++     * extensions (and maps 0x5c to a backslash, as RPCS3 does). */
++    iconv_t converter = iconv_open(to_utf8 ? "UTF-8" : "CP932",
++                                   to_utf8 ? "CP932" : "UTF-8");
++    if (converter == (iconv_t)-1) return 3; /* ConverterUnknown */
++    do {
++        char scratch[256];
++        char* out = dst ? output : scratch;
++        size_t left = dst ? capacity : sizeof(scratch);
++        size_t before = left;
++        size_t rc = iconv(converter, &input, &remaining, &out, &left);
++        written += (u32)(before - left);
++        if (dst) { output = out; capacity = left; }
++        if (rc != (size_t)-1) break;
++        if (errno == E2BIG && !dst) continue;
++        result = errno == E2BIG ? 2 : 1; /* DSTExhausted / SRCIllegal */
++        break;
++    } while (remaining);
++    iconv_close(converter);
++#else
++    /* Convert one scalar at a time so partial results and short-buffer errors
++     * have the same semantics as iconv on POSIX. */
++    while (remaining) {
++        u32 cp;
++        int count = to_utf8 ? (IsDBCSLeadByteEx(932, (BYTE)*input) ? 2 : 1)
++                            : decode_utf8((u8*)input, (u32)remaining, &cp);
++        WCHAR wide[2];
++        if (!count || (size_t)count > remaining) { result = 1; break; }
++        int wn = MultiByteToWideChar(to_utf8 ? 932 : CP_UTF8,
++                                     MB_ERR_INVALID_CHARS, input, count, wide, 2);
++        char bytes[8]; BOOL substituted = FALSE;
++        int bn = wn ? WideCharToMultiByte(to_utf8 ? CP_UTF8 : 932,
++                       to_utf8 ? 0 : WC_NO_BEST_FIT_CHARS, wide, wn, bytes, 8,
++                       NULL, to_utf8 ? NULL : &substituted) : 0;
++        if (!bn || substituted) { result = 1; break; }
++        if (dst && capacity < (size_t)bn) { result = 2; break; }
++        if (dst) { memcpy(output, bytes, bn); output += bn; capacity -= bn; }
++        written += bn; input += count; remaining -= count;
++    }
++#endif
++    l10n_set_length(dst_len, written);
++    return result;
++}
++
++s32 SJISstoUTF8s(const u8* src, const u32* src_len, u8* dst, u32* dst_len)
++{
++    return l10n_sjis_string(src, src_len, dst, dst_len, 1);
++}
++
++s32 UTF8stoSJISs(const u8* src, const u32* src_len, u8* dst, u32* dst_len)
++{
++    return l10n_sjis_string(src, src_len, dst, dst_len, 0);
++}
++
++/* jstrchk returns a mask: ambiguous byte strings can fit several encodings.
++ * RPCS3 still returns UTF8 unconditionally; validate each candidate here. */
++s32 jstrchk(const u8* jstr)
++{
++    if (!jstr) return (1 << 17); /* ERROR */
++    const u8* str = (const u8*)l10n_ptr(jstr);
++    size_t len = strlen((const char*)str);
++    int ascii = 1, utf8 = 1, sjis = 1, euc = 1;
++    for (size_t i = 0; i < len; i++) if (str[i] >= 0x80) { ascii = 0; break; }
++    /* ISO-2022-JP carries its encoding in escape sequences; those bytes are
++     * all ASCII, so check them before declaring a plain ASCII string. */
++    int jis = 1, escaped = 0, mode = 0;
++    for (size_t i = 0; i < len;) {
++        u8 c = str[i++];
++        if (c == 0x1b) {
++            if (i + 1 >= len) { jis = 0; break; }
++            u8 a = str[i++], b = str[i++];
++            if (a == '$' && (b == '@' || b == 'B')) mode = 1;
++            else if (a == '(' && (b == 'B' || b == 'J')) mode = 0;
++            else if (a == '(' && b == 'I') mode = 2;
++            else { jis = 0; break; }
++            escaped = 1;
++        } else if (mode == 1) {
++            if (c < 0x21 || c > 0x7e || i >= len || str[i] < 0x21 || str[i] > 0x7e) {
++                jis = 0; break;
++            }
++            i++;
++        } else if (mode == 2) {
++            if (c < 0x21 || c > 0x5f) { jis = 0; break; }
++        } else if (c >= 0x80) { jis = 0; break; }
++    }
++    if (escaped && jis) return (1 << 2); /* JIS */
++    if (ascii) return (1 << 1); /* ASCII */
++    for (size_t i = 0; i < len;) {
++        u32 cp; int n = decode_utf8(str + i, (u32)(len - i), &cp);
++        if (!n) { utf8 = 0; break; } i += n;
++    }
++    for (size_t i = 0; i < len; i++) {
++        u8 c = str[i];
++        if (c < 0x80 || (c >= 0xa1 && c <= 0xdf)) continue;
++        if (!((c >= 0x81 && c <= 0x9f) || (c >= 0xe0 && c <= 0xfc)) || ++i >= len ||
++            !((str[i] >= 0x40 && str[i] <= 0x7e) || (str[i] >= 0x80 && str[i] <= 0xfc))) {
++            sjis = 0; break;
++        }
++    }
++    for (size_t i = 0; i < len; i++) {
++        u8 c = str[i];
++        if (c < 0x80) continue;
++        int n = c == 0x8f ? 2 : 1;
++        u8 hi = c == 0x8e ? 0xdf : 0xfe;
++        if (!(c == 0x8e || c == 0x8f || (c >= 0xa1 && c <= 0xfe))) { euc = 0; break; }
++        while (n--) if (++i >= len || str[i] < 0xa1 || str[i] > hi) { euc = 0; break; }
++        if (!euc) break;
++    }
++    s32 mask = (utf8 ? 1 << 5 : 0) | (sjis ? 1 << 4 : 0) | (euc ? 1 << 3 : 0);
++    return mask ? mask : (1 << 16); /* ILLEGAL */
++}
+--- a/libs/font/cellL10n.h
++++ b/libs/font/cellL10n.h
+@@ -108,6 +108,10 @@
+ s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,
+                      s32 dst_code, void* dst, u32* dst_len);
+ 
++s32 SJISstoUTF8s(const u8* src, const u32* src_len, u8* dst, u32* dst_len);
++s32 UTF8stoSJISs(const u8* src, const u32* src_len, u8* dst, u32* dst_len);
++s32 jstrchk(const u8* jstr);
++
+ /* Single codepoint length in UTF-8 */
+ s32 UTF8Len(const u8* utf8);
+ /* Single codepoint length in UTF-16 */
+--- a/libs/misc/cellGameExec.c
++++ b/libs/misc/cellGameExec.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "cellGameExec.h"
++#include "../system/cellGame.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 -- guest addrs */
+ #include <stdio.h>
+ #include <string.h>
+@@ -68,6 +69,13 @@
+     exit(0);
+ }
+ 
++s32 cellGameGetHomeDataExportPath(char* exportPath)
++{
++    /* PlayStation Home is not installed in the native runtime. RPCS3 also
++     * reports NOAPP, leaving the output untouched. */
++    return exportPath ? CELL_GAME_ERROR_NOAPP : CELL_GAME_ERROR_PARAM;
++}
++
+ s32 cellGameGetBootGameInfo(u32* type, char* dirName, u32* execData)
+ {
+     printf("[cellGameExec] GetBootGameInfo() -> DISC\n");
+--- a/libs/misc/cellGameExec.h
++++ b/libs/misc/cellGameExec.h
+@@ -48,6 +48,7 @@
+ void cellGameExitToShelf(void);
+ 
+ /* Get boot information */
++s32 cellGameGetHomeDataExportPath(char* exportPath);
+ s32 cellGameGetBootGameInfo(u32* type, char* dirName, u32* execData);
+ 
+ #ifdef __cplusplus
+--- a/libs/network/sceNpTrophy.c
++++ b/libs/network/sceNpTrophy.c
+@@ -53,6 +53,7 @@
+ 
+ typedef struct {
+     int in_use;
++    int aborted;
+ } TrophyHandle;
+ 
+ /* ID zero is the firmware invalid sentinel; retain all four usable slots. */
+@@ -269,6 +270,7 @@
+     for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_HANDLES; i++) {
+         if (!s_handles[i].in_use) {
+             s_handles[i].in_use = 1;
++            s_handles[i].aborted = 0;
+             vm_write32(GUEST_EA(handle), (u32)i);
+             printf("[sceNpTrophy] CreateHandle() -> handle=%d\n", i);
+             return CELL_OK;
+@@ -289,6 +291,24 @@
+ 
+     s_handles[handle].in_use = 0;
+     printf("[sceNpTrophy] DestroyHandle(handle=%d)\n", handle);
++    return CELL_OK;
++}
++
++static s32 trophy_handle_check(SceNpTrophyHandle handle)
++{
++    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
++        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
++    if (s_handles[handle].aborted) return SCE_NP_TROPHY_ERROR_ABORT;
++    return CELL_OK;
++}
++
++s32 sceNpTrophyAbortHandle(SceNpTrophyHandle handle)
++{
++    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
++        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
++    s_handles[handle].aborted = 1;
+     return CELL_OK;
+ }
+ 
+@@ -298,6 +318,9 @@
+                                u32 arg,
+                                u64 options)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)options;
+ 
+     if (!s_trophy_initialized)
+@@ -333,6 +356,10 @@
+     if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+     if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+     if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
++    if (s_handles[handle].aborted) {
++        s_contexts[context].registered = 0;
++        return SCE_NP_TROPHY_ERROR_ABORT;
++    }
+     const u64 completion[8] = {(u32)context, SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
+                                0, 0, arg, 0, 0, 0};
+     if (cellSysutilQueueGuestCallbackArgs(statusCb, completion) != CELL_OK) {
+@@ -347,6 +374,9 @@
+                                     SceNpTrophyHandle handle,
+                                     u64* reqSpace, u64 options)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)handle; (void)options;
+ 
+     if (!s_trophy_initialized)
+@@ -377,6 +407,9 @@
+                            SceNpTrophyGameDetails* details,
+                            SceNpTrophyGameData* data)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)handle;
+ 
+     if (!s_trophy_initialized)
+@@ -425,6 +458,9 @@
+                              SceNpTrophyDetails* details,
+                              SceNpTrophyData* data)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)handle;
+ 
+     if (!s_trophy_initialized)
+@@ -468,6 +504,9 @@
+                             SceNpTrophyId trophyId,
+                             SceNpTrophyId* platinumId)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)handle;
+ 
+     if (!s_trophy_initialized)
+@@ -514,6 +553,9 @@
+                                     SceNpTrophyFlagArray* flags,
+                                     u32* count)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)handle;
+ 
+     if (!s_trophy_initialized)
+@@ -549,6 +591,9 @@
+                                SceNpTrophyHandle handle,
+                                s32* percentage)
+ {
++    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    s32 handle_error = trophy_handle_check(handle);
++    if (handle_error) return handle_error;
+     (void)handle;
+ 
+     if (!s_trophy_initialized)
+--- a/libs/network/sceNpTrophy.h
++++ b/libs/network/sceNpTrophy.h
+@@ -118,6 +118,7 @@
+ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context);
+ 
+ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle);
++s32 sceNpTrophyAbortHandle(SceNpTrophyHandle handle);
+ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle);
+ 
+ /* Real ABI: (context, handle, statusCb, arg, options).  statusCb is a guest
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -313,6 +313,15 @@
+ /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
+ const char* cellGame_get_title_id(void) { return s_title_id; }
+ 
++s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved)
++{
++    (void)size; (void)reserved;
++    /* This runtime currently boots disc applications. A disc (SFO category
++     * DG) is not a patch (GD); do not create a content-permission session or
++     * touch size on this error, matching RPCS3. */
++    return CELL_GAME_ERROR_NOTPATCH;
++}
++
+ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+                        char* dirName)
+ {
+--- a/libs/system/cellGame.h
++++ b/libs/system/cellGame.h
+@@ -144,6 +144,7 @@
+  * Functions
+  * -----------------------------------------------------------------------*/
+ 
++s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved);
+ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+                        char* dirName);
+ 
+--- a/libs/system/cellMsgDialog.c
++++ b/libs/system/cellMsgDialog.c
+@@ -25,8 +25,9 @@
+ 
+ static const char* guest_str(const void* p)
+ {
+-    uint32_t ea = (uint32_t)(uintptr_t)p;
+-    return (ea && vm_base) ? (const char*)(vm_base + ea) : "<null>";
++    uintptr_t ea = (uintptr_t)p;
++    if (ea >= 0x100000000ull) return (const char*)p;
++    return (ea && vm_base) ? (const char*)(vm_base + (u32)ea) : "<null>";
+ }
+ 
+ /* Do not run a completion before Open2 returns: games establish their
+@@ -262,6 +263,17 @@
+     return cellMsgDialogOpen2(type, msgString, callback, userdata, extParam);
+ }
+ 
++s32 cellMsgDialogOpenErrorCode(u32 errorCode, CellMsgDialogCallback callback,
++                                void* userdata, void* extParam)
++{
++    if (s_dialog_open) return (s32)0x8002b105; /* SYSUTIL_ERROR_BUSY */
++    char message[80];
++    snprintf(message, sizeof message, "An error has occurred. (0x%08X)", errorCode);
++    return cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_SE_TYPE_ERROR |
++                              CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK,
++                              message, callback, userdata, extParam);
++}
++
+ s32 cellMsgDialogClose(float delayMs)
+ {
+     printf("[cellMsgDialog] Close(delay=%.1f ms)\n", delayMs);
+--- a/libs/system/cellMsgDialog.h
++++ b/libs/system/cellMsgDialog.h
+@@ -67,6 +67,9 @@
+                         CellMsgDialogCallback callback, void* userdata,
+                         void* extParam);
+ 
++s32 cellMsgDialogOpenErrorCode(u32 errorCode, CellMsgDialogCallback callback,
++                                void* userdata, void* extParam);
++
+ s32 cellMsgDialogClose(float delayMs);
+ 
+ s32 cellMsgDialogAbort(void);
+--- a/libs/system/cellRtc.c
++++ b/libs/system/cellRtc.c
+@@ -338,6 +338,13 @@
+         return CELL_EINVAL;
+ 
+     rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)(iAdd * (s64)USEC_PER_SEC));
++    return CELL_OK;
++}
++
++s32 cellRtcTickAddTicks(CellRtcTick* out, const CellRtcTick* in, s64 add)
++{
++    if (!out || !in) return (s32)0x80010602; /* INVALID_POINTER */
++    rtc_tick_write(out, rtc_tick_read(in) + (u64)add);
+     return CELL_OK;
+ }
+ 
+--- a/libs/system/cellRtc.h
++++ b/libs/system/cellRtc.h
+@@ -66,6 +66,7 @@
+ s32 cellRtcTickAddHours(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
+ s32 cellRtcTickAddMinutes(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
+ s32 cellRtcTickAddSeconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iAdd);
++s32 cellRtcTickAddTicks(CellRtcTick* out, const CellRtcTick* in, s64 add);
+ s32 cellRtcTickAddMicroseconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iAdd);
+ 
+ s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUtc);
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -17,6 +17,12 @@
+ #include "../../libs/filesystem/edat.h"
+ #include "ps3emu/nid.h"      /* ps3_compute_nid */
+ #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
++#include "../prx/prx_loader.h"
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -762,43 +768,187 @@
+  * done", which is exactly true here. */
+ static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+ 
+-static void cellFsAioRead(ppu_context* ctx)
+-{
+-    uint32_t aio    = (uint32_t)ctx->gpr[3];
+-    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
++static bool fs_guest_range(uint32_t addr, uint64_t size)
++{
++    uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
++    return addr && addr < limit && size <= limit - addr;
++}
++#ifdef _WIN32
++#define HOST_FTELL64(f) _ftelli64(f)
++#define HOST_FILE_LOCK(f) _lock_file(f)
++#define HOST_FILE_UNLOCK(f) _unlock_file(f)
++#else
++#define HOST_FTELL64(f) ftello(f)
++#define HOST_FILE_LOCK(f) flockfile(f)
++#define HOST_FILE_UNLOCK(f) funlockfile(f)
++#endif
++
++/* AIO writes complete on a host worker, not inside the submitting guest
++ * call. The OPD bridge gives host callback threads their own guest stack. */
++class FsAioWriteCompletions {
++    struct Completion { uint32_t opd, aio; int32_t error, id; uint64_t size; };
++    std::mutex lock;
++    std::condition_variable ready;
++    std::deque<Completion> pending;
++    bool stop = false;
++    std::thread worker;
++public:
++    FsAioWriteCompletions() : worker([this] {
++        std::unique_lock<std::mutex> guard(lock);
++        for (;;) {
++            ready.wait(guard, [this] { return stop || !pending.empty(); });
++            if (pending.empty() && stop) return;
++            Completion c = pending.front(); pending.pop_front();
++            guard.unlock();
++            ps3_invoke_guest(c.opd, c.aio, (uint64_t)(int64_t)c.error,
++                             (uint64_t)(int64_t)c.id, c.size, 0, 0, 0, 0);
++            guard.lock();
++        }
++    }) {}
++    ~FsAioWriteCompletions()
++    {
++        { std::lock_guard<std::mutex> guard(lock); stop = true; }
++        ready.notify_one(); worker.join();
++    }
++    void submit(uint32_t opd, uint32_t aio, int32_t error, int32_t id, uint64_t size)
++    {
++        { std::lock_guard<std::mutex> guard(lock); pending.push_back({opd, aio, error, id, size}); }
++        ready.notify_one();
++    }
++};
++
++static void cellFsAioTransfer(ppu_context* ctx, bool write)
++{
++    uint32_t aio = (uint32_t)ctx->gpr[3], id_ptr = (uint32_t)ctx->gpr[4];
+     uint32_t cb_opd = (uint32_t)ctx->gpr[5];
+-
+-    int      fd     = (int)guest_be32(aio + 0x00);
+-    uint64_t offset = guest_be64(aio + 0x08);
+-    uint32_t buf    = guest_be32(aio + 0x10);
+-    uint64_t size   = guest_be64(aio + 0x18);
+-
+-    static int32_t s_next_id = 1;
+-    int32_t id = s_next_id++;
+-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
+-
++    if (!fs_guest_range(aio, 0x28) || !fs_guest_range(id_ptr, 4)) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000d; return;
++    }
++    int fd = (int)guest_be32(aio);
++    uint64_t offset = guest_be64(aio + 8), size = guest_be64(aio + 0x18);
++    uint32_t buf = guest_be32(aio + 0x10);
++    static std::atomic<int32_t> next_id{1};
++    int32_t id = next_id.fetch_add(1, std::memory_order_relaxed);
++    vm_write32(id_ptr, (uint32_t)id);
+     size_t n = 0;
+-    int32_t err = CELL_FS_ENOENT;
+-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
++    int32_t err = (int32_t)0x8001002a; /* EBADF */
++    if (size && !fs_guest_range(buf, size)) err = (int32_t)0x8001000d;
++    else if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
++        FILE* f = g_files[fd];
+         fs_prefault(buf, size);
+-        /* AIO reads are absolute -- they do not disturb the fd's own file
+-         * position, and the guest interleaves them freely across threads. */
+-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
+-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+-        err = CELL_OK;
++        HOST_FILE_LOCK(f);
++        auto old = HOST_FTELL64(f);
++        clearerr(f); errno = 0;
++        if (offset <= INT64_MAX && HOST_FSEEK64(f, offset) == 0) {
++            n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
++                      : fread(vm_base + buf, 1, (size_t)size, f);
++            err = ferror(f) ? (errno == EBADF ? (int32_t)0x8001002a : CELL_FS_EIO) : CELL_OK;
++            if (write && fflush(f)) err = CELL_FS_EIO;
++        } else err = CELL_FS_EIO;
++        if (old >= 0) HOST_FSEEK64(f, old);
++        HOST_FILE_UNLOCK(f);
+     }
+     if (getenv("PS3_FSLOG"))
+-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
+-
+-    ctx->gpr[3] = CELL_OK;
+-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
++        fprintf(stderr, "[fs] aio %s id=%d fd=%d off=%llu size=%llu -> %zu error=0x%08X\n",
++                write ? "write" : "read", id, fd, (unsigned long long)offset,
++                (unsigned long long)size, n, (uint32_t)err);
++    ctx->gpr[3] = CELL_OK;
++    if (cb_opd && write) {
++        static FsAioWriteCompletions completions;
++        completions.submit(cb_opd, aio, err, id, n);
++    } else if (cb_opd) {
++        /* Preserve the existing AioRead callback ordering for ports that
++         * already rely on it. Both paths report actual bytes and errors. */
++        ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
++                         (uint64_t)(int64_t)id, n, 0, 0, 0, 0);
++        ctx->gpr[3] = CELL_OK;
++    }
++}
++static void cellFsAioRead(ppu_context* ctx) { cellFsAioTransfer(ctx, false); }
++static void cellFsAioWrite(ppu_context* ctx) { cellFsAioTransfer(ctx, true); }
++
++static void cellFsSdataOpenByFd(ppu_context* ctx)
++{
++    int fd = (int)(uint32_t)ctx->gpr[3];
++    uint32_t flags = (uint32_t)ctx->gpr[4], out = (uint32_t)ctx->gpr[5];
++    uint64_t offset = ctx->gpr[6];
++    int32_t err = (int32_t)0x8001000d; /* EFAULT */
++    if (!fs_guest_range(out, 4)) { ctx->gpr[3] = (uint64_t)(int64_t)err; return; }
++    vm_write32(out, UINT32_MAX);
++    err = (int32_t)0x8001002a; /* EBADF */
++    if (fd >= 3 && fd < FS_MAX && g_files[fd]) {
++        err = flags ? (int32_t)0x80010002 : (int32_t)0x80010038; /* EINVAL / EFSSPECIFIC */
++        if (!flags) {
++            FILE* f = g_files[fd];
++            HOST_FILE_LOCK(f);
++            auto old = HOST_FTELL64(f);
++#ifdef _WIN32
++            _fseeki64(f, 0, SEEK_END);
++#else
++            fseeko(f, 0, SEEK_END);
++#endif
++            auto end = HOST_FTELL64(f);
++            size_t len = end > 0 && offset < (uint64_t)end ? (size_t)((uint64_t)end - offset) : 0;
++            uint8_t* enc = len ? (uint8_t*)malloc(len) : nullptr;
++            size_t got = enc && offset <= INT64_MAX && !HOST_FSEEK64(f, offset)
++                       ? fread(enc, 1, len, f) : 0;
++            if (old >= 0) HOST_FSEEK64(f, old);
++            HOST_FILE_UNLOCK(f);
++            size_t plain_len = 0;
++            uint8_t* plain = enc && got == len ? sdata_decrypt(enc, len, &plain_len) : nullptr;
++            free(enc);
++            if (plain) {
++                FILE* view = tmpfile();
++                err = CELL_FS_EIO;
++                if (view && fwrite(plain, 1, plain_len, view) == plain_len) {
++                    rewind(view);
++                    int result = fd_alloc_file(view);
++                    if (result >= 0) {
++                        vm_write32(out, (uint32_t)result);
++                        snprintf(g_fd_path[result], sizeof g_fd_path[result], "%s", g_fd_path[fd]);
++                        err = CELL_OK; view = nullptr;
++                    } else err = (int32_t)0x8001002c; /* EMFILE */
++                }
++                if (view) fclose(view);
++                free(plain);
++            }
++        }
++    }
++    ctx->gpr[3] = (uint64_t)(int64_t)err;
++}
++
++/* Native PRXs must be lifted ahead of time. Return a real id only when that
++ * module is already resident; do not claim to have loaded uncompiled code. */
++static void hle_prx_load_path(ppu_context* ctx)
++{
++    uint32_t ea = (uint32_t)ctx->gpr[3];
++    if (!fs_guest_range(ea, 1)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000d; return; }
++    const char* path = (const char*)(vm_base + ea);
++    uint32_t id = prx_loaded_module_id(path);
++    if (id) { ctx->gpr[3] = id; return; }
++    char host[1200]; host_path(host, sizeof host, path);
++    FILE* f = fopen(host, "rb");
++    if (f) fclose(f);
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)(f ? 0x80011148 : 0x80010006);
++}
++static void hle_prx_load_fd(ppu_context* ctx)
++{
++    int fd = (int)(uint32_t)ctx->gpr[3];
++    if (fd < 3 || fd >= FS_MAX || !g_files[fd]) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001002a; return;
++    }
++    uint32_t id = ctx->gpr[4] ? 0 : prx_loaded_module_id(g_fd_path[fd]);
++    ctx->gpr[3] = id ? id : (uint64_t)(int64_t)(int32_t)0x80011148;
+ }
+ 
+ extern "C" void ppu_fs_register(void)
+ {
++    ps3_hle_register_ctx(0x26090058u, "sys_prx_load_module", hle_prx_load_path);
++    ps3_hle_register_ctx(0xAA6D9BFFu, "sys_prx_load_module_on_memcontainer", hle_prx_load_path);
++    ps3_hle_register_ctx(0xEF68C17Cu, "sys_prx_load_module_by_fd", hle_prx_load_fd);
++    ps3_hle_register_ctx(0xA330AD84u, "sys_prx_load_module_on_memcontainer_by_fd", hle_prx_load_fd);
++    ps3_hle_register_ctx(0x6D3BB15Bu, "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
++    ps3_hle_register_ctx(0x4CEF342Eu, "cellFsAioWrite", cellFsAioWrite);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+     /* Register by the literal import NID: LBP imports 0xB1840B53 for
+      * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -31,6 +31,7 @@
+ #endif
+ 
+ #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
++#include "../ps3_log.h"
+ #include "ppu_recomp.h"
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+ #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
+@@ -1522,6 +1523,13 @@
+     fflush(stderr);
+ }
+ 
++static int ppu_spinbt_enabled(void)
++{
++    static PPU_THREAD_LOCAL int enabled = -1;
++    if (enabled < 0) enabled = getenv("PPU_SPINBT") != nullptr;
++    return enabled;
++}
++
+ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
+ #ifdef VM_SAMPLE_READS
+@@ -1550,17 +1558,17 @@
+      * Every width shares one window so a byte-at-a-time strcmp is caught as
+      * readily as a word load. */
+     ppu_rwatch_hit((uint32_t)a, 1, __builtin_return_address(0));
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++    if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) {
+-          fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
++          if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
+                   (uint32_t)a, vm_base[(uint32_t)a], GetCurrentThreadId(),
+                   ppu_prof_resolve_host(__builtin_return_address(0)));
+           n=0; } }
+       else { last=(uint32_t)a; n=0; } }
+     return vm_base[(uint32_t)a]; }
+ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
++    if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++      if ((uint32_t)a==last) { if (++n==200000) { if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
+     return __builtin_bswap16(v); }
+ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+@@ -1641,8 +1649,8 @@
+           for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
+     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
+      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+-      if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == (VM_HLE_INJECT_BASE + 0x2000u)) {
++    if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++      if ((uint32_t)a==last) { if (++n==200000) { if (ps3_log_hotread()) { if (((uint32_t)a & ~0xFFFu) == (VM_HLE_INJECT_BASE + 0x2000u)) {
+               /* A spin on the GCM control block is a fence/FIFO wait. Print the
+                * WHOLE block: put vs get says whether the RSX side is behind or
+                * whether the guest never submitted, which is the difference
+@@ -1658,7 +1666,7 @@
+               fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
+                       "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
+           } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
+-          g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
++          g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); } n=0;
+ #ifdef _WIN32
+         /* PPU_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
+          * is on the watched address -- names the guest function containing the
+@@ -1680,8 +1688,8 @@
+ #ifdef VM_SAMPLE_READS
+     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
+ #endif
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), ppu_prof_resolve_host(__builtin_return_address(0))); n=0;
++    if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++      if ((uint32_t)a==last) { if (++n==200000) { if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), ppu_prof_resolve_host(__builtin_return_address(0))); n=0;
+ #ifdef _WIN32
+         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
+           if(wa>=0 && (uint32_t)a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
+--- a/runtime/ppu/ppu_memory.h
++++ b/runtime/ppu/ppu_memory.h
+@@ -16,7 +16,17 @@
+ 
+ #include <stdint.h>
+ #include <string.h>
++/* C++20's <atomic> cannot coexist with Clang's C <stdatomic.h>. Keep
++ * atomics in the language's own namespace when HLE modules compile as C++. */
++#ifdef __cplusplus
++#include <atomic>
++#define PPU_MEM_ATOMIC(T) std::atomic<T>
++#define PPU_MEM_ATOMIC_FN(name) std::name
++#else
+ #include <stdatomic.h>
++#define PPU_MEM_ATOMIC(T) _Atomic(T)
++#define PPU_MEM_ATOMIC_FN(name) name
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -291,8 +301,8 @@
+ {
+     /* Read the current value from memory (big-endian, so swap). */
+     uint32_t raw;
+-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
+-    raw = atomic_load_explicit(atom, memory_order_acquire);
++    PPU_MEM_ATOMIC(uint32_t)* atom = (PPU_MEM_ATOMIC(uint32_t)*)vm_ptr32(addr);
++    raw = PPU_MEM_ATOMIC_FN(atomic_load_explicit)(atom, PPU_MEM_ATOMIC_FN(memory_order_acquire));
+ 
+     ctx->reserve_addr  = addr;
+     ctx->reserve_value = raw;
+@@ -312,7 +322,7 @@
+ 
+     uint32_t expected = (uint32_t)ctx->reserve_value;
+     uint32_t desired  = ps3_bswap32(val);
+-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
++    PPU_MEM_ATOMIC(uint32_t)* atom = (PPU_MEM_ATOMIC(uint32_t)*)vm_ptr32(addr);
+ 
+     /* On a line an SPU has reserved, commit under the lock-line lock and notify
+      * -- the same serialization the coherent stores above use, so a PPU commit
+@@ -321,15 +331,15 @@
+     int ok;
+     if (spu_coh_is_reserved(addr)) {
+         spu_lockline_lock();
+-        ok = atomic_compare_exchange_strong_explicit(
++        ok = PPU_MEM_ATOMIC_FN(atomic_compare_exchange_strong_explicit)(
+             atom, &expected, desired,
+-            memory_order_acq_rel, memory_order_acquire);
++            PPU_MEM_ATOMIC_FN(memory_order_acq_rel), PPU_MEM_ATOMIC_FN(memory_order_acquire));
+         if (ok) spu_coh_notify_write(addr);
+         spu_lockline_unlock();
+     } else {
+-        ok = atomic_compare_exchange_strong_explicit(
++        ok = PPU_MEM_ATOMIC_FN(atomic_compare_exchange_strong_explicit)(
+             atom, &expected, desired,
+-            memory_order_acq_rel, memory_order_acquire);
++            PPU_MEM_ATOMIC_FN(memory_order_acq_rel), PPU_MEM_ATOMIC_FN(memory_order_acquire));
+     }
+ 
+     ctx->reserve_valid = 0;
+@@ -345,8 +355,8 @@
+ /* 64-bit variants: ldarx / stdcx. */
+ static inline uint64_t ppu_ldarx(ppu_context* ctx, uint32_t addr)
+ {
+-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
+-    uint64_t raw = atomic_load_explicit(atom, memory_order_acquire);
++    PPU_MEM_ATOMIC(uint64_t)* atom = (PPU_MEM_ATOMIC(uint64_t)*)vm_ptr64(addr);
++    uint64_t raw = PPU_MEM_ATOMIC_FN(atomic_load_explicit)(atom, PPU_MEM_ATOMIC_FN(memory_order_acquire));
+ 
+     ctx->reserve_addr  = addr;
+     ctx->reserve_value = raw;
+@@ -365,20 +375,20 @@
+ 
+     uint64_t expected = ctx->reserve_value;
+     uint64_t desired  = ps3_bswap64(val);
+-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
++    PPU_MEM_ATOMIC(uint64_t)* atom = (PPU_MEM_ATOMIC(uint64_t)*)vm_ptr64(addr);
+ 
+     int ok;
+     if (spu_coh_is_reserved(addr)) {
+         spu_lockline_lock();
+-        ok = atomic_compare_exchange_strong_explicit(
++        ok = PPU_MEM_ATOMIC_FN(atomic_compare_exchange_strong_explicit)(
+             atom, &expected, desired,
+-            memory_order_acq_rel, memory_order_acquire);
++            PPU_MEM_ATOMIC_FN(memory_order_acq_rel), PPU_MEM_ATOMIC_FN(memory_order_acquire));
+         if (ok) spu_coh_notify_write(addr);
+         spu_lockline_unlock();
+     } else {
+-        ok = atomic_compare_exchange_strong_explicit(
++        ok = PPU_MEM_ATOMIC_FN(atomic_compare_exchange_strong_explicit)(
+             atom, &expected, desired,
+-            memory_order_acq_rel, memory_order_acquire);
++            PPU_MEM_ATOMIC_FN(memory_order_acq_rel), PPU_MEM_ATOMIC_FN(memory_order_acquire));
+     }
+ 
+     ctx->reserve_valid = 0;
+@@ -395,4 +405,7 @@
+ } /* extern "C" */
+ #endif
+ 
++#undef PPU_MEM_ATOMIC
++#undef PPU_MEM_ATOMIC_FN
++
+ #endif /* PPU_MEMORY_H */
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -16,9 +16,11 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <mutex>
+ /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
+  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
+ #include "../platform/win32_compat.h"
++#include "../prx/prx_loader.h"
+ #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+ 
+ extern "C" uint8_t* vm_base;
+@@ -464,6 +466,8 @@
+ {
+     /* Bump from a small scratch region below the main stack (0x0FF00000) and
+      * above the TLS image -- a few control structs, never freed. */
++    static std::mutex lock;
++    std::lock_guard<std::mutex> guard(lock);
+     static unsigned int bump = 0x0F800000u;
+     if (align < 16) align = 16;
+     bump = (bump + align - 1) & ~(align - 1);
+@@ -516,17 +520,69 @@
+  * _sys_net_errno_loc returns a POINTER the game dereferences. */
+ #define SYS_NET_EWOULDBLOCK_V 35
+ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+-static uint32_t g_net_errno_ea = 0;
++static thread_local uint32_t g_net_errno_ea = 0;
+ static void hle_net_errno_loc(ppu_context* ctx)
+ {
++    if (!g_net_errno_ea) {
++        g_net_errno_ea = gcm_guest_alloc(4, 4);
++        vm_write32(g_net_errno_ea, 0);
++    }
++    ctx->gpr[3] = g_net_errno_ea;
++}
++static void hle_net_error(ppu_context* ctx, uint32_t error)
++{
+     if (!g_net_errno_ea) g_net_errno_ea = gcm_guest_alloc(4, 4);
+-    vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
+-    ctx->gpr[3] = g_net_errno_ea;
++    vm_write32(g_net_errno_ea, error);
++    ctx->gpr[3] = (uint64_t)(int64_t)-1;
+ }
+ static void hle_net_wouldblock(ppu_context* ctx)
+ {
+-    if (g_net_errno_ea) vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
+-    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
++    hle_net_error(ctx, SYS_NET_EWOULDBLOCK_V);
++}
++static std::mutex s_net_lock;
++static struct { bool active, listening; uint32_t type; } s_net_sockets[256];
++static bool hle_net_valid(uint32_t fd)
++{
++    return fd >= 3 && fd < 256 && s_net_sockets[fd].active;
++}
++static void hle_net_listen(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> lock(s_net_lock);
++    uint32_t fd = (uint32_t)ctx->gpr[3];
++    if (!hle_net_valid(fd)) { hle_net_error(ctx, 9); return; } /* EBADF */
++    if (s_net_sockets[fd].type != 1) { hle_net_error(ctx, 45); return; } /* EOPNOTSUPP */
++    s_net_sockets[fd].listening = true;
++    ctx->gpr[3] = 0;
++}
++static void hle_net_accept(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> lock(s_net_lock);
++    uint32_t fd = (uint32_t)ctx->gpr[3];
++    if (!hle_net_valid(fd)) { hle_net_error(ctx, 9); return; }
++    if (!s_net_sockets[fd].listening) { hle_net_error(ctx, 22); return; }
++    hle_net_wouldblock(ctx); /* no offline clients; leave address outputs alone */
++}
++static void hle_net_send(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> lock(s_net_lock);
++    uint32_t fd = (uint32_t)ctx->gpr[3];
++    if (!hle_net_valid(fd)) { hle_net_error(ctx, 9); return; }
++    hle_net_error(ctx, s_net_sockets[fd].type == 2 ? 39 : 57); /* EDESTADDRREQ / ENOTCONN */
++}
++static void hle_net_shutdown(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> lock(s_net_lock);
++    uint32_t fd = (uint32_t)ctx->gpr[3];
++    if (!hle_net_valid(fd)) { hle_net_error(ctx, 9); return; }
++    hle_net_error(ctx, (uint32_t)ctx->gpr[4] > 2 ? 22 : 57); /* EINVAL / ENOTCONN */
++}
++static void hle_net_close(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> lock(s_net_lock);
++    uint32_t fd = (uint32_t)ctx->gpr[3];
++    if (!hle_net_valid(fd)) { hle_net_error(ctx, 9); return; }
++    s_net_sockets[fd] = {};
++    ctx->gpr[3] = 0;
+ }
+ static void hle_net_zero(ppu_context* ctx) { ctx->gpr[3] = 0; }
+ /* select/poll: nothing is ever ready offline -- but a real select BLOCKS for
+@@ -560,7 +616,18 @@
+ }
+ /* Distinct small fds: the unresolved default handed EVERY socket() call fd 0,
+  * making all sockets alias one id in the game's tables. */
+-static void hle_net_socket(ppu_context* ctx) { static uint32_t s_fd = 3; ctx->gpr[3] = s_fd++; }
++static void hle_net_socket(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> lock(s_net_lock);
++    uint32_t type = (uint32_t)ctx->gpr[4];
++    for (uint32_t fd = 3; fd < 256; fd++) {
++        if (!s_net_sockets[fd].active) {
++            s_net_sockets[fd] = {true, false, type};
++            ctx->gpr[3] = fd; return;
++        }
++    }
++    hle_net_error(ctx, 24); /* EMFILE */
++}
+ /* sendto: report the full length as sent (packets vanish into the void, matching
+  * the RPCS3-offline oracle where broadcasts go out and nothing answers). */
+ static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[5]; }
+@@ -833,8 +900,34 @@
+     _InterlockedExchange(spin_word(ea), 0);
+ }
+ 
++/* Library entries are 0x1c-byte BE export tables, as in RPCS3's
++ * ppu_manual_load_imports_exports. They refer to resident, lifted guest code. */
++static void hle_prx_register_library(ppu_context* ctx)
++{
++    uint32_t lib = (uint32_t)ctx->gpr[3];
++    extern uint32_t ppu_vm_size;
++    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
++    if (!lib || (uint64_t)lib + 0x1c > limit) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000d; return; /* EFAULT */
++    }
++    uint32_t count = ((uint32_t)vm_base[lib + 6] << 8) | vm_base[lib + 7];
++    uint32_t nids = vm_read32(lib + 20), opds = vm_read32(lib + 24);
++    if ((vm_base[lib] && vm_base[lib] < 0x1c) ||
++        (count && (!nids || !opds || (uint64_t)nids + count * 4 > limit ||
++                                    (uint64_t)opds + count * 4 > limit))) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001113d; return;
++    }
++    for (uint32_t i = 0; i < count; i++) {
++        if (!prx_register_export(vm_read32(nids + i * 4), vm_read32(opds + i * 4))) {
++            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004; return; /* ENOMEM */
++        }
++    }
++    ctx->gpr[3] = 0;
++}
++
+ extern "C" void ppu_sysprx_register(void)
+ {
++    ps3_hle_register_ctx(0x42B23552u, "sys_prx_register_library", hle_prx_register_library);
+     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
+     ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
+ 
+@@ -852,10 +945,14 @@
+     ps3_hle_register_ctx(0x3F09E20Au, "sys_net_bnet_select",    hle_net_select);
+     ps3_hle_register_ctx(0x139A9E9Bu, "netInitializeNetworkEx", hle_net_zero);   /* lib init ok */
+     ps3_hle_register_ctx(0x9C056962u, "netSocket",              hle_net_socket);
++    ps3_hle_register_ctx(0x28E208BBu, "listen", hle_net_listen);
++    ps3_hle_register_ctx(0xA50777C6u, "shutdown", hle_net_shutdown);
++    ps3_hle_register_ctx(0xC94F6939u, "accept", hle_net_accept);
++    ps3_hle_register_ctx(0xDC751B40u, "send", hle_net_send);
+     ps3_hle_register_ctx(0xB0A59804u, "netBind",                hle_net_zero);
+     ps3_hle_register_ctx(0x88F03575u, "netSetSockOpt",          hle_net_zero);
+     ps3_hle_register_ctx(0x9647570Bu, "netSendTo",              hle_net_sendto);
+-    ps3_hle_register_ctx(0x6DB6E8CDu, "netClose",               hle_net_zero);
++    ps3_hle_register_ctx(0x6DB6E8CDu, "netClose",               hle_net_close);
+     ps3_hle_register_ctx(0x71F4C717u, "netGetHostByName",       hle_net_zero);   /* NULL: DNS down */
+     ps3_hle_register_ctx(0xB68D5625u, "netFinalizeNetwork",     hle_net_zero);
+     ps3_hle_register_ctx(0xFDB8F926u, "netFreethreadContext",   hle_net_zero);
+--- a/runtime/prx/prx_loader.c
++++ b/runtime/prx/prx_loader.c
+@@ -9,6 +9,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdatomic.h>
+ 
+ /* The runtime's guest memory: host_ptr = vm_base + guest_addr. Declared by
+  * runtime/memory/vm.h; we only need the symbol, so extern it directly to keep
+@@ -19,36 +20,70 @@
+  * Flat NID -> guest-address table, filled as modules load. A handful of system
+  * PRXs export a few hundred symbols total, so a linear array with linear lookup
+  * is plenty (lookups happen once per import resolution, not per call). */
+-typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
++typedef struct { uint32_t nid; _Atomic(uint32_t) guest_addr; } prx_export_reg_entry;
+ #define PRX_EXPORT_REG_CAP 2048
+ static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
+-static uint32_t             s_export_reg_n = 0;
++static _Atomic(uint32_t)    s_export_reg_n = 0;
++static atomic_flag          s_export_lock = ATOMIC_FLAG_INIT;
+ 
+-static void prx_export_register(uint32_t nid, uint32_t guest_addr)
++int prx_register_export(uint32_t nid, uint32_t guest_addr)
+ {
+-    /* Last writer wins if two modules export the same NID (matches the PS3
+-     * loader's link order). Overwrite an existing entry rather than duplicate. */
+-    for (uint32_t i = 0; i < s_export_reg_n; i++) {
++    /* Registration can run after guest threads start. Publish new slots only
++     * after initialization; existing OPDs update atomically for readers. */
++    while (atomic_flag_test_and_set_explicit(&s_export_lock, memory_order_acquire)) {}
++    uint32_t count = atomic_load_explicit(&s_export_reg_n, memory_order_relaxed);
++    for (uint32_t i = 0; i < count; i++) {
+         if (s_export_reg[i].nid == nid) {
+-            s_export_reg[i].guest_addr = guest_addr;
+-            return;
++            atomic_store_explicit(&s_export_reg[i].guest_addr, guest_addr, memory_order_release);
++            atomic_flag_clear_explicit(&s_export_lock, memory_order_release);
++            return 1;
+         }
+     }
+-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
+-        s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
+-    else
+-        fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
++    if (count < PRX_EXPORT_REG_CAP) {
++        s_export_reg[count].nid = nid;
++        atomic_store_explicit(&s_export_reg[count].guest_addr, guest_addr, memory_order_relaxed);
++        atomic_store_explicit(&s_export_reg_n, count + 1, memory_order_release);
++        atomic_flag_clear_explicit(&s_export_lock, memory_order_release);
++        return 1;
++    }
++    atomic_flag_clear_explicit(&s_export_lock, memory_order_release);
++    fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
++    return 0;
+ }
+ 
+ uint32_t prx_resolve_export(uint32_t nid)
+ {
+-    for (uint32_t i = 0; i < s_export_reg_n; i++)
++    uint32_t count = atomic_load_explicit(&s_export_reg_n, memory_order_acquire);
++    for (uint32_t i = 0; i < count; i++)
+         if (s_export_reg[i].nid == nid)
+-            return s_export_reg[i].guest_addr;
++            return atomic_load_explicit(&s_export_reg[i].guest_addr, memory_order_acquire);
+     return 0;
+ }
+ 
+-uint32_t prx_export_registry_count(void) { return s_export_reg_n; }
++uint32_t prx_export_registry_count(void)
++{
++    return atomic_load_explicit(&s_export_reg_n, memory_order_acquire);
++}
++
++static struct { char name[128]; uint32_t id; } s_loaded[64];
++static uint32_t s_loaded_n;
++
++static void prx_module_name(const char* path, char* out, size_t cap)
++{
++    const char* name = strrchr(path, '/');
++    snprintf(out, cap, "%s", name ? name + 1 : path);
++    char* dot = strrchr(out, '.');
++    if (dot && (!strcmp(dot, ".sprx") || !strcmp(dot, ".prx"))) *dot = 0;
++}
++
++uint32_t prx_loaded_module_id(const char* path)
++{
++    if (!path) return 0;
++    char name[128]; prx_module_name(path, name, sizeof name);
++    for (uint32_t i = 0; i < s_loaded_n; i++)
++        if (!strcmp(name, s_loaded[i].name)) return s_loaded[i].id;
++    return 0;
++}
+ 
+ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
+ {
+@@ -97,11 +132,16 @@
+             const prx_export* e = &m->exports[i];
+             if (e->nid == 0)
+                 continue;
+-            prx_export_register(e->nid, m->base + e->vaddr);
++            prx_register_export(e->nid, m->base + e->vaddr);
+             exports_published++;
+         }
+     }
+ 
++    if (m->name && !prx_loaded_module_id(m->name) && s_loaded_n < 64) {
++        prx_module_name(m->name, s_loaded[s_loaded_n].name, sizeof s_loaded[0].name);
++        s_loaded[s_loaded_n].id = 0x23000000u + s_loaded_n;
++        s_loaded_n++;
++    }
+     r.ok = 1;
+     fprintf(stderr,
+             "[prx] loaded %-12s base=0x%08X size=%u (0x%X) funcs=%u/%llu exports=%u\n",
+--- a/runtime/prx/prx_loader.h
++++ b/runtime/prx/prx_loader.h
+@@ -111,6 +111,11 @@
+  */
+ uint32_t prx_resolve_export(uint32_t nid);
+ 
++/* Register an already-resident library export (absolute guest OPD). */
++int prx_register_export(uint32_t nid, uint32_t guest_addr);
++/* Positive module id for a pre-lifted, loaded PRX; zero if unavailable. */
++uint32_t prx_loaded_module_id(const char* path);
++
+ /* Number of exports currently registered (diagnostics/tests). */
+ uint32_t prx_export_registry_count(void);
+ 
+--- a/runtime/ps3_log.h
++++ b/runtime/ps3_log.h
+@@ -1,48 +1,40 @@
+-/* ps3_log.h -- gate for high-volume diagnostic logging.
+- *
+- * Chatty per-wait / per-round logs stay FULL when stderr is redirected
+- * (debug runs capture to a file) or PS3_VERBOSE is set, and go quiet on a
+- * live console: conhost flushes stall the emitting threads, and the ~20k
+- * [WAIT] lines/minute of an LBP intro run showed up as harsh ~1 Hz hitches
+- * in user-visible runs while file-redirected runs played smoothly.
+- */
++/* ps3_log.h -- opt-in high-volume diagnostics. PS3_VERBOSE=1 enables all
++ * streams; PS3_VERBOSE=0 keeps them quiet unless a stream is explicitly set. */
+ #ifndef PS3_LOG_H
+ #define PS3_LOG_H
+ 
+-#include <stdio.h>
+ #include <stdlib.h>
+-#ifdef _WIN32
+-#include <io.h>
+-#define PS3_ISATTY_STDERR() _isatty(_fileno(stderr))
++
++#ifdef _MSC_VER
++#define PS3_LOG_TLS __declspec(thread)
+ #else
+-#include <unistd.h>
+-#define PS3_ISATTY_STDERR() isatty(fileno(stderr))
++#define PS3_LOG_TLS __thread
+ #endif
+ 
+-#ifdef __cplusplus
+-static inline int ps3_log_verbose(void)
+-#else
+-static __inline int ps3_log_verbose(void)
+-#endif
+-{
+-    /* PS3_VERBOSE, when set, decides -- INCLUDING "0" to force quiet. Without it
+-     * the old default stands: a redirected stderr means someone is capturing a
+-     * log, so be verbose.
+-     *
+-     * That default has a sharp edge worth knowing about. The per-event lines are
+-     * emitted from every guest thread through one FILE lock, and Windows locks
+-     * are not fair, so at the ~6k lines/s a SPURS audio loop produces a thread
+-     * can starve on the lock for seconds. Tokyo Jungle presents four frames in
+-     * 40 s with the log discarded and one with it redirected to a file -- the
+-     * logging changes what the title does. Measure timing-sensitive behaviour
+-     * with PS3_VERBOSE=0. */
+-    static int v = -1;
+-    if (v < 0) {
+-        const char* e = getenv("PS3_VERBOSE");
+-        if (e) v = (e[0] && e[0] != '0') ? 1 : 0;
+-        else   v = !PS3_ISATTY_STDERR();
+-    }
+-    return v;
++#define PS3_LOG_GATE(fn, env) \
++static inline int fn(void) \
++{ \
++    static PS3_LOG_TLS int value = -1; \
++    if (value < 0) { \
++        const char* e = getenv(env); \
++        value = e ? (e[0] && e[0] != '0') : ps3_log_verbose(); \
++    } \
++    return value; \
+ }
+ 
++static inline int ps3_log_verbose(void)
++{
++    static PS3_LOG_TLS int value = -1;
++    if (value < 0) {
++        const char* e = getenv("PS3_VERBOSE");
++        value = e && e[0] && e[0] != '0';
++    }
++    return value;
++}
++
++PS3_LOG_GATE(ps3_log_wait, "PS3RECOMP_TRACE_WAIT")
++PS3_LOG_GATE(ps3_log_event, "PS3RECOMP_TRACE_EVENT")
++PS3_LOG_GATE(ps3_log_hotread, "PS3RECOMP_TRACE_HOTREAD")
++#undef PS3_LOG_GATE
++
+ #endif /* PS3_LOG_H */
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -687,7 +687,15 @@
+ /* sys_spu_image_close(sys_spu_image_t*) -- NID 0xE0DA8EFD. The descriptor lives
+  * in a runtime bump arena that is never reclaimed, so there is nothing to free;
+  * it exists so the guest's own error checking passes. */
+-static void hle_spu_image_close(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++static void hle_spu_image_close(ppu_context* ctx)
++{
++    uint32_t img = (uint32_t)ctx->gpr[3];
++    if (!img || !vm_base) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT; return; }
++    uint32_t type = be32_load(img);
++    /* USER/KERNEL descriptors use runtime-owned bump storage. Closing drops
++     * no host allocation; the arena is released with guest VM at shutdown. */
++    ctx->gpr[3] = type <= 1 ? CELL_OK : (uint64_t)(int64_t)(int32_t)CELL_EINVAL;
++}
+ 
+ void sys_raw_spu_init(lv2_syscall_table* tbl)
+ {
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -324,7 +324,7 @@
+     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
+      * (PS3 priority semantics). Their job objects are fully initialized by now. */
+     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
+-    if (ps3_log_verbose())
++    if (ps3_log_wait())
+         fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
+                 queue_id, (unsigned long long)timeout_us,
+                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+@@ -624,7 +624,7 @@
+         static int _sel = -2;
+         if (_sel == -2) { const char* e = getenv("PS3_EVT_RECV");
+                           _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
+-    if (_sel == -1 || (int)queue_id == _sel) {
++    if ((ps3_log_event() || getenv("PS3_EVT_RECV")) && (_sel == -1 || (int)queue_id == _sel)) {
+         static int _r = 0;
+         if (_r++ < 64)
+             fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
+@@ -955,7 +955,7 @@
+     if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
+         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
+             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
+-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
++    if (ps3_log_event()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
+ 
+     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
+@@ -988,7 +988,7 @@
+         fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
+         return (int64_t)(int32_t)CELL_ENOTCONN;
+     }
+-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
++    if (ps3_log_event()) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+             port_id, p->connected_queue, (unsigned long long)p->name);
+ 
+     int32_t qidx = p->connected_queue;
+@@ -1153,9 +1153,9 @@
+     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
+     uint32_t mode       = LV2_ARG_U32(ctx, 2);
+     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
+-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
++    { static int n=0; if(ps3_log_wait() && n++<30) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
+     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
+-    { static int _w=0; if (_w++ < 40) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
++    { static int _w=0; if (ps3_log_wait() && _w++ < 40) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
+     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
+      * *(r29+0x24) (a completion counter the SPU would increment) reaches the target
+      * *(r29). Since we don't yet run the SPU workload, satisfy that counter so the
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -2,6 +2,7 @@
+  * ps3recomp - PPU thread management syscalls (implementation)
+  */
+ 
++#include "../ps3_log.h"
+ #include <setjmp.h>
+ 
+ /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
+@@ -555,7 +556,7 @@
+ {
+     uint64_t tid          = LV2_ARG_U64(ctx, 0);
+     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
+-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
++    { static int n=0; if(ps3_log_wait() && n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+ 
+     table_lock();
+     ppu_thread_info* t = find_thread(tid);
+--- a/runtime/syscalls/sys_semaphore.c
++++ b/runtime/syscalls/sys_semaphore.c
+@@ -352,7 +352,7 @@
+         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu cia=0x%08X lr=0x%08X)\n",
+                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us,
+                 (unsigned)ctx->cia, (unsigned)ctx->lr);
+-      else if (!getenv("SEMTID") && ps3_log_verbose())
++      else if (!getenv("SEMTID") && ps3_log_wait())
+         fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
+     /* PS3_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
+      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -2,6 +2,7 @@
+  * ps3recomp - Timer and time syscalls (implementation)
+  */
+ 
++#include "../ps3_log.h"
+ #include "sys_timer.h"
+ #include "sys_event.h"
+ #include "../memory/vm.h"
+@@ -108,7 +109,7 @@
+ {
+     uint64_t usec = LV2_ARG_U64(ctx, 0);
+     { extern unsigned long long ps3_qpc_us(void);
+-      static int n=0; if (n++ < 60)
++      static int n=0; if (ps3_log_wait() && n++ < 60)
+         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
+         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
+--- a/tools/gen_hle_nids.py
++++ b/tools/gen_hle_nids.py
+@@ -28,7 +28,7 @@
+ # not read from a /* NID */ comment -- computation matches the real imports far
+ # better and needs no manual annotation.
+ DEF_RE = re.compile(
+-    r"^(?!static)[A-Za-z_][\w \t\*]*?\b(_?(?:cell|sys|sce|_sys)\w+)\s*\([^;]*?\)\s*\{",
++    r"^(?!static)[A-Za-z_][\w \t\*]*?\b((?:_?(?:cell|sys|sce|_sys)\w+|SJISstoUTF8s|UTF8stoSJISs|jstrchk))\s*\([^;]*?\)\s*\{",
+     re.M)
+ 
+ 

@@ -1,0 +1,1897 @@
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -2,7 +2,7 @@
+  * ps3recomp - cellSaveData HLE implementation
+  *
+  * Game save data management with callback-driven flow.
+- * Save data is stored under: {root}/gamedata/dev_hdd0/home/00000001/savedata/{dirName}/
++ * Save data is stored under $PS3_HDD0_ROOT/home/00000001/savedata/{dirName}.
+  */
+ 
+ #include "cellSaveData.h"
+@@ -15,6 +15,10 @@
+ #include <sys/stat.h>
+ #include <errno.h>
+ #include <time.h>
++#include <stdatomic.h>
++#if defined(__APPLE__) && !defined(PS3RECOMP_SAVEDATA_NO_UI)
++#  include "savedata_macos.h"
++#endif
+ 
+ /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros (st_atim.tv_sec
+  * etc.) that collide with the identically named members of CellSaveData*Stat; undef
+@@ -41,6 +45,7 @@
+ #  include <unistd.h>
+ #  include <dirent.h>
+ #  include <sys/types.h>
++#  include <sys/statvfs.h>
+ #  define HOST_MKDIR(p) mkdir(p, 0755)
+ #  define HOST_STAT     stat
+ #  define HOST_STAT_T   struct stat
+@@ -52,9 +57,50 @@
+ 
+ static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
+ static int s_enable_overlay = 1;
+-
+-/* The headless save UI has no overlay to draw; retain the guest preference
+- * for a future host UI. This API is void, and does not start a save operation. */
++#include "savedata_sfo.h"
++
++static void resolve_save_root(void)
++{
++    const char* root = getenv("PS3_HDD0_ROOT");
++    if (root && *root)
++        snprintf(s_save_root, sizeof(s_save_root), "%s/home/00000001/savedata", root);
++}
++
++static int valid_save_name(const char* name)
++{
++    return name && name[0] && strnlen(name, 32) < 32 &&
++           !strchr(name, '/') && !strchr(name, '\\') &&
++           strcmp(name, ".") && strcmp(name, "..");
++}
++
++/* Explicit environment choices also make host input scripts deterministic. */
++static int save_confirmed(const char* action, const char* directory)
++{
++    const char* answer = getenv("PS3_SAVEDATA_CONFIRM");
++    if (answer) return strcmp(answer, "no") != 0;
++#if defined(__APPLE__) && !defined(PS3RECOMP_SAVEDATA_NO_UI)
++    int result = savedata_macos_confirm(action, directory);
++    if (result != -2) return result;
++#endif
++    return 1;
++}
++
++static int select_save_ui(const CellSaveDataDirList* dirs, u32 count,
++                          const char* new_name, const char* action, char selected[64])
++{
++#if defined(__APPLE__) && !defined(PS3RECOMP_SAVEDATA_NO_UI)
++    if (!getenv("PS3_SAVEDATA_DIR")) {
++        char pick[32] = "";
++        int result = savedata_macos_select(dirs, count, new_name, selected, action, pick);
++        if (result == -1) { selected[0] = 0; return 1; }
++        if (result == 0) snprintf(selected, 64, "%s", pick);
++    }
++#endif
++    return 0;
++}
++
++/* Retain the guest overlay preference; macOS uses native modal dialogs.
++ * This API is void, and does not start a save operation. */
+ void cellSaveDataEnableOverlay(s32 enable)
+ {
+     s_enable_overlay = enable != 0;
+@@ -81,6 +127,7 @@
+ 
+ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
+ {
++    resolve_save_root();
+     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
+ #ifdef _WIN32
+     for (char* p = buf; *p; p++) {
+@@ -144,15 +191,14 @@
+  *
+  * Layout (sizes in PS3 ABI, all big-endian, 32-bit pointers):
+  *   CellSaveDataCBResult:    4 + 4 + 4 + 4 + 4                = 20 bytes
+- *   CellSaveDataStatGet:     4 + 4 + 56 + 1552 + 4*5 + 4      = 1640 bytes
++ *   CellSaveDataStatGet:     1640 bytes of fields + reserved[64] = 1704 bytes
+  *   CellSaveDataStatSet:     4 + 4 + 4                        = 12 bytes (pointers + reCreateMode)
+  *
+- * We use a fixed scratch region at 0x024E0000 (128 KB, just before the
+- * cmdbuf region at 0x02500000). Only one savedata operation is in flight
+- * at a time, so a bump allocator is sufficient.
++ * Scratch lives outside the title's main-memory heap, committed on demand.
++ * The operation guard returns BUSY for concurrent/reentrant saves.
+  * -----------------------------------------------------------------------*/
+ 
+-#define SAVEDATA_SCRATCH_BASE  0x024E0000u
++#define SAVEDATA_SCRATCH_BASE  0x2FFE0000u
+ #define SAVEDATA_SCRATCH_SIZE  0x00020000u  /* 128 KB */
+ 
+ static uint32_t s_scratch_base = SAVEDATA_SCRATCH_BASE;
+@@ -180,6 +226,7 @@
+     uint32_t addr = s_scratch_next;
+     s_scratch_next += size;
+     /* Zero-init */
++    if (vm_commit(addr, size) != CELL_OK) return 0;
+     memset(vm_base + addr, 0, size);
+     return addr;
+ }
+@@ -255,6 +302,8 @@
+     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
+     *userdata_ea = vm_read32(cb_ea + 16);
+     memset(out, 0, sizeof(*out));
++    s32 result = marshal_cbresult_read_result(cb_ea);
++    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) return result;
+     out->fileOperation = vm_read32(set_ea);
+     out->fileType = vm_read32(set_ea + 8);
+     memcpy(out->secureFileId, vm_base + set_ea + 12, 16);
+@@ -266,7 +315,9 @@
+     out->fileBuf = buffer ? vm_base + buffer : NULL;
+     /* fread/fwrite on fileBuf go through the kernel, which cannot fault in a
+      * demand-committed guest page (see sys_fs_read). Commit it first. */
+-    if (buffer && out->fileBufSize) vm_commit(buffer, out->fileBufSize);
++    if (buffer && out->fileBufSize &&
++        ((u64)buffer + out->fileBufSize > UINT32_MAX ||
++         vm_commit(buffer, out->fileBufSize) != CELL_OK)) return CELL_SAVEDATA_ERROR_PARAM;
+     return marshal_cbresult_read_result(cb_ea);
+ }
+ 
+@@ -355,21 +406,6 @@
+     return result;
+ }
+ 
+-/* Dispatch a List/Fixed selection callback.
+- *
+- * The four List/Fixed entry points used to call the guest OPD as a HOST
+- * function pointer with HOST struct pointers -- `funcList(&cbResult, &listGet,
+- * &listSet)`. That is an immediate access violation the first time a title
+- * actually reaches one, and none did until Virtua Fighter 5 called
+- * cellSaveDataFixedLoad: rip == the guest OPD address, 0x00691F30.
+- *
+- * ponytail: this dispatches through the guest caller with ZEROED guest
+- * structures rather than marshalling the directory list. With no save data on
+- * the VFS the list is empty anyway, which is the honest answer, and a title
+- * sees "nothing to select" and proceeds with defaults. Marshal CellSaveData-
+- * ListGet/ListSet properly when a title needs to pick an existing save; the
+- * layouts are the only missing piece, and dispatch_func_stat next door is the
+- * shape to copy. */
+ /* List callback. The directory list is marshalled into the title's own
+  * CellSaveDataSetBuf (SDK: "dirList uses CellSaveDataSetBuf *buf"), and the
+  * directory the title picks is read back out of the GUEST CellSaveDataListSet:
+@@ -385,32 +421,33 @@
+  *   DirList  { dirName[32]; listParam[8]; reserved[8] }  (48 bytes)
+  *   SetBuf   { dirListMax +0; fileListMax +4; reserved[6]; bufSize +32; buf* +36 }
+  *
+- * `selected` receives the chosen directory ("" when none): the first listed
+- * entry, else the new-save name, else the focus name. For a save with nothing
+- * listed the new-save name wins -- headless, there is no user to pick. */
++ * The callback filters/focuses the list. A native host dialog selects a slot;
++ * headless runs use that focus or PS3_SAVEDATA_DIR. Terminal results skip
++ * selection entirely (D2 uses result=2 to count saves at the title menu). */
+ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
+                                 uint32_t dirCount, uint32_t setBuf_ea, int is_save,
+-                                uint32_t userdata_ea, const char* who, char selected[64])
++                                uint32_t* userdata_ea, const char* who, char selected[64])
+ {
+     selected[0] = '\0';
+     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+ 
+     scratch_reset();
+     uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+-    uint32_t get_ea = scratch_alloc(SAVEDATA_STATGET_SIZE);
+-    uint32_t set_ea = scratch_alloc(SAVEDATA_STATSET_SIZE);
++    uint32_t get_ea = scratch_alloc(76);
++    uint32_t set_ea = scratch_alloc(24);
+     if (!cb_ea || !get_ea || !set_ea) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+     for (uint32_t i = 0; i < 24; i += 4) vm_write32(set_ea + i, 0);
+ 
+     uint32_t buf_ea = setBuf_ea ? vm_read32(setBuf_ea + 36) : 0;
+     uint32_t cap = setBuf_ea ? vm_read32(setBuf_ea + 32) / 48u : 0;
+     if (setBuf_ea && vm_read32(setBuf_ea + 0) < cap) cap = vm_read32(setBuf_ea + 0);
++    if (buf_ea && cap && vm_commit(buf_ea, cap * 48) != CELL_OK) return CELL_SAVEDATA_ERROR_PARAM;
+     uint32_t listed = buf_ea ? (dirCount < cap ? dirCount : cap) : 0;
+     for (uint32_t i = 0; i < listed; i++)
+         for (uint32_t k = 0; k < 48; k++)
+             vm_write8(buf_ea + i * 48 + k, (uint8_t)((const char*)&dirList[i])[k]);
+ 
+-    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
++    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, *userdata_ea);
+     vm_write32(get_ea + 0, dirCount);        /* dirNum     */
+     vm_write32(get_ea + 4, listed);          /* dirListNum */
+     vm_write32(get_ea + 8, listed ? buf_ea : 0);
+@@ -420,21 +457,73 @@
+     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
+ 
+     s32 result = marshal_cbresult_read_result(cb_ea);
++    *userdata_ea = vm_read32(cb_ea + 16);
+     const uint32_t fixed_n = vm_read32(set_ea + 8), fixed = vm_read32(set_ea + 12);
+     const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
++    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) {
++        printf("[cellSaveData] %s terminal result=%d (dirNum=%u)\n", who, result, dirCount);
++        return result;
++    }
++    if (fixed_n > CELL_SAVEDATA_DIRLIST_MAX || (fixed_n && !fixed))
++        return CELL_SAVEDATA_ERROR_PARAM;
+     const uint32_t new_name = newd ? vm_read32(newd + 4) : 0;
+-    uint32_t pick = 0;
+-    if (is_save && new_name && fixed_n == 0) pick = new_name;
+-    else if (fixed_n && fixed)               pick = fixed;
+-    else if (new_name)                       pick = new_name;
+-    else if (focus)                          pick = focus;
+-    if (pick) {
+-        for (int i = 0; i < 63; i++) {
+-            selected[i] = (char)vm_read8(pick + (uint32_t)i);
+-            if (!selected[i]) break;
+-        }
+-        selected[63] = '\0';
+-    }
++    if (newd && (vm_read32(newd) > 1 || !valid_save_name(new_name ? (char*)vm_base + new_name : NULL)))
++        return CELL_SAVEDATA_ERROR_PARAM;
++    u32 position = vm_read32(set_ea), pick = 0;
++    /* fixedList filters the available entries; it is not the selection. */
++    if (position > CELL_SAVEDATA_FOCUSPOS_NEWDATA ||
++        (position == CELL_SAVEDATA_FOCUSPOS_DIRNAME && !focus) ||
++        (position == CELL_SAVEDATA_FOCUSPOS_NEWDATA && !new_name))
++        return CELL_SAVEDATA_ERROR_PARAM;
++    const char* requested = getenv("PS3_SAVEDATA_DIR");
++    u32 chosen = UINT32_MAX;
++    s64 chosen_time = 0;
++    for (u32 i = 0; i < dirCount; i++) {
++        int allowed = !fixed_n;
++        for (u32 j = 0; j < fixed_n && j < CELL_SAVEDATA_DIRLIST_MAX; j++)
++            if (fixed && !strncmp(dirList[i].dirName, (char*)vm_base + fixed + j * 48, 32))
++                allowed = 1;
++        if (!allowed) continue;
++        if (requested && !strcmp(requested, dirList[i].dirName)) { chosen = i; break; }
++        if (!requested && position == CELL_SAVEDATA_FOCUSPOS_DIRNAME && focus &&
++            !strcmp((char*)vm_base + focus, dirList[i].dirName)) { chosen = i; break; }
++        char path[1024]; HOST_STAT_T st; s64 modified = 0;
++        build_save_path(path, sizeof(path), dirList[i].dirName);
++        if (HOST_STAT(path, &st) == 0) {
++#ifdef _WIN32
++            modified = st.st_mtime;
++#elif defined(__APPLE__)
++            modified = st.st_mtimespec.tv_sec;
++#else
++            modified = st.st_mtim.tv_sec;
++#endif
++        }
++        if (chosen == UINT32_MAX || position == CELL_SAVEDATA_FOCUSPOS_LISTTAIL ||
++            (position == CELL_SAVEDATA_FOCUSPOS_LATEST && modified > chosen_time) ||
++            (position == CELL_SAVEDATA_FOCUSPOS_OLDEST && modified < chosen_time)) {
++            chosen = i; chosen_time = modified;
++        }
++    }
++    if (is_save && new_name && (position == CELL_SAVEDATA_FOCUSPOS_NEWDATA ||
++        chosen == UINT32_MAX || (requested && !strcmp(requested, (char*)vm_base + new_name))))
++        pick = new_name;
++    if (pick) snprintf(selected, 64, "%s", (char*)vm_base + pick);
++    else if (chosen != UINT32_MAX) snprintf(selected, 64, "%s", dirList[chosen].dirName);
++    if (requested && strcmp(requested, selected)) selected[0] = 0;
++    /* The host sees only callback-approved entries and the optional new slot. */
++    CellSaveDataDirList* allowed_dirs = calloc(dirCount ? dirCount : 1, sizeof(*allowed_dirs));
++    if (!allowed_dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
++    u32 allowed_count = 0;
++    for (u32 i = 0; i < dirCount; i++) {
++        int allowed = !fixed_n;
++        for (u32 j = 0; j < fixed_n; j++)
++            if (!strncmp(dirList[i].dirName, (char*)vm_base + fixed + j * 48, 32)) allowed = 1;
++        if (allowed) allowed_dirs[allowed_count++] = dirList[i];
++    }
++    select_save_ui(allowed_dirs, allowed_count,
++                   is_save && new_name ? (char*)vm_base + new_name : NULL,
++                   is_save ? "Save" : "Load", selected);
++    free(allowed_dirs);
+     printf("[cellSaveData] %s returned cbResult.result=%d fixed=%u newData=%s -> '%s'%c",
+            who, result, fixed_n, new_name ? "yes" : "no", selected, 10);
+     return result;
+@@ -445,6 +534,7 @@
+ {
+     u32 count = 0;
+ 
++    resolve_save_root();
+     ensure_dirs(s_save_root);
+ 
+ #ifdef _WIN32
+@@ -463,8 +553,10 @@
+         do {
+             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                 continue;
+-            if (fd.cFileName[0] == '.')
+-                continue;
++            if (fd.cFileName[0] == '.') continue;
++            char full[1024];
++            build_save_path(full, sizeof(full), fd.cFileName);
++            if (!dir_has_save(full)) continue;
+             if (prefix && prefix[0] && strncmp(fd.cFileName, prefix, strlen(prefix)) != 0)
+                 continue;
+             if (count < max && dirList) {
+@@ -472,6 +564,13 @@
+                 strncpy(dirList[count].dirName, fd.cFileName,
+                         CELL_SAVEDATA_DIRNAME_SIZE - 1);
+             }
++            if (count < max && dirList) {
++                char path[1024];
++                build_save_path(path, sizeof(path), dirList[count].dirName);
++                CellSaveDataSystemFileParam param;
++                if (read_param_sfo(path, &param))
++                    memcpy(dirList[count].listParam, param.listParam, 8);
++            }
+             count++;
+         } while (FindNextFileA(hFind, &fd));
+ 
+@@ -490,7 +589,7 @@
+             /* Check it's a directory */
+             char full[1024];
+             snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);
+-            if (!dir_exists(full))
++            if (!dir_has_save(full))
+                 continue;
+             if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)
+                 continue;
+@@ -499,6 +598,13 @@
+                 strncpy(dirList[count].dirName, de->d_name,
+                         CELL_SAVEDATA_DIRNAME_SIZE - 1);
+             }
++            if (count < max && dirList) {
++                char path[1024];
++                build_save_path(path, sizeof(path), dirList[count].dirName);
++                CellSaveDataSystemFileParam param;
++                if (read_param_sfo(path, &param))
++                    memcpy(dirList[count].listParam, param.listParam, 8);
++            }
+             count++;
+         }
+         closedir(dp);
+@@ -524,47 +630,10 @@
+     return CELL_SAVEDATA_FILETYPE_NORMALFILE;
+ }
+ 
+-/* Which files were written as SECUREFILE. A real save records them in
+- * PARAM.PFD; ours keeps one name per line there, and the file stays hidden
+- * from the guest's list (savedata_system_file). Without it every file came
+- * back as NORMALFILE, and a title that looks for its secure payload in the
+- * stat list (The Simpsons Arcade Game) called its own fresh save corrupt. */
+-static void pfd_path(const char* save_path, char* out, size_t n)
+-{
+-    snprintf(out, n, "%s/PARAM.PFD", save_path);
+-#ifdef _WIN32
+-    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
+-#endif
+-}
+-
+-static int pfd_has(const char* save_path, const char* name)
+-{
+-    char path[1024], line[64];
+-    pfd_path(save_path, path, sizeof(path));
+-    FILE* fp = fopen(path, "rb");
+-    if (!fp) return 0;
+-    int found = 0;
+-    while (!found && fgets(line, sizeof(line), fp)) {
+-        line[strcspn(line, "\r\n")] = 0;
+-        found = !strcmp(line, name);
+-    }
+-    fclose(fp);
+-    return found;
+-}
+-
+-static void pfd_add(const char* save_path, const char* name)
+-{
+-    if (pfd_has(save_path, name)) return;
+-    char path[1024];
+-    pfd_path(save_path, path, sizeof(path));
+-    FILE* fp = fopen(path, "ab");
+-    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
+-}
+-
+ static u32 savedata_file_type(const char* save_path, const char* name)
+ {
+     u32 t = savedata_content_type(name);
+-    return t == CELL_SAVEDATA_FILETYPE_NORMALFILE && pfd_has(save_path, name)
++    return t == CELL_SAVEDATA_FILETYPE_NORMALFILE && sfo_file_flag(save_path, name, -2)
+          ? CELL_SAVEDATA_FILETYPE_SECUREFILE : t;
+ }
+ 
+@@ -669,7 +738,9 @@
+     }
+     if (!name || !name[0] || strnlen(name, CELL_SAVEDATA_FILENAME_SIZE) == CELL_SAVEDATA_FILENAME_SIZE ||
+         strchr(name, '/') || strchr(name, '\\') || !strcmp(name, ".") || !strcmp(name, "..") ||
+-        (set->fileOperation != CELL_SAVEDATA_FILEOP_DELETE && !set->fileBuf))
++        savedata_system_file(name) || set->fileOperation > CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC ||
++        (set->fileOperation != CELL_SAVEDATA_FILEOP_DELETE &&
++         (set->fileSize > set->fileBufSize || (set->fileBufSize && !set->fileBuf))))
+         return CELL_SAVEDATA_ERROR_PARAM;
+     char file_path[1024];
+     snprintf(file_path, sizeof(file_path), "%s/%s", save_path, name);
+@@ -729,83 +800,186 @@
+         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
+         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
+         int failed = wrote != write_size;
++        if (!failed && set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE) {
++#ifdef _WIN32
++            if (_chsize_s(_fileno(fp), (u64)set->fileOffset + wrote) != 0) failed = 1;
++#else
++            if (fflush(fp) != 0 || ftruncate(fileno(fp), (off_t)set->fileOffset + wrote) != 0) failed = 1;
++#endif
++        }
+         if (fclose(fp) != 0) failed = 1;
+-        if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
+-            pfd_add(save_path, name);
++        if (!failed && !sfo_file_flag(save_path, name,
++                          set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)) failed = 1;
+         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
+     }
+ 
+     case CELL_SAVEDATA_FILEOP_DELETE:
+-        remove(file_path);
+-        return 0;
++        if (remove(file_path) != 0) return CELL_SAVEDATA_ERROR_FAILURE;
++        return sfo_file_flag(save_path, name, -1) ? 0 : CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+ 
+     default:
+-        return 0;
+-    }
+-}
+-
+-/* Write a simplified PARAM.SFO with the save's title/subtitle/detail */
+-static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
+-{
+-    if (!param) return;
+-
+-    char sfo_path[1024];
+-    snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
+-#ifdef _WIN32
+-    for (char* p = sfo_path; *p; p++) {
+-        if (*p == '/') *p = '\\';
+-    }
+-#endif
+-
+-    FILE* fp = fopen(sfo_path, "wb");
+-    if (!fp) return;
+-
+-    /* Write a simplified text-based PARAM.SFO for easy debugging.
+-       Games don't read this directly - our stat callback fills it from here. */
+-    fprintf(fp, "TITLE=%s\n", param->title);
+-    fprintf(fp, "SUB_TITLE=%s\n", param->subTitle);
+-    fprintf(fp, "DETAIL=%s\n", param->detail);
+-    fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
+-    fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
+-    fclose(fp);
+-}
+-
+-/* Read simplified PARAM.SFO */
+-static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
+-{
+-    if (!param) return;
+-    memset(param, 0, sizeof(CellSaveDataSystemFileParam));
+-
+-    char sfo_path[1024];
+-    snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
+-#ifdef _WIN32
+-    for (char* p = sfo_path; *p; p++) {
+-        if (*p == '/') *p = '\\';
+-    }
+-#endif
+-
+-    FILE* fp = fopen(sfo_path, "rb");
+-    if (!fp) return;
+-
+-    char line[2048];
+-    while (fgets(line, sizeof(line), fp)) {
+-        /* Remove trailing newline */
+-        size_t len = strlen(line);
+-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+-            line[--len] = '\0';
+-
+-        if (strncmp(line, "TITLE=", 6) == 0)
+-            strncpy(param->title, line + 6, CELL_SAVEDATA_SYSP_TITLE_SIZE - 1);
+-        else if (strncmp(line, "SUB_TITLE=", 10) == 0)
+-            strncpy(param->subTitle, line + 10, CELL_SAVEDATA_SYSP_SUBTITLE_SIZE - 1);
+-        else if (strncmp(line, "DETAIL=", 7) == 0)
+-            strncpy(param->detail, line + 7, CELL_SAVEDATA_SYSP_DETAIL_SIZE - 1);
+-        else if (strncmp(line, "ATTRIBUTE=", 10) == 0)
+-            param->attribute = (u32)atoi(line + 10);
+-        else if (strncmp(line, "LIST_PARAM=", 11) == 0)
+-            strncpy(param->listParam, line + 11, CELL_SAVEDATA_SYSP_LPARAM_SIZE - 1);
+-    }
+-    fclose(fp);
++        return CELL_SAVEDATA_ERROR_PARAM;
++    }
++}
++
++/* Delete only the flat files in a selected save, never arbitrary subtrees. */
++static s32 delete_save_path(const char* path)
++{
++#ifdef _WIN32
++    char search[1100]; snprintf(search, sizeof(search), "%s/*", path);
++    WIN32_FIND_DATAA data;
++    HANDLE h = FindFirstFileA(search, &data);
++    if (h == INVALID_HANDLE_VALUE) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    int failed = 0;
++    do {
++        if (!strcmp(data.cFileName, ".") || !strcmp(data.cFileName, "..")) continue;
++        char file[1100]; snprintf(file, sizeof(file), "%s/%s", path, data.cFileName);
++        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || remove(file) != 0) failed = 1;
++    } while (FindNextFileA(h, &data));
++    FindClose(h);
++    return !failed && _rmdir(path) == 0 ? CELL_OK : CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++#else
++    DIR* dp = opendir(path);
++    if (!dp) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    struct dirent* de;
++    int failed = 0;
++    while ((de = readdir(dp))) {
++        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
++        char file[1100]; snprintf(file, sizeof(file), "%s/%s", path, de->d_name);
++        if (remove(file) != 0) failed = 1;
++    }
++    closedir(dp);
++    return !failed && rmdir(path) == 0 ? CELL_OK : CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++#endif
++}
++
++static s32 savedata_free_kb(void)
++{
++    resolve_save_root(); ensure_dirs(s_save_root);
++#ifdef _WIN32
++    ULARGE_INTEGER free_bytes;
++    if (!GetDiskFreeSpaceExA(s_save_root, &free_bytes, NULL, NULL)) return 0;
++    u64 kb = free_bytes.QuadPart / 1024;
++#else
++    struct statvfs st;
++    if (statvfs(s_save_root, &st) != 0) return 0;
++    u64 kb = ((u64)st.f_bavail * (st.f_frsize ? st.f_frsize : st.f_bsize)) / 1024;
++#endif
++    return kb > INT32_MAX ? INT32_MAX : (s32)kb;
++}
++
++static int s_sort_type, s_sort_order;
++static int save_dir_compare(const void* a, const void* b)
++{
++    const CellSaveDataDirList* x = a;
++    const CellSaveDataDirList* y = b;
++    char px[1024], py[1024];
++    build_save_path(px, sizeof(px), x->dirName); build_save_path(py, sizeof(py), y->dirName);
++    int result = 0;
++    if (s_sort_type == CELL_SAVEDATA_SORTTYPE_SUBTITLE) {
++        CellSaveDataSystemFileParam sx, sy;
++        read_param_sfo(px, &sx); read_param_sfo(py, &sy);
++        result = strcmp(sx.subTitle, sy.subTitle);
++    } else {
++        HOST_STAT_T sx, sy;
++        if (HOST_STAT(px, &sx) == 0 && HOST_STAT(py, &sy) == 0) {
++#ifdef _WIN32
++            s64 tx = sx.st_mtime, ty = sy.st_mtime;
++#elif defined(__APPLE__)
++            s64 tx = sx.st_mtimespec.tv_sec, ty = sy.st_mtimespec.tv_sec;
++#else
++            s64 tx = sx.st_mtim.tv_sec, ty = sy.st_mtim.tv_sec;
++#endif
++            result = tx < ty ? -1 : tx > ty ? 1 : 0;
++        }
++    }
++    if (!result) result = strcmp(x->dirName, y->dirName);
++    return s_sort_order == CELL_SAVEDATA_SORTORDER_ASCENT ? result : -result;
++}
++
++static s32 sort_save_dirs(CellSaveDataSetList* setList, CellSaveDataDirList* dirs, u32 count)
++{
++    u32 ea = (u32)(uintptr_t)setList;
++    s_sort_type = (int)vm_read32(ea); s_sort_order = (int)vm_read32(ea + 4);
++    if (s_sort_type > 1 || s_sort_type < 0 || s_sort_order > 1 || s_sort_order < 0)
++        return CELL_SAVEDATA_ERROR_PARAM;
++    qsort(dirs, count, sizeof(*dirs), save_dir_compare);
++    return CELL_OK;
++}
++
++/* Work in a sibling directory so callback or I/O errors preserve the old save.
++ * The final directory rename commits all files and metadata together. */
++static s32 stage_save(const char* source, const char* directory, int recreate,
++                      char parent[1024], char staged[1024])
++{
++    snprintf(parent, 1024, "%s/.savedata-XXXXXX", s_save_root);
++#ifdef _WIN32
++    if (_mktemp_s(parent, 1024) || HOST_MKDIR(parent)) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++#else
++    if (!mkdtemp(parent)) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++#endif
++    snprintf(staged, 1024, "%s/%s", parent, directory);
++    if (HOST_MKDIR(staged) != 0) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    if (recreate || !dir_exists(source)) return CELL_OK;
++#ifdef _WIN32
++    char search[1100]; snprintf(search, sizeof(search), "%s/*", source);
++    WIN32_FIND_DATAA data;
++    HANDLE h = FindFirstFileA(search, &data);
++    if (h == INVALID_HANDLE_VALUE) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    int more = 1;
++    while (more) {
++        const char* name = data.cFileName;
++#else
++    DIR* dp = opendir(source);
++    if (!dp) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    struct dirent* de;
++    while ((de = readdir(dp))) {
++        const char* name = de->d_name;
++#endif
++        if (strcmp(name, ".") && strcmp(name, "..")) {
++            char from[1100], to[1100];
++            snprintf(from, sizeof(from), "%s/%s", source, name);
++            snprintf(to, sizeof(to), "%s/%s", staged, name);
++            FILE* input = fopen(from, "rb"); FILE* output = fopen(to, "wb");
++            int ok = input && output;
++            u8 bytes[16384]; size_t n;
++            while (ok && (n = fread(bytes, 1, sizeof(bytes), input)))
++                ok = fwrite(bytes, 1, n, output) == n;
++            if (input) { if (ferror(input)) ok = 0; fclose(input); }
++            if (output && fclose(output) != 0) ok = 0;
++            if (!ok) {
++#ifdef _WIN32
++                FindClose(h);
++#else
++                closedir(dp);
++#endif
++                return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++            }
++        }
++#ifdef _WIN32
++        more = FindNextFileA(h, &data);
++#endif
++    }
++#ifdef _WIN32
++    FindClose(h);
++#else
++    closedir(dp);
++#endif
++    return CELL_OK;
++}
++
++static s32 commit_save(const char* target, const char* staged, const char* parent)
++{
++    char backup[1100]; snprintf(backup, sizeof(backup), "%s/previous", parent);
++    int existed = dir_exists(target);
++    if (existed && rename(target, backup) != 0) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    if (rename(staged, target) != 0) {
++        if (existed && rename(backup, target) != 0)
++            printf("[cellSaveData] restore failed; previous save retained in '%s'\n", backup);
++        return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
++    }
++    if (existed) delete_save_path(backup);
++    return CELL_OK;
+ }
+ 
+ /* Core save/load implementation shared by List/Fixed/Auto variants */
+@@ -815,9 +989,10 @@
+                              CellSaveDataFileCallback funcFile,
+                              void* userdata)
+ {
+-    if (!dirName || !funcStat)
++    if (!valid_save_name(dirName) || !funcStat)
+         return CELL_SAVEDATA_ERROR_PARAM;
+ 
++    char stage_parent[1024] = "", staged[1024] = "";
+     char save_path[1024];
+     build_save_path(save_path, sizeof(save_path), dirName);
+ 
+@@ -843,14 +1018,13 @@
+     if (file_list_max > 0) {
+         fileList = (CellSaveDataFileStat*)calloc(file_list_max, sizeof(CellSaveDataFileStat));
+         if (!fileList) return CELL_SAVEDATA_ERROR_INTERNAL;
+-        if (!is_new) {
+-            fileNum = enumerate_save_files(save_path, fileList, file_list_max);
+-        }
+-    }
++    }
++
++    if (!is_new) fileNum = enumerate_save_files(save_path, fileList, file_list_max);
+ 
+     CellSaveDataStatGet statGet;
+     memset(&statGet, 0, sizeof(statGet));
+-    statGet.hddFreeSizeKB = 1024 * 1024; /* report 1GB free */
++    statGet.hddFreeSizeKB = savedata_free_kb();
+     statGet.isNewData = is_new ? 1 : 0;
+     strncpy(statGet.dir.dirName, dirName, CELL_SAVEDATA_DIRNAME_SIZE - 1);
+ 
+@@ -872,7 +1046,9 @@
+             statGet.dir.st_ctime = (s64)hst.st_ctim.tv_sec;
+ #endif
+         }
+-        read_param_sfo(save_path, &statGet.getParam);
++        if (!read_param_sfo(save_path, &statGet.getParam)) {
++            free(fileList); return CELL_SAVEDATA_ERROR_BROKEN;
++        }
+     }
+ 
+     statGet.fileNum = fileNum;
+@@ -880,7 +1056,10 @@
+     statGet.fileList = fileList;
+     statGet.bind = 0;
+     statGet.sizeKB = 0;
+-    statGet.sysSizeKB = 0;
++    statGet.sysSizeKB = 35; /* firmware reserved metadata allocation */
++    for (u32 i = 0; i < statGet.fileListNum; i++)
++        statGet.sizeKB += (s32)((fileList[i].st_size + 1023) / 1024);
++    statGet.sizeKB += statGet.sysSizeKB;
+ 
+     /* Call stat callback */
+     CellSaveDataCBResult cbResult;
+@@ -898,21 +1077,37 @@
+     cbResult.result = dispatch_func_stat_full((uint32_t)(uintptr_t)funcStat, is_new,
+                          dirName, &callback_userdata, &statGet, &statSet);
+ 
+-    if (cbResult.result < 0) {
++    if (cbResult.result < 0 || cbResult.result > 2) {
+         printf("[cellSaveData] stat callback returned error %d\n", cbResult.result);
+         free(fileList);
+-        if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
+-            return CELL_SAVEDATA_ERROR_NODATA;
+         return CELL_SAVEDATA_ERROR_CBRESULT;
+     }
+ 
++    if (cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
++        cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) {
++        free(fileList); return CELL_OK;
++    }
++
+     /* Write PARAM.SFO if stat set provided params and we're saving */
++    s32 rc = CELL_OK;
++#define SAVE_RETURN(value) do { rc = (value); goto save_done; } while (0)
++    if ((statSet.reCreateMode & ~0x10000u) > 3) SAVE_RETURN(CELL_SAVEDATA_ERROR_PARAM);
++    int recreate = (statSet.reCreateMode & ~0x10000u) >= 2;
++    if (is_save && (is_new || recreate) && !statSet.setParam)
++        SAVE_RETURN(CELL_SAVEDATA_ERROR_PARAM);
++    if (is_save) {
++        rc = stage_save(save_path, dirName, recreate, stage_parent, staged);
++        if (rc != CELL_OK) SAVE_RETURN(rc);
++    }
++    const char* operation_path = is_save ? staged : save_path;
+     if (is_save && statSet.setParam) {
+-        ensure_dirs(save_path);
++        ensure_dirs(operation_path);
+         CellSaveDataSystemFileParam params;
+         memcpy(&params, statSet.setParam, sizeof(params));
+         params.attribute = ps3_bswap32(params.attribute);
+-        write_param_sfo(save_path, &params);
++        if (!write_param_sfo(operation_path, &params)) {
++            SAVE_RETURN(CELL_SAVEDATA_ERROR_ACCESS_ERROR);
++        }
+     }
+ 
+     /* Each NEXT callback requests one operation. LAST ends the sequence;
+@@ -923,154 +1118,100 @@
+             CellSaveDataFileSet fileSet;
+             cbResult.result = dispatch_func_file((u32)(uintptr_t)funcFile,
+                                                  &callback_userdata, exc_size, &fileSet);
++            if (cbResult.result < -1000) SAVE_RETURN(cbResult.result);
+             if (cbResult.result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
+-            s32 exc = process_file_op(save_path, &fileSet);
++            s32 exc = process_file_op(operation_path, &fileSet);
+             printf("[cellSaveData] file op=%u type=%u name='%s' off=%u size=%u buf=%u -> %d\n",
+                    fileSet.fileOperation, fileSet.fileType,
+                    fileSet.fileName ? fileSet.fileName : "", fileSet.fileOffset,
+                    fileSet.fileSize, fileSet.fileBufSize, exc);
+-            if (exc < 0) { free(fileList); return exc; }
++            if (exc < 0) SAVE_RETURN(exc);
+             exc_size = (u32)exc;
+         }
+     }
+ 
+-    free(fileList);
+-
+-    if (cbResult.result < 0) {
+-        if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
+-            return CELL_SAVEDATA_ERROR_NODATA;
+-        return CELL_SAVEDATA_ERROR_CBRESULT;
++    if (cbResult.result < 0 || cbResult.result > 2) SAVE_RETURN(CELL_SAVEDATA_ERROR_CBRESULT);
++    if (is_save) {
++        rc = commit_save(save_path, staged, stage_parent);
++        if (rc != CELL_OK) SAVE_RETURN(rc);
+     }
+ 
+     printf("[cellSaveData] %s complete for '%s'\n",
+            is_save ? "SAVE" : "LOAD", dirName);
+-    return CELL_OK;
++save_done:
++    free(fileList);
++    if (staged[0] && dir_exists(staged)) delete_save_path(staged);
++    if (stage_parent[0]) {
++#ifdef _WIN32
++        _rmdir(stage_parent);
++#else
++        rmdir(stage_parent);
++#endif
++    }
++#undef SAVE_RETURN
++    return rc;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+  * API implementations
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
+-                           CellSaveDataSetBuf* setBuf,
+-                           CellSaveDataListCallback funcList,
+-                           CellSaveDataStatCallback funcStat,
+-                           CellSaveDataFileCallback funcFile,
++static s32 savedata_list(int is_save, CellSaveDataSetList* setList,
++                         CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
++                         CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
++                         void* userdata)
++{
++    if (!setList || !setBuf || !funcList || !funcStat) return CELL_SAVEDATA_ERROR_PARAM;
++    u32 max = vm_read32((u32)(uintptr_t)setBuf);
++    if (max > CELL_SAVEDATA_DIRLIST_MAX) return CELL_SAVEDATA_ERROR_PARAM;
++    /* Collect all matching entries: dirNum must not be capped to dirListMax. */
++    CellSaveDataDirList* dirs = calloc(CELL_SAVEDATA_DIRLIST_MAX, sizeof(*dirs));
++    if (!dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
++    u32 prefix = vm_read32((u32)(uintptr_t)setList + 8);
++    u32 count = enumerate_save_dirs(prefix ? (char*)vm_base + prefix : "", dirs,
++                                    CELL_SAVEDATA_DIRLIST_MAX);
++    if (count > CELL_SAVEDATA_DIRLIST_MAX) count = CELL_SAVEDATA_DIRLIST_MAX;
++    s32 sorted = sort_save_dirs(setList, dirs, count);
++    if (sorted != CELL_OK) { free(dirs); return sorted; }
++    char selected[64];
++    u32 user = (u32)(uintptr_t)userdata;
++    s32 result = dispatch_func_select((u32)(uintptr_t)funcList, dirs, count,
++                (u32)(uintptr_t)setBuf, is_save, &user, "funcList", selected);
++    free(dirs);
++    if (result == CELL_SAVEDATA_CBRESULT_OK_LAST || result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM)
++        return CELL_OK;
++    if (result < -1000) return result;
++    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) return CELL_SAVEDATA_ERROR_CBRESULT;
++    if (!selected[0]) {
++        printf("[cellSaveData] no save data available for list %s\n", is_save ? "save" : "load");
++        return 1; /* CELL_CANCEL: list UI closed without a selection. */
++    }
++    if (is_save && !save_confirmed("Save", selected)) {
++        printf("[cellSaveData] save confirmation declined for '%s'\n", selected);
++        return 1;
++    }
++    return savedata_execute(selected, is_save, setBuf, funcStat, funcFile, (void*)(uintptr_t)user);
++}
++
++static s32 impl_cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
++                           CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
++                           CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+ {
++    (void)container;
+     printf("[cellSaveData] ListSave2(version=%u)\n", version);
+-
+-    if (!setList || !setBuf || !funcList || !funcStat)
+-        return CELL_SAVEDATA_ERROR_PARAM;
+-
+-    /* Enumerate existing save dirs */
+-    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
+-     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
+-     * prefix EA is the word at +8 and needs translating before it is used as a
+-     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
+-     * pointer, so a cast would have read half of it plus padding. */
+-    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
+-    if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
+-    CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
+-
+-    u32 dirCount = enumerate_save_dirs(
+-        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
+-            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
+-        dirList, dir_max);
+-
+-    /* Call list callback */
+-    CellSaveDataCBResult cbResult;
+-    memset(&cbResult, 0, sizeof(cbResult));
+-    cbResult.result = CELL_SAVEDATA_CBRESULT_OK_NEXT;
+-
+-    CellSaveDataListGet listGet;
+-    memset(&listGet, 0, sizeof(listGet));
+-    listGet.dirListNum = dirCount < dir_max ? dirCount : dir_max;
+-    listGet.dirList = dirList;
+-
+-    CellSaveDataListSet listSet;
+-    memset(&listSet, 0, sizeof(listSet));
+-
+-    char selectedDir[64];
+-    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
+-                                          listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 1,
+-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+-    (void)listSet;
+-
+-    if (cbResult.result < 0) {
+-        free(dirList);
+-        return CELL_SAVEDATA_ERROR_CBRESULT;
+-    }
+-    if (!selectedDir[0] && dirCount > 0)
+-        strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
+-    if (!selectedDir[0]) {
+-        free(dirList);
+-        return CELL_SAVEDATA_ERROR_NODATA;
+-    }
+-
+-    s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile, userdata);
+-    free(dirList);
+-    return result;
+-}
+-
+-s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
+-                           CellSaveDataSetBuf* setBuf,
+-                           CellSaveDataListCallback funcList,
+-                           CellSaveDataStatCallback funcStat,
+-                           CellSaveDataFileCallback funcFile,
++    if (version > 1) return CELL_SAVEDATA_ERROR_PARAM;
++    return savedata_list(1, setList, setBuf, funcList, funcStat, funcFile, userdata);
++}
++static s32 impl_cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
++                           CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
++                           CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+ {
++    (void)container;
+     printf("[cellSaveData] ListLoad2(version=%u)\n", version);
+-
+-    if (!setList || !setBuf || !funcList || !funcStat)
+-        return CELL_SAVEDATA_ERROR_PARAM;
+-
+-    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
+-     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
+-     * prefix EA is the word at +8 and needs translating before it is used as a
+-     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
+-     * pointer, so a cast would have read half of it plus padding. */
+-    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
+-    if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
+-    CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
+-
+-    u32 dirCount = enumerate_save_dirs(
+-        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
+-            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
+-        dirList, dir_max);
+-
+-    CellSaveDataCBResult cbResult;
+-    memset(&cbResult, 0, sizeof(cbResult));
+-    cbResult.result = CELL_SAVEDATA_CBRESULT_OK_NEXT;
+-
+-    CellSaveDataListGet listGet;
+-    memset(&listGet, 0, sizeof(listGet));
+-    listGet.dirListNum = dirCount < dir_max ? dirCount : dir_max;
+-    listGet.dirList = dirList;
+-
+-    CellSaveDataListSet listSet;
+-    memset(&listSet, 0, sizeof(listSet));
+-
+-    char selectedDir[64];
+-    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
+-                                          listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 0,
+-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+-    (void)listSet;
+-
+-    if (cbResult.result < 0) {
+-        free(dirList);
+-        return CELL_SAVEDATA_ERROR_CBRESULT;
+-    }
+-    if (!selectedDir[0] && dirCount > 0)
+-        strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
+-    if (!selectedDir[0]) {
+-        free(dirList);
+-        return CELL_SAVEDATA_ERROR_NODATA;
+-    }
+-
+-    s32 result = savedata_execute(selectedDir, 0, setBuf, funcStat, funcFile, userdata);
+-    free(dirList);
+-    return result;
++    if (version > 1) return CELL_SAVEDATA_ERROR_PARAM;
++    return savedata_list(0, setList, setBuf, funcList, funcStat, funcFile, userdata);
+ }
+ 
+ /* Fixed callbacks have CellSaveDataFixedSet, not CellSaveDataListSet.
+@@ -1106,6 +1247,8 @@
+     u32 prefix = vm_read32((u32)(uintptr_t)setList + 8);
+     u32 count = enumerate_save_dirs(prefix ? (char*)vm_base + prefix : "", dirs, dir_max);
+     u32 listed = count < dir_max ? count : dir_max;
++    s32 sorted = sort_save_dirs(setList, dirs, listed);
++    if (sorted != CELL_OK) { free(dirs); return sorted; }
+     scratch_reset();
+     u32 cb = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+     u32 get = scratch_alloc(0x4C); /* dirNum, dirListNum, dirList, reserved[64] */
+@@ -1153,13 +1296,14 @@
+     /* The selected string may be inside callback scratch, reused by funcStat. */
+     char directory[CELL_SAVEDATA_DIRNAME_SIZE];
+     memcpy(directory, name, len + 1);
++    if (is_save && vm_read32(set + 8) == 0 && !save_confirmed("Save", directory)) return 1;
+     printf("[cellSaveData] %s: proceeding with dir='%s' (%u listed)\n",
+            __func__, directory, listed);
+     return savedata_execute(directory, is_save, setBuf, funcStat, funcFile,
+                             (void*)(uintptr_t)vm_read32(cb + 16));
+ }
+ 
+-s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
++static s32 impl_cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
+                             CellSaveDataSetBuf* setBuf,
+                             CellSaveDataFixedCallback funcFixed,
+                             CellSaveDataStatCallback funcStat,
+@@ -1171,7 +1315,7 @@
+     return savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+ }
+ 
+-s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
++static s32 impl_cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
+                             CellSaveDataSetBuf* setBuf,
+                             CellSaveDataFixedCallback funcFixed,
+                             CellSaveDataStatCallback funcStat,
+@@ -1183,7 +1327,7 @@
+     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+ }
+ 
+-s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
++static s32 impl_cellSaveDataListAutoLoad(u32 version, u32 errDialog,
+                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataFixedCallback funcFixed,
+                             CellSaveDataStatCallback funcStat,
+@@ -1207,30 +1351,18 @@
+     printf("[cellSaveData] AutoSave2(version=%u, dir='%s')\n",
+            version, dirName ? dirName : "<null>");
+ 
+-    /* Delegate to the non-_2 entry, which marshals. This used to call
+-     * savedata_execute(), which invokes funcStat as a HOST function pointer
+-     * with HOST struct addresses -- but funcStat is a guest OPD and the structs
+-     * must live in guest memory, so the callback wrote nothing the caller could
+-     * read and the first dereference faulted. The Simpsons Arcade Game crashed
+-     * exactly here on its first boot, creating its profile right after
+-     * AutoLoad2 had correctly reported ERR_NODATA. The two entries take
+-     * identical arguments; _2 is just the newer SDK name.
+-     *
+-     * savedata_execute() is still behind the List* and Fixed* entries and
+-     * carries the same defect for each of them. Fixing those needs list/file
+-     * marshalling that dispatch_func_stat does not do yet, so they are left
+-     * alone until a title actually reaches one. */
+     return cellSaveDataAutoSave(version, dirName, errDialog, setBuf,
+                                 funcStat, funcFile, container, userdata);
+ }
+ 
+-s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
++static s32 impl_cellSaveDataAutoLoad2(u32 version, const char* dirName,
+                            u32 errDialog,
+                            CellSaveDataSetBuf* setBuf,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+ {
++    if (version > 1 || errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+     dirName = savedata_host_str(dirName);
+     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
+     (void)container;
+@@ -1244,35 +1376,32 @@
+      * into guest BE memory and dispatch through g_ps3_guest_caller.
+      * Even on first-run-no-data, the game observes funcStat fire with
+      * isNewData=1 so its title state machine can advance. */
+-    char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
+-    int is_new = !dir_has_save(save_path);
+-
+-    (void)is_new;
+-    /* Full sequence: funcStat, then the funcFile loop that reads the files.
+-     * Stopping after funcStat (OK_NEXT) left a title with a save on disk
+-     * waiting for its data forever -- GH3's second boot sat on "Checking HDD".
+-     *
+-     * flОw first-boot: its funcStat returns ERR_NODATA on a new profile
+-     * (isNewData=1). The callback already ran and told the game "no save",
+-     * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
+-     * parked in MODE_AUTO_LOAD (no app loop, no flips).
+-     * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
+-     * and a real title handles it; that flОw does not is a bug somewhere in
+-     * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
+-     * compat return until that is understood -- it was dropped once already
+-     * in the fold merge and cost a boot regression. */
+     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
+-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+-}
+-
+-s32 cellSaveDataDelete2(u32 container)
+-{
+-    printf("[cellSaveData] Delete2(container=%u)\n", container);
+-
+-    /* Without a directory name we can't delete anything meaningful.
+-       This variant typically shows a UI for deletion - just succeed. */
+-    return CELL_OK;
++    return r;
++}
++
++static s32 impl_cellSaveDataDelete2(u32 container)
++{
++    (void)container;
++    const char* name = getenv("PS3_SAVEDATA_DELETE_DIR");
++    char selected[64] = "";
++    if (!name || !*name) {
++        CellSaveDataDirList* dirs = calloc(CELL_SAVEDATA_DIRLIST_MAX, sizeof(*dirs));
++        if (!dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
++        u32 count = enumerate_save_dirs("", dirs, CELL_SAVEDATA_DIRLIST_MAX);
++        if (count > CELL_SAVEDATA_DIRLIST_MAX) count = CELL_SAVEDATA_DIRLIST_MAX;
++        select_save_ui(dirs, count, NULL, "Delete", selected);
++        free(dirs);
++        name = selected;
++    }
++    if (!*name) return 1; /* CELL_CANCEL */
++    if (!valid_save_name(name)) return CELL_SAVEDATA_ERROR_PARAM;
++    char path[1024]; build_save_path(path, sizeof(path), name);
++    if (!dir_has_save(path)) return CELL_SAVEDATA_ERROR_NODATA;
++    if (!save_confirmed("Delete", name)) return 1;
++    s32 rc = delete_save_path(path);
++    printf("[cellSaveData] Delete2 dir='%s' -> 0x%08X\n", name, (u32)rc);
++    return rc;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -1332,13 +1461,14 @@
+                                   funcFile, container, NULL);
+ }
+ 
+-s32 cellSaveDataAutoSave(u32 version, const char* dirName,
++static s32 impl_cellSaveDataAutoSave(u32 version, const char* dirName,
+                           u32 errDialog,
+                           CellSaveDataSetBuf* setBuf,
+                           CellSaveDataStatCallback funcStat,
+                           CellSaveDataFileCallback funcFile,
+                           u32 container, void* userdata)
+ {
++    if (version > 1 || errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+     dirName = savedata_host_str(dirName);
+     (void)errDialog; (void)funcFile; (void)container;
+     printf("[cellSaveData] AutoSave(version=%u, dir='%s')\n",
+@@ -1346,33 +1476,17 @@
+     if (!dirName || !setBuf || !funcStat)
+         return CELL_SAVEDATA_ERROR_PARAM;
+ 
+-    /* This used to return CELL_OK WITHOUT running funcStat -- the game believed
+-     * its profile saved while nothing happened (silent data loss). Run the
+-     * guest funcStat callback the same proven way cellSaveDataAutoLoad does
+-     * (dispatch_func_stat marshals through g_ps3_guest_caller). The callback
+-     * fires and returns a real result the game can act on. (Persisting the file
+-     * bytes needs the funcFile marshalling loop; the stat callback running is
+-     * the correct, honest first step and matches the load path's behaviour.) */
+-    char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
+-    int is_new = !dir_has_save(save_path);
+-
+-    (void)is_new;
+-    /* Run the whole sequence: funcStat, then the funcFile loop that writes the
+-     * files. Stopping after funcStat left the title waiting for file callbacks
+-     * that never came -- GH3 sat on "Saving..." forever after its first
+-     * autosave. savedata_execute marshals both callbacks through guest memory
+-     * (dispatch_func_stat_full / dispatch_func_file). */
+     return savedata_execute(dirName, 1, setBuf, funcStat, funcFile, userdata);
+ }
+ 
+-s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
++static s32 impl_cellSaveDataAutoLoad(u32 version, const char* dirName,
+                           u32 errDialog,
+                           CellSaveDataSetBuf* setBuf,
+                           CellSaveDataStatCallback funcStat,
+                           CellSaveDataFileCallback funcFile,
+                           u32 container, void* userdata)
+ {
++    if (version > 1 || errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+     dirName = savedata_host_str(dirName);
+     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
+     (void)container;
+@@ -1381,25 +1495,18 @@
+     if (!dirName || !setBuf || !funcStat)
+         return CELL_SAVEDATA_ERROR_PARAM;
+ 
+-    char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
+-    int is_new = !dir_has_save(save_path);
+-
+-    (void)is_new;
+-    /* Same as cellSaveDataAutoLoad2 above, including flОw's first-boot compat
+-     * return (it calls this old non-_2 variant). */
+     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
+-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+-}
+-
+-s32 cellSaveDataDelete(u32 version, const char* dirName,
+-                        u32 container)
+-{
+-    (void)version;
++    return r;
++}
++
++static s32 impl_cellSaveDataDelete(u32 version, const char* dirName, u32 container)
++{
++    (void)container;
+     dirName = savedata_host_str(dirName);
+-    printf("[cellSaveData] Delete(dir='%s', container=%u)\n",
+-           dirName ? dirName : "<null>", container);
+-    return CELL_OK;
++    if (version > 1 || !valid_save_name(dirName)) return CELL_SAVEDATA_ERROR_PARAM;
++    char path[1024]; build_save_path(path, sizeof(path), dirName);
++    if (!dir_has_save(path)) return CELL_SAVEDATA_ERROR_NODATA;
++    return delete_save_path(path);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -1522,3 +1629,122 @@
+     return cellSaveDataAutoLoad(version, dirName, errDialog, setBuf,
+                                 funcStat, funcFile, container, NULL);
+ }
++
++/* Firmware allows only one savedata operation at a time. */
++static atomic_flag s_savedata_busy = ATOMIC_FLAG_INIT;
++
++s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
++                           CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
++                           CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
++                           u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataListSave2(version, setList, setBuf, funcList, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
++                           CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
++                           CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
++                           u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataListLoad2(version, setList, setBuf, funcList, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
++                            CellSaveDataSetBuf* setBuf,
++                            CellSaveDataFixedCallback funcFixed,
++                            CellSaveDataStatCallback funcStat,
++                            CellSaveDataFileCallback funcFile,
++                            u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataFixedSave2(version, setList, setBuf, funcFixed, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
++                            CellSaveDataSetBuf* setBuf,
++                            CellSaveDataFixedCallback funcFixed,
++                            CellSaveDataStatCallback funcStat,
++                            CellSaveDataFileCallback funcFile,
++                            u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataFixedLoad2(version, setList, setBuf, funcFixed, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
++                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
++                            CellSaveDataFixedCallback funcFixed,
++                            CellSaveDataStatCallback funcStat,
++                            CellSaveDataFileCallback funcFile,
++                            u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataListAutoLoad(version, errDialog, setList, setBuf, funcFixed, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataAutoSave(u32 version, const char* dirName,
++                          u32 errDialog,
++                          CellSaveDataSetBuf* setBuf,
++                          CellSaveDataStatCallback funcStat,
++                          CellSaveDataFileCallback funcFile,
++                          u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataAutoSave(version, dirName, errDialog, setBuf, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
++                           u32 errDialog,
++                           CellSaveDataSetBuf* setBuf,
++                           CellSaveDataStatCallback funcStat,
++                           CellSaveDataFileCallback funcFile,
++                           u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataAutoLoad2(version, dirName, errDialog, setBuf, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
++                          u32 errDialog,
++                          CellSaveDataSetBuf* setBuf,
++                          CellSaveDataStatCallback funcStat,
++                          CellSaveDataFileCallback funcFile,
++                          u32 container, void* userdata)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataAutoLoad(version, dirName, errDialog, setBuf, funcStat, funcFile, container, userdata);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataDelete2(u32 container)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataDelete2(container);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
++
++s32 cellSaveDataDelete(u32 version, const char* dirName, u32 container)
++{
++    if (atomic_flag_test_and_set(&s_savedata_busy)) return CELL_SAVEDATA_ERROR_BUSY;
++    s32 rc = impl_cellSaveDataDelete(version, dirName, container);
++    atomic_flag_clear(&s_savedata_busy);
++    return rc;
++}
+--- a/libs/system/cellSaveData.h
++++ b/libs/system/cellSaveData.h
+@@ -101,14 +101,16 @@
+ #define CELL_SAVEDATA_ERROR_NOTSUPPORTED   (s32)(CELL_ERROR_BASE_SYSUTIL_SAVE | 0x0C)
+ 
+ /* ---------------------------------------------------------------------------
+- * Structures
++ * Host-side structures. Guest structures use BE scalars and 32-bit pointers;
++ * marshal them explicitly rather than casting these host models.
+  * -----------------------------------------------------------------------*/
+ 
+ typedef struct CellSaveDataCBResult {
+     s32  result;
+     u32  progressBarInc;
+     s32  errNeedSizeKB;
+-    char invalidMsg[CELL_SAVEDATA_INVALIDMSG_MAX];
++    char* invalidMsg;
++    void* userdata;
+ } CellSaveDataCBResult;
+ 
+ typedef struct CellSaveDataDirList {
+@@ -118,8 +120,10 @@
+ } CellSaveDataDirList;
+ 
+ typedef struct CellSaveDataListGet {
++    u32  dirNum;
+     u32  dirListNum;
+     CellSaveDataDirList* dirList;
++    char reserved[64];
+ } CellSaveDataListGet;
+ 
+ typedef struct CellSaveDataListSet {
+@@ -127,7 +131,8 @@
+     char* focusDirName;
+     u32  fixedListNum;
+     CellSaveDataDirList* fixedList;
+-    char reserved[12];
++    struct CellSaveDataListNewData* newData;
++    void* reserved;
+ } CellSaveDataListSet;
+ 
+ typedef struct CellSaveDataFixedSet {
+@@ -140,13 +145,14 @@
+     char* title;
+     u32   iconBufSize;
+     void* iconBuf;
++    void* reserved;
+ } CellSaveDataNewDataIcon;
+ 
+ typedef struct CellSaveDataListNewData {
+     u32  iconPosition;
+     char* dirName;
+     CellSaveDataNewDataIcon* icon;
+-    char reserved[8];
++    void* reserved;
+ } CellSaveDataListNewData;
+ 
+ typedef struct CellSaveDataSystemFileParam {
+@@ -173,7 +179,7 @@
+     s64  st_atime;
+     s64  st_mtime;
+     s64  st_ctime;
+-    char fileName[CELL_SAVEDATA_FILENAME_SIZE + 3]; /* padded */
++    char fileName[CELL_SAVEDATA_FILENAME_SIZE];
+     char reserved2[3];
+ } CellSaveDataFileStat;
+ 
+@@ -188,6 +194,7 @@
+     u32  fileNum;
+     u32  fileListNum;
+     CellSaveDataFileStat* fileList;
++    char reserved[64];
+ } CellSaveDataStatGet;
+ 
+ typedef struct CellSaveDataStatSet {
+@@ -216,6 +223,7 @@
+ typedef struct CellSaveDataDoneGet {
+     s32  excResult;
+     char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
++    s32  sizeKB;
+     s32  hddFreeSizeKB;
+     char reserved[64];
+ } CellSaveDataDoneGet;
+@@ -250,6 +258,7 @@
+     u32  sortType;
+     u32  sortOrder;
+     char* dirNamePrefix;
++    void* reserved;
+ } CellSaveDataSetList;
+ 
+ typedef struct CellSaveDataSetBuf {
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -33,6 +33,9 @@
+ /* ---------------------------------------------------------------------------
+  * Internal state
+  * -----------------------------------------------------------------------*/
++
++static int s_title_metadata_loaded = 0;
++static void load_title_metadata(void);
+ 
+ static char s_title_id[64]  = "BLES00000";
+ static char s_title[256]    = "Unknown Title";
+@@ -191,6 +194,7 @@
+ void cellGame_set_title_id(const char* title_id)
+ {
+     if (!title_id) return;
++    s_title_metadata_loaded = 1;
+     strncpy(s_title_id, title_id, sizeof(s_title_id) - 1);
+     s_title_id[sizeof(s_title_id) - 1] = '\0';
+ }
+@@ -207,6 +211,7 @@
+  * which is confusing the moment you run two ports side by side. */
+ const char* cellGame_get_title(void)
+ {
++    load_title_metadata();
+     return s_title;
+ }
+ 
+@@ -286,6 +291,7 @@
+  * can't be read (keeps the game working without it). */
+ void cellGame_init_from_paramsfo(const char* sfo_path)
+ {
++    s_title_metadata_loaded = 1;
+     char tmp[256];
+     if (sfo_read_string(sfo_path, "TITLE_ID", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+         strncpy(s_title_id, tmp, sizeof(s_title_id) - 1);
+@@ -310,8 +316,20 @@
+     }
+ }
+ 
++/* Project runners need not duplicate metadata initialization. Resolve the
++ * mounted disc lazily before reporting its title/version or boot paths. */
++static void load_title_metadata(void)
++{
++    if (s_title_metadata_loaded) return;
++    const char* root = getenv("PS3_VFS_ROOT");
++    if (!root || !*root) root = ppu_vfs_root;
++    if (!root || !*root || !strcmp(root, ".")) return;
++    char path[1024]; snprintf(path, sizeof(path), "%s/PS3_GAME/PARAM.SFO", root);
++    cellGame_init_from_paramsfo(path);
++}
++
+ /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
+-const char* cellGame_get_title_id(void) { return s_title_id; }
++const char* cellGame_get_title_id(void) { load_title_metadata(); return s_title_id; }
+ 
+ s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved)
+ {
+@@ -325,6 +343,7 @@
+ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+                        char* dirName)
+ {
++    load_title_metadata();
+     printf("[cellGame] BootCheck()\n");
+ 
+     /* Build paths based on title ID */
+@@ -382,6 +401,11 @@
+            s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
+ 
+     if (!s_check_is_disc) {
++        /* DataCheck can precede BootCheck and can name a different directory. */
++        snprintf(s_content_info_path, sizeof(s_content_info_path),
++                 "%s/%s", content_root(), s_check_dir);
++        snprintf(s_usrdir_path, sizeof(s_usrdir_path),
++                 "%s/%s/USRDIR", content_root(), s_check_dir);
+         /* Ensure directories exist. IMPORTANT: also create them at the SAME host
+          * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
+          * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
+@@ -390,12 +414,6 @@
+          * forever and exits. Create it where cellFs will actually find it. */
+         ensure_dirs(s_content_info_path);
+         ensure_dirs(s_usrdir_path);
+-        {
+-            extern const char* ppu_vfs_root;
+-            char vpath[CELL_GAME_PATH_MAX];
+-            snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);
+-            ensure_dirs(vpath);
+-        }
+     }
+ 
+     /* Both paths are GUEST addresses; format into a host temp, copy into the
+@@ -661,6 +679,7 @@
+ 
+ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
+ {
++    load_title_metadata();
+     printf("[cellGame] GetParamString(id=%d, bufsize=%u)\n", id, bufsize);
+ 
+     /* `buf` is a GUEST address (raw r4); translate through vm_base. Strings are
+--- /dev/null
++++ b/libs/system/savedata_sfo.h
+@@ -0,0 +1,196 @@
++/* Binary PSF metadata used by cellSaveData and RPCS3 (little endian on disk).
++ * Keep unknown entries when updating imported saves. Secure-file flags are
++ * integer entries named *<filename>; PARAM.PFD is not a plaintext manifest. */
++#ifndef PS3RECOMP_SAVEDATA_SFO_H
++#define PS3RECOMP_SAVEDATA_SFO_H
++
++#define SAVE_SFO_MAX 256
++typedef struct SaveSfoEntry {
++    char key[64];
++    u16 format;
++    u32 size, capacity;
++    u8* data;
++} SaveSfoEntry;
++typedef struct SaveSfo { u32 count; SaveSfoEntry entries[SAVE_SFO_MAX]; } SaveSfo;
++
++static u32 sfo_le32(const u8* p)
++{
++    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
++}
++static void sfo_put32(u8* p, u32 n)
++{
++    p[0] = (u8)n; p[1] = (u8)(n >> 8); p[2] = (u8)(n >> 16); p[3] = (u8)(n >> 24);
++}
++static void sfo_free(SaveSfo* s)
++{
++    for (u32 i = 0; i < s->count; i++) free(s->entries[i].data);
++    memset(s, 0, sizeof(*s));
++}
++static SaveSfoEntry* sfo_find(SaveSfo* s, const char* key)
++{
++    for (u32 i = 0; i < s->count; i++)
++        if (!strcmp(s->entries[i].key, key)) return &s->entries[i];
++    return NULL;
++}
++static int sfo_set(SaveSfo* s, const char* key, u16 format,
++                   const void* data, u32 size, u32 capacity)
++{
++    if (strlen(key) >= 64 || size > capacity || capacity > 65536) return 0;
++    SaveSfoEntry* e = sfo_find(s, key);
++    if (!e) {
++        if (s->count == SAVE_SFO_MAX) return 0;
++        e = &s->entries[s->count++];
++        strcpy(e->key, key);
++    }
++    u8* copy = calloc(1, capacity ? capacity : 1);
++    if (!copy) return 0;
++    if (size) memcpy(copy, data, size);
++    free(e->data); e->data = copy;
++    e->format = format; e->size = size; e->capacity = capacity;
++    return 1;
++}
++static int sfo_set_int(SaveSfo* s, const char* key, u32 n)
++{
++    u8 data[4]; sfo_put32(data, n);
++    return sfo_set(s, key, 0x0404, data, 4, 4);
++}
++static int sfo_set_str(SaveSfo* s, const char* key, const char* text, u32 capacity)
++{
++    u32 len = (u32)strnlen(text, capacity);
++    if (len == capacity) return 0;
++    return sfo_set(s, key, 0x0204, text, len + 1, capacity);
++}
++static void sfo_remove(SaveSfo* s, const char* key)
++{
++    SaveSfoEntry* e = sfo_find(s, key);
++    if (!e) return;
++    u32 i = (u32)(e - s->entries);
++    free(e->data);
++    memmove(e, e + 1, (s->count - i - 1) * sizeof(*e));
++    memset(&s->entries[--s->count], 0, sizeof(*e));
++}
++static int sfo_load(const char* path, SaveSfo* s)
++{
++    memset(s, 0, sizeof(*s));
++    FILE* f = fopen(path, "rb");
++    if (!f) return 0;
++    fseek(f, 0, SEEK_END); long length = ftell(f); rewind(f);
++    if (length < 20 || length > 1024 * 1024) { fclose(f); return 0; }
++    u8* bytes = malloc((size_t)length);
++    if (!bytes) { fclose(f); return 0; }
++    int ok = fread(bytes, 1, (size_t)length, f) == (size_t)length;
++    fclose(f);
++    u32 keys = sfo_le32(bytes + 8), data = sfo_le32(bytes + 12);
++    u32 count = sfo_le32(bytes + 16);
++    ok = ok && !memcmp(bytes, "\0PSF", 4) && count <= SAVE_SFO_MAX &&
++         20 + count * 16 <= keys && keys <= data && data <= (u32)length;
++    for (u32 i = 0; ok && i < count; i++) {
++        const u8* e = bytes + 20 + i * 16;
++        u32 key = keys + ((u32)e[0] | (u32)e[1] << 8);
++        u32 size = sfo_le32(e + 4), cap = sfo_le32(e + 8), off = sfo_le32(e + 12);
++        ok = key < data && memchr(bytes + key, 0, data - key) &&
++             size <= cap && cap <= 65536 && (u64)data + off + cap <= (u32)length;
++        if (ok) ok = sfo_set(s, (char*)bytes + key, (u16)(e[2] | e[3] << 8),
++                             bytes + data + off, size, cap);
++    }
++    free(bytes);
++    if (!ok) sfo_free(s);
++    return ok;
++}
++static int sfo_entry_compare(const void* a, const void* b)
++{
++    return strcmp(((const SaveSfoEntry*)a)->key, ((const SaveSfoEntry*)b)->key);
++}
++static int sfo_store(const char* path, SaveSfo* s)
++{
++    qsort(s->entries, s->count, sizeof(s->entries[0]), sfo_entry_compare);
++    u32 key_size = 0, data_size = 0;
++    for (u32 i = 0; i < s->count; i++) {
++        key_size += (u32)strlen(s->entries[i].key) + 1;
++        data_size += (s->entries[i].capacity + 3) & ~3u;
++    }
++    u32 keys = 20 + s->count * 16, data = (keys + key_size + 3) & ~3u;
++    u32 size = data + data_size;
++    u8* bytes = calloc(1, size);
++    if (!bytes) return 0;
++    memcpy(bytes, "\0PSF", 4); sfo_put32(bytes + 4, 0x101);
++    sfo_put32(bytes + 8, keys); sfo_put32(bytes + 12, data); sfo_put32(bytes + 16, s->count);
++    u32 k = 0, d = 0;
++    for (u32 i = 0; i < s->count; i++) {
++        SaveSfoEntry* entry = &s->entries[i];
++        u8* e = bytes + 20 + i * 16;
++        e[0] = (u8)k; e[1] = (u8)(k >> 8);
++        e[2] = (u8)entry->format; e[3] = (u8)(entry->format >> 8);
++        sfo_put32(e + 4, entry->size); sfo_put32(e + 8, entry->capacity); sfo_put32(e + 12, d);
++        strcpy((char*)bytes + keys + k, entry->key);
++        memcpy(bytes + data + d, entry->data, entry->size);
++        k += (u32)strlen(entry->key) + 1; d += (entry->capacity + 3) & ~3u;
++    }
++    char temp[1100]; snprintf(temp, sizeof(temp), "%s.tmp", path);
++    FILE* f = fopen(temp, "wb");
++    int ok = f && fwrite(bytes, 1, size, f) == size;
++    if (f && fclose(f) != 0) ok = 0;
++    free(bytes);
++    if (ok) ok = rename(temp, path) == 0;
++    if (!ok) remove(temp);
++    return ok;
++}
++static int read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
++{
++    memset(param, 0, sizeof(*param));
++    char path[1024]; snprintf(path, sizeof(path), "%s/PARAM.SFO", save_path);
++    SaveSfo s;
++    if (!sfo_load(path, &s)) return 0;
++    const char* keys[] = { "TITLE", "SUB_TITLE", "DETAIL", "SAVEDATA_LIST_PARAM" };
++    char* dest[] = { param->title, param->subTitle, param->detail, param->listParam };
++    u32 sizes[] = { 128, 128, 1024, 8 };
++    for (u32 i = 0; i < 4; i++) {
++        SaveSfoEntry* e = sfo_find(&s, keys[i]);
++        if (e) memcpy(dest[i], e->data, e->size < sizes[i] ? e->size : sizes[i] - 1);
++    }
++    SaveSfoEntry* e = sfo_find(&s, "ATTRIBUTE");
++    if (e && e->size == 4) param->attribute = sfo_le32(e->data);
++    sfo_free(&s);
++    return 1;
++}
++static int write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
++{
++    char path[1024]; snprintf(path, sizeof(path), "%s/PARAM.SFO", save_path);
++    SaveSfo s; sfo_load(path, &s);
++    const char* name = strrchr(save_path, '/'); name = name ? name + 1 : save_path;
++    int ok = (sfo_find(&s, "ACCOUNT_ID") ||
++              sfo_set(&s, "ACCOUNT_ID", 0x0004, "0000000000000000", 16, 16)) &&
++             sfo_set_int(&s, "ATTRIBUTE", param->attribute) &&
++             sfo_set_str(&s, "CATEGORY", "SD", 4) &&
++             (sfo_find(&s, "PARAMS") || sfo_set_str(&s, "PARAMS", "", 1024)) &&
++             (sfo_find(&s, "PARAMS2") || sfo_set_str(&s, "PARAMS2", "", 12)) &&
++             (sfo_find(&s, "PARENTAL_LEVEL") || sfo_set_int(&s, "PARENTAL_LEVEL", 0)) &&
++             sfo_set_str(&s, "SAVEDATA_DIRECTORY", name, 32) &&
++             sfo_set_str(&s, "TITLE", param->title, 128) &&
++             sfo_set_str(&s, "SUB_TITLE", param->subTitle, 128) &&
++             sfo_set_str(&s, "DETAIL", param->detail, 1024) &&
++             sfo_set_str(&s, "SAVEDATA_LIST_PARAM", param->listParam, 8);
++    if (ok) ok = sfo_store(path, &s);
++    sfo_free(&s);
++    return ok;
++}
++static int sfo_file_flag(const char* save_path, const char* name, int value)
++{
++    char path[1024], key[64];
++    snprintf(path, sizeof(path), "%s/PARAM.SFO", save_path);
++    snprintf(key, sizeof(key), "*%s", name);
++    SaveSfo s;
++    if (!sfo_load(path, &s)) return 0;
++    int ok;
++    if (value == -2) {
++        SaveSfoEntry* e = sfo_find(&s, key);
++        ok = e && e->size == 4 && sfo_le32(e->data) != 0;
++    } else {
++        if (value < 0) { sfo_remove(&s, key); ok = 1; }
++        else ok = sfo_set_int(&s, key, (u32)value);
++        if (ok) ok = sfo_store(path, &s);
++    }
++    sfo_free(&s);
++    return ok;
++}
++#endif
+--- /dev/null
++++ b/libs/system/savedata_macos.h
+@@ -0,0 +1,9 @@
++#ifndef PS3RECOMP_SAVEDATA_MACOS_H
++#define PS3RECOMP_SAVEDATA_MACOS_H
++#include "cellSaveData.h"
++/* -2 = no desktop/headless; -1 = cancelled; 0 = selected. Host pointers only. */
++int savedata_macos_select(const CellSaveDataDirList* dirs, u32 count,
++                         const char* new_name, const char* focused,
++                         const char* action, char selected[32]);
++int savedata_macos_confirm(const char* action, const char* directory);
++#endif
+--- /dev/null
++++ b/libs/system/savedata_macos.m
+@@ -0,0 +1,82 @@
++/* Native save dialogs run on the application's main thread. The guest save
++ * thread blocks while the macOS runner continues servicing its run loop. */
++#import <AppKit/AppKit.h>
++#include "savedata_macos.h"
++#include <stdlib.h>
++#include <string.h>
++
++static int headless(void)
++{
++    const char* mode = getenv("PS3_SAVEDATA_UI");
++    const char* metal = getenv("PS3RECOMP_METAL_HEADLESS");
++    return (mode && !strcmp(mode, "headless")) || (metal && !strcmp(metal, "1"));
++}
++
++int savedata_macos_select(const CellSaveDataDirList* dirs, u32 count,
++                         const char* new_name, const char* focused,
++                         const char* action, char selected[32])
++{
++    if (headless()) return -2;
++    __block int result = -2;
++    void (^show)(void) = ^{
++        if (!NSApp) return;
++        @autoreleasepool {
++            NSAlert* alert = [[NSAlert alloc] init];
++            alert.messageText = [NSString stringWithFormat:@"%s game data", action];
++            if (!count && (!new_name || !*new_name)) {
++                alert.informativeText = @"No save data is available.";
++                [alert addButtonWithTitle:@"OK"];
++                [alert runModal]; result = -1;
++            } else {
++                alert.informativeText = @"Choose a save slot.";
++                [alert addButtonWithTitle:[NSString stringWithUTF8String:action]];
++                [alert addButtonWithTitle:@"Cancel"];
++                NSPopUpButton* menu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 360, 28) pullsDown:NO];
++                NSInteger focus = 0;
++                for (u32 i = 0; i < count; i++) {
++                    NSString* label = [NSString stringWithUTF8String:dirs[i].dirName];
++                    [menu addItemWithTitle:label ?: @"Save"];
++                    if (focused && !strcmp(focused, dirs[i].dirName)) focus = i;
++                }
++                if (new_name && *new_name) {
++                    [menu addItemWithTitle:[NSString stringWithFormat:@"New save (%s)", new_name]];
++                    if (focused && !strcmp(focused, new_name)) focus = count;
++                }
++                [menu selectItemAtIndex:focus]; alert.accessoryView = menu;
++                if ([alert runModal] == NSAlertFirstButtonReturn) {
++                    NSInteger i = menu.indexOfSelectedItem;
++                    const char* name = i < count ? dirs[i].dirName : new_name;
++                    snprintf(selected, 32, "%s", name); result = 0;
++                } else result = -1;
++                [menu release];
++            }
++            [alert release];
++        }
++    };
++    if ([NSThread isMainThread]) show();
++    else dispatch_sync(dispatch_get_main_queue(), show);
++    return result;
++}
++
++int savedata_macos_confirm(const char* action, const char* directory)
++{
++    if (headless()) return -2;
++    __block int result = -2;
++    void (^show)(void) = ^{
++        if (!NSApp) return;
++        @autoreleasepool {
++            NSAlert* alert = [[NSAlert alloc] init];
++            alert.messageText = [NSString stringWithFormat:@"%s %@?", action,
++                [NSString stringWithUTF8String:directory] ?: @"save data"];
++            alert.informativeText = !strcmp(action, "Delete")
++                ? @"This save will be deleted." : @"Your current progress will be written to this slot.";
++            [alert addButtonWithTitle:[NSString stringWithUTF8String:action]];
++            [alert addButtonWithTitle:@"Cancel"];
++            result = [alert runModal] == NSAlertFirstButtonReturn;
++            [alert release];
++        }
++    };
++    if ([NSThread isMainThread]) show();
++    else dispatch_sync(dispatch_get_main_queue(), show);
++    return result;
++}
+--- a/libs/system/tests/test_savedata_fixed.c
++++ b/libs/system/tests/test_savedata_fixed.c
+@@ -1,5 +1,6 @@
+ /* clang -std=gnu17 -I include libs/system/tests/test_savedata_fixed.c
+  * -Wl,-dead_strip -o /tmp/test_savedata_fixed && /tmp/test_savedata_fixed */
++#define PS3RECOMP_SAVEDATA_NO_UI
+ #include "../cellSaveData.c"
+ #include <assert.h>
+ uint8_t* vm_base;
+@@ -60,12 +61,11 @@
+      * decide isNewData (an empty directory is a half-made one, not a save).
+      * Give the fixtures theirs, or the "existing directory" assertion in
+      * guest_callback is checking a directory that now reports isNewData=1. */
+-    static const unsigned char psf_magic[4] = { 0, 'P', 'S', 'F' };
++    CellSaveDataSystemFileParam param = {0};
++    strcpy(param.title, "Fixed callback fixture");
+     for (int n = 1; n <= 2; n++) {
+-        snprintf(path, sizeof(path), "%s/TEST0000%d/PARAM.SFO", root, n);
+-        FILE* f = fopen(path, "wb"); assert(f);
+-        assert(fwrite(psf_magic, 1, sizeof psf_magic, f) == sizeof psf_magic);
+-        fclose(f);
++        snprintf(path, sizeof(path), "%s/TEST0000%d", root, n);
++        assert(write_param_sfo(path, &param));
+     }
+     vm_base = calloc(1, 0x200000); assert(vm_base);
+     assert(cellSaveData_set_scratch_region(0x100000, 0x20000) == CELL_OK);
+--- a/libs/system/tests/test_savedata_io.c
++++ b/libs/system/tests/test_savedata_io.c
+@@ -1,5 +1,6 @@
+ /* clang -std=gnu17 -I include libs/system/tests/test_savedata_io.c
+  * -Wl,-dead_strip -o /tmp/test_savedata_io && /tmp/test_savedata_io */
++#define PS3RECOMP_SAVEDATA_NO_UI
+ #include "../cellSaveData.c"
+ #include <assert.h>
+ uint8_t* vm_base;
+--- a/libs/system/tests/test_game_paths.c
++++ b/libs/system/tests/test_game_paths.c
+@@ -15,6 +15,7 @@
+ void spu_lockline_unlock(void) {}
+ 
+ ps3_guest_caller_fn g_ps3_guest_caller;
++const char* ppu_vfs_root = ".";
+ 
+ int main(void)
+ {
+@@ -24,11 +25,19 @@
+     cellGame_set_content_path(root);
+     memcpy(vm_base + 0x100, "TEST00000", 10);
+     assert(cellGameDataCheck(3, (void*)0x100, (void*)0x200) == CELL_GAME_RET_NONE);
++    char disc[256], host[256];
++    snprintf(disc, sizeof(disc), "%s/disc", root);
++    assert(mkdir(disc, 0700) == 0); ppu_vfs_root = disc;
++    /* DataCheck before BootCheck: create the checked HDD directory and never
++     * mirror game data into the mounted disc. */
++    assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
++    assert(strcmp((char*)vm_base + 0x400, "/dev_hdd0/game/TEST00000") == 0);
++    snprintf(host, sizeof(host), "%s/game", disc); assert(!dir_exists(host));
++    assert(rmdir(disc) == 0); ppu_vfs_root = ".";
+     assert(cellGameCreateGameData((void*)0x300, (void*)0x400, (void*)0x500) == CELL_OK);
+     assert(strcmp((char*)vm_base + 0x400, "/dev_hdd0/game/TEST00000") == 0);
+     assert(strcmp((char*)vm_base + 0x500, "/dev_hdd0/game/TEST00000/USRDIR") == 0);
+     assert(cellGameDataCheck(3, (void*)0x100, NULL) == CELL_OK);
+-    char host[256];
+     snprintf(host, sizeof(host), "%s/TEST00000/USRDIR", root);
+     assert(dir_exists(host)); assert(rmdir(host) == 0);
+     snprintf(host, sizeof(host), "%s/TEST00000", root);
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -49,7 +49,8 @@
+ if(APPLE)
+     enable_language(OBJC)
+     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+-                            "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m")
++                            "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
++                            "${CMAKE_CURRENT_SOURCE_DIR}/libs/system/savedata_macos.m")
+ endif()
+ # The HLSL -> MSL translator is C++ (it drives glslang's C++ API) and compiles
+ # to a stub wherever the shader tools are absent, so it is part of the

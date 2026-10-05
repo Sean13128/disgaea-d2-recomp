@@ -1,0 +1,141 @@
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -48,6 +48,7 @@
+  */
+ #import <Metal/Metal.h>
+ #import <QuartzCore/CAMetalLayer.h>
++#import <QuartzCore/CATransaction.h>
+ #if !TARGET_OS_IPHONE
+ #  import <AppKit/AppKit.h>
+ #endif
+@@ -73,6 +74,7 @@
+ static id<MTLTexture>      s_offscreen;  /* headless only   */
+ static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+ static NSWindow*           s_window;
++static id                  s_menu_monitor;
+ static int                 s_headless;
+ static int                 s_closed;
+ static int                 s_ready;
+@@ -362,6 +364,11 @@
+     if (!w || !h || (w == s_width && h == s_height)) return;
+     s_width = w; s_height = h;
+     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
++#if !TARGET_OS_IPHONE
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [s_window.contentView setNeedsLayout:YES];
++    });
++#endif
+     if (s_depth && create_depth() != 0)
+         fprintf(stderr, "[RSX metal] depth/stencil resize to %ux%u failed; "
+                         "the old buffer stays bound\n", w, h);
+@@ -460,13 +467,54 @@
+ }
+ 
+ #if !TARGET_OS_IPHONE
++/* Scale only the presentation layer. Guest targets and viewports keep their
++ * original pixel dimensions, including when entering a Retina full screen. */
++@interface Ps3MetalView : NSView
++@end
++@implementation Ps3MetalView
++- (void)layout
++{
++    [super layout];
++    CGSize pixels = s_layer.drawableSize;
++    if (!pixels.width || !pixels.height) return;
++    NSRect bounds = self.bounds;
++    CGFloat scale = MIN(bounds.size.width / pixels.width, bounds.size.height / pixels.height);
++    CGSize size = CGSizeMake(pixels.width * scale, pixels.height * scale);
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    s_layer.frame = CGRectMake((bounds.size.width - size.width) / 2,
++                              (bounds.size.height - size.height) / 2,
++                              size.width, size.height);
++    [CATransaction commit];
++}
++@end
++
++@interface Ps3MetalWindow : NSWindow
++@end
++@implementation Ps3MetalWindow
++- (BOOL)performKeyEquivalent:(NSEvent*)event
++{
++    NSEventModifierFlags flags = event.modifierFlags &
++        (NSEventModifierFlagCommand | NSEventModifierFlagControl |
++         NSEventModifierFlagOption | NSEventModifierFlagShift);
++    if ([event.charactersIgnoringModifiers.lowercaseString isEqualToString:@"f"] &&
++        (flags == NSEventModifierFlagCommand ||
++         flags == (NSEventModifierFlagCommand | NSEventModifierFlagControl))) {
++        [self toggleFullScreen:nil];
++        fprintf(stderr, "[RSX metal] fullscreen toggle\n");
++        return YES;
++    }
++    return [super performKeyEquivalent:event];
++}
++@end
++
+ static int create_window_impl(const char* title)
+ {
+     [NSApplication sharedApplication];
+     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
+     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
+-    s_window = [[NSWindow alloc]
++    s_window = [[Ps3MetalWindow alloc]
+         initWithContentRect:frame
+                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                              NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+@@ -475,6 +523,8 @@
+     if (!s_window) return -1;
+ 
+     [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
++    s_window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
++    s_window.contentMinSize = NSMakeSize(320, 180);
+     [s_window center];
+ 
+     s_layer = [CAMetalLayer layer];
+@@ -483,11 +533,34 @@
+     s_layer.framebufferOnly = YES;
+     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
+ 
+-    NSView* view = [s_window contentView];
++    NSView* view = [[Ps3MetalView alloc] initWithFrame:frame];
++    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++    [s_window setContentView:view];
+     [view setWantsLayer:YES];
+-    [view setLayer:s_layer];
++    view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
++    [view.layer addSublayer:s_layer];
++    [view setNeedsLayout:YES];
++
++    if (!NSApp.mainMenu) {
++        NSMenu* menu = [NSMenu new];
++        NSMenuItem* app_item = [NSMenuItem new];
++        NSMenu* app_menu = [NSMenu new];
++        [app_menu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
++        app_item.submenu = app_menu;
++        [menu addItem:app_item];
++        NSApp.mainMenu = menu;
++    }
+ 
+     pad_macos_attach_window((__bridge void*)s_window);
++    /* Menu shortcuts must run before the game-key monitor consumes Cmd+Q. */
++    if (!s_menu_monitor) {
++        s_menu_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
++            handler:^NSEvent*(NSEvent* event) {
++                if ((event.modifierFlags & NSEventModifierFlagCommand) &&
++                    [NSApp.mainMenu performKeyEquivalent:event]) return nil;
++                return event;
++            }];
++    }
+     [s_window makeKeyAndOrderFront:nil];
+     [NSApp activateIgnoringOtherApps:YES];
+     return 0;
+@@ -3292,6 +3365,7 @@
+         }
+ #if !TARGET_OS_IPHONE
+         pad_macos_attach_window(NULL);
++        if (s_menu_monitor) { [NSEvent removeMonitor:s_menu_monitor]; s_menu_monitor = nil; }
+         if (s_window) { [s_window close]; s_window = nil; }
+ #endif
+         free(s_verts); s_verts = NULL;

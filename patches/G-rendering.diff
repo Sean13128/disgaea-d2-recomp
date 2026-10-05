@@ -1,0 +1,19 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2866,12 +2866,14 @@
+  * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
+  * table hit returned the empty command-buffer EA instead of VRAM). Callers
+  * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
+- * use this. `local` != 0 -> local memory. */
++ * use this. `local` != 0 -> local memory. MAIN must ignore the local-page
++ * heuristic too: a later VRAM allocation can share an IO vertex buffer's
++ * offset page. An unmapped MAIN offset is invalid, never a VRAM fallback. */
+ u32 cellGcmResolveLocated(int local, u32 offset)
+ {
+     if (local)
+         return s_config.localAddress + offset;
+-    return cellGcmResolveOffset(offset);
++    return cellGcmResolveIO(offset);
+ }
+ 
+ /* ---------------------------------------------------------------------------

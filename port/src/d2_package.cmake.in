@@ -1,0 +1,15 @@
+set(contents "${APP}/Contents")
+file(COPY "${RUNNER}" DESTINATION "${contents}/MacOS")
+include(BundleUtilities)
+# SDL2 and glslang/SPIRV-Tools are shared on this Mac; spirv-cross is static.
+# fixup_bundle follows transitive dependencies and rewrites their install names.
+fixup_bundle("${APP}" "${contents}/MacOS/DisgaeaD2Recomp" "/opt/homebrew/lib")
+execute_process(COMMAND /usr/bin/codesign --force --deep --sign - "${APP}"
+    RESULT_VARIABLE signed)
+if(NOT signed EQUAL 0)
+    message(FATAL_ERROR "Ad-hoc signing failed: ${signed}")
+endif()
+set(dist "@CMAKE_CURRENT_SOURCE_DIR@/dist")
+file(MAKE_DIRECTORY "${dist}")
+file(REMOVE_RECURSE "${dist}/Disgaea D2.app")
+file(COPY "${APP}" DESTINATION "${dist}")

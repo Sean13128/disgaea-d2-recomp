@@ -1,0 +1,19 @@
+diff --git a/port/main.cpp b/port/main.cpp
+--- a/port/main.cpp
++++ b/port/main.cpp
+@@ -37,6 +37,7 @@
+  * passthrough to <windows.h>; off Windows the toolkit's shim supplies the same
+  * names over pthreads and mmap, so the call sites below are written once. */
+ #include "win32_compat.h"
++#include "guest_poll.h"
+ #include "vm.h"
+ 
+ #include <stdint.h>
+@@ -193,6 +194,7 @@
+ 
+ static DWORD WINAPI frame_clock(LPVOID)
+ {
++    ps3_poll_thread_start("RSX render", 1);
+     const char* title = getenv("PS3_TITLE");
+     if (!title || !*title) title = "ps3recomp";
+ 

@@ -1,0 +1,267 @@
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -159,6 +159,23 @@
+ static inline int mfc_is_fence(uint32_t cmd)
+ {
+     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
++}
++
++/* A quadword DMA must sample/publish one coherent quadword. A dynamic-size
++ * memcpy can split 16 bytes into separate loads/stores: a polling GET then
++ * combines an old command with its newly published ready flag. RPCS3 uses
++ * v128 transfers for this case. Use host atomics on arm64, where paired plain
++ * loads/stores are not guaranteed atomic; keep bulk copies on the fast path. */
++static inline void mfc_copy(void* dst, const void* src, uint32_t size)
++{
++#if defined(__aarch64__) && defined(__SIZEOF_INT128__)
++    if (size == 16 && (((uintptr_t)dst | (uintptr_t)src) & 15u) == 0) {
++        __uint128_t value = __atomic_load_n((const __uint128_t*)src, __ATOMIC_ACQUIRE);
++        __atomic_store_n((__uint128_t*)dst, value, __ATOMIC_RELEASE);
++        return;
++    }
++#endif
++    memcpy(dst, src, size);
+ }
+ 
+ /*
+@@ -561,7 +578,7 @@
+               }
+           } }
+         /* GET: main memory -> local store */
+-        memcpy(ls_ptr, ea_ptr, size);
++        mfc_copy(ls_ptr, ea_ptr, size);
+         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
+          * dword = the completion-word EA arriving in a job buffer. */
+         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+@@ -646,14 +663,14 @@
+             }
+             if (span_reserved) {
+                 spu_lockline_lock();
+-                memcpy(ea_ptr, ls_ptr, size);
++                mfc_copy(ea_ptr, ls_ptr, size);
+                 for (uint32_t a = a0; ; a += 128u) {
+                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                     if (a == a1) break;
+                 }
+                 spu_lockline_unlock();
+             } else {
+-                memcpy(ea_ptr, ls_ptr, size);
++                mfc_copy(ea_ptr, ls_ptr, size);
+                 for (uint32_t a = a0; ; a += 128u) {
+                     if (spu_coh_is_reserved(a)) {
+                         spu_lockline_lock();
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -107,9 +107,7 @@
+  * unregistered context (bug); stamp a sentinel that matches no real thread. */
+ #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
+ 
+-#ifdef _WIN32
+ static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+-#endif
+ static void sys_lwmutex_create(ppu_context* ctx)
+ {
+     uint32_t lwm  = (uint32_t)ctx->gpr[3];
+@@ -124,12 +122,10 @@
+     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
+     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
+     vm_write32(lwm + 0x14, 0);
+-#ifdef _WIN32
+     /* A recreate at a reused address must not inherit a locked slot (e.g. the
+      * previous holder exited while holding). Force the semaphore signaled;
+      * over-release of an already-free sem fails harmlessly at max count 1. */
+     { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+-#endif
+     ctx->gpr[3] = 0;
+ }
+ /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
+@@ -145,7 +141,6 @@
+  * thread. Recursion is handled explicitly via the guest owner/recur fields
+  * we stamp (only the holder ever writes owner=self, so the re-lock check is
+  * race-free). Keyed by guest address in an open-addressed table. */
+-#ifdef _WIN32
+ #define LWM_HASH 65536u
+ static struct LwmSlot { volatile long addr; HANDLE sem;
+     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
+@@ -161,13 +156,9 @@
+  * convoy root. Default OFF. */
+ static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
+ static long long lwm_now_us(void){
+-#ifdef _WIN32
+     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
+     LARGE_INTEGER c; QueryPerformanceCounter(&c);
+     return (long long)(c.QuadPart*1000000ll/freq.QuadPart);
+-#else
+-    return 0;
+-#endif
+ }
+ /* Find an EXISTING slot (no create) for hold-tracking. */
+ static struct LwmSlot* lwm_find(uint32_t addr){
+@@ -185,14 +176,14 @@
+     uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+     for (uint32_t i = 0; i < LWM_HASH; i++) {
+         uint32_t idx = (h + i) & (LWM_HASH - 1);
+-        long cur = g_lwm[idx].addr;
++        long cur = InterlockedCompareExchange(&g_lwm[idx].addr, 0, 0);
+         if ((uint32_t)cur == addr) return g_lwm[idx].sem;
+         if (cur == 0) {
+             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
+             HANDLE r = nullptr;
+             if (g_lwm[idx].addr == 0) {
+                 g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
+-                g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
++                InterlockedExchange(&g_lwm[idx].addr, (long)addr);
+                 r = g_lwm[idx].sem;
+             } else if ((uint32_t)g_lwm[idx].addr == addr) {
+                 r = g_lwm[idx].sem;
+@@ -204,9 +195,6 @@
+     }
+     return nullptr;   /* table full (raise LWM_HASH) */
+ }
+-#else
+-static void* lwm_sem(uint32_t) { return nullptr; }
+-#endif
+ /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
+  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
+  * logging during that window only (park hunts: gate on state, not counts). */
+@@ -221,7 +209,6 @@
+      * contended lock yields to other threads instead of hard-blocking). We had
+      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
+     uint64_t timeout_us = ctx->gpr[4];
+-#ifdef _WIN32
+     HANDLE s = lwm_sem(lwm);
+     if (s) {
+         /* Recursive re-lock by the current holder: bump the count, no wait.
+@@ -259,7 +246,6 @@
+         }
+     }
+     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+-#endif
+     vm_write32(lwm + LWM_OWNER, self);
+     vm_write32(lwm + LWM_RECUR, 1);
+     ctx->gpr[3] = 0;   // CELL_OK
+@@ -268,7 +254,6 @@
+ {
+     uint32_t lwm = (uint32_t)ctx->gpr[3];
+     uint32_t self = LWM_SELF(ctx);
+-#ifdef _WIN32
+     HANDLE s = lwm_sem(lwm);
+     if (s) {
+         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+@@ -276,10 +261,9 @@
+             ctx->gpr[3] = 0;
+             return;
+         }
+-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
++        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } // EBUSY
+     }
+     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+-#endif
+     vm_write32(lwm + LWM_OWNER, self);
+     vm_write32(lwm + LWM_RECUR, 1);
+     ctx->gpr[3] = 0;
+@@ -295,7 +279,6 @@
+     }
+     vm_write32(lwm + LWM_RECUR, 0);
+     vm_write32(lwm + LWM_OWNER, 0);
+-#ifdef _WIN32
+     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
+         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
+             if (held > 100000) {
+@@ -328,7 +311,6 @@
+      * hands lwmutex ownership across threads. Over-release (unlock of a free
+      * mutex) fails harmlessly at the max count of 1. */
+     if (s) ReleaseSemaphore(s, 1, NULL);
+-#endif
+     ctx->gpr[3] = 0;
+ }
+ 
+@@ -362,7 +344,6 @@
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+     uint32_t lwmutex = vm_read32(lwcond + 0x00);
+-#ifdef _WIN32
+     HANDLE s = lwm_sem(lwmutex);
+     if (s) {
+         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+@@ -375,7 +356,6 @@
+         vm_write32(lwmutex + LWM_OWNER, own);
+         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+     }
+-#endif
+     ctx->gpr[3] = 0;
+ }
+ 
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -53,7 +53,7 @@
+ #define CELL_OK              0
+ #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
+ #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
+-#define CELL_FS_EIO          (-2147418111)
++#define CELL_FS_EIO          (-2147418069)   /* 0x8001002B */
+ #define CELL_FS_S_IFDIR      0x4000u
+ #define CELL_FS_S_IFREG      0x8000u
+ #define CELL_FS_O_RDONLY     0
+@@ -227,6 +227,9 @@
+         close(hfd);
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+     }
++    /* cellFs descriptors have no userspace stdio buffer: completed writes must
++     * be visible to other descriptors and fstat, including cache headers. */
++    setvbuf(f, nullptr, _IONBF, 0);
+     int fd = fd_alloc_file(f);
+     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+@@ -335,6 +338,9 @@
+         ctx->gpr[3] = CELL_OK;
+         return;
+     }
++    /* cellFs descriptors have no userspace stdio buffer: completed writes must
++     * be visible to other descriptors and fstat, including cache headers. */
++    setvbuf(f, nullptr, _IONBF, 0);
+     int fd = fd_alloc_file(f);
+     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+@@ -691,7 +697,21 @@
+     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+ }
+ static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++static void cellFsUnlink(ppu_context* ctx)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    host_path(hpath, sizeof hpath, gpath);
++    /* The disc mount is read-only, even when its host directory is writable. */
++    if (strncmp(gpath, "/dev_bdvd", 9) == 0) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010026u;
++        return;
++    }
++    int r = unlink(hpath);
++    int32_t err = r == 0 ? CELL_OK : errno == ENOENT ? CELL_FS_ENOENT : CELL_FS_EIO;
++    fprintf(stderr, "[fs] unlink '%s' -> 0x%08X\n", gpath, (uint32_t)err);
++    ctx->gpr[3] = (uint64_t)(int64_t)err;
++}
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2075,7 +2075,15 @@
+      *
+      * ponytail: append the JUMP at `current` the way the SDK's own callback
+      * does, rather than tracking a second copy of the ring's geometry. */
+-    if (s_gcm_ctx_out_ea) {
++    /* Rewriting the producer's current pointer from the drain thread can
++     * discard an unflushed SET_REFERENCE. Keep this legacy overflow recovery
++     * opt-in; the producer's command-buffer callback owns recycling. */
++    static int force_recycle = -1;
++    if (force_recycle < 0) {
++        const char* e = getenv("GCM_FORCE_RECYCLE");
++        force_recycle = e && atoi(e) != 0;
++    }
++    if (force_recycle && s_gcm_ctx_out_ea) {
+         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
+         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;

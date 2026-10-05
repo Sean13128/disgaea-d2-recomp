@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key>
+    <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+    <key>CFBundleIdentifier</key><string>com.sean13128.disgaead2recomp</string>
+    <key>CFBundleName</key><string>Disgaea D2</string>
+    <key>CFBundleDisplayName</key><string>Disgaea D2</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleVersion</key><string>@PROJECT_VERSION@</string>
+    <key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
+    <key>CFBundleIconFile</key><string>DisgaeaD2.icns</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>GCSupportsControllerUserInteraction</key><true/>
+    <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+</dict></plist>

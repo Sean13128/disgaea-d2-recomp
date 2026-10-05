@@ -1,0 +1,53 @@
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -410,6 +410,7 @@
+     /* Metal owns the window; SDL supplies only joystick/controller drivers.
+      * With no SDL video window its focus flag stays false. Native keyboard
+      * focus is checked independently by the AppKit monitor. */
++    if (s_sdl_inited) return; /* system UI may initialize before guest libpad */
+     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+     if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
+         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) < 0) {
+@@ -433,6 +434,7 @@
+             s_sdl_instance[i] = -1;
+         }
+     }
++    s_sdl_inited = 0;
+ }
+ 
+ #endif /* PAD_BACKEND_SDL2 */
+--- a/libs/input/tests/test_pad_overlay.m
++++ b/libs/input/tests/test_pad_overlay.m
+@@ -27,6 +27,32 @@
+         assert(host_pad() == 0x4000);
+         assert(cellPadGetData(0, (CellPadData*)(uintptr_t)0x1000) == CELL_PAD_ERROR_NOT_OPENED);
+         key(window, 6, NSEventTypeKeyUp, 0); assert(host_pad() == 0);
++        /* System UI can open a real controller before guest libpad starts.
++         * Repeated host reads and guest Init must retain exactly one handle. */
++        SDL_VirtualJoystickDesc early_desc = {0};
++        early_desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
++        early_desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
++        early_desc.naxes = SDL_CONTROLLER_AXIS_MAX;
++        early_desc.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
++        early_desc.button_mask = (1u << SDL_CONTROLLER_BUTTON_MAX) - 1;
++        early_desc.axis_mask = (1u << SDL_CONTROLLER_AXIS_MAX) - 1;
++        early_desc.name = "P pre-libpad controller";
++        int early_device = SDL_JoystickAttachVirtualEx(&early_desc); assert(early_device >= 0);
++        SDL_Joystick* early_pad = SDL_JoystickOpen(early_device); assert(early_pad);
++        SDL_JoystickID early_id = SDL_JoystickInstanceID(early_pad);
++        SDL_JoystickSetVirtualAxis(early_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
++        SDL_JoystickSetVirtualAxis(early_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, -32768);
++        assert(host_pad() == 0);
++        SDL_JoystickSetVirtualButton(early_pad, SDL_CONTROLLER_BUTTON_A, 1);
++        assert(host_pad() == 0x4000);
++        SDL_JoystickSetVirtualButton(early_pad, SDL_CONTROLLER_BUTTON_A, 0);
++        assert(host_pad() == 0);
++        assert(cellPadInit(2) == CELL_OK);
++        assert(read_pad(0) == 0);
++        assert(cellPadEnd() == CELL_OK);
++        assert(SDL_GameControllerFromInstanceID(early_id) == NULL);
++        SDL_JoystickClose(early_pad); SDL_JoystickDetachVirtual(early_device);
++        puts("[P-test] pre-libpad controller ownership survives host reads/guest Init and closes at End: PASS");
+         assert(cellPadInit(2) == CELL_OK);
+         assert(cellPadSetPortSetting(0, CELL_PAD_SETTING_PRESS_ON) == CELL_OK);
+         ps3_overlay_set_renderer(1);

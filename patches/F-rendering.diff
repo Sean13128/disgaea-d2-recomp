@@ -1,0 +1,219 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index cdb0464..6e171e1 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -797,6 +797,77 @@ static u32 s_fifo_calloff = 0;
+  * its texture-size constants -> UVs scaled by 0 -> uniform output).
+  * -----------------------------------------------------------------------*/
+ extern u32 cellGcmResolveLocated(int local, u32 offset);
++extern u32 cellGcmResolveIO(u32 offset);
++
++/* NV0039 memory-to-memory transfers (libgcm's default subchannel 1). */
++static struct {
++    u32 src_dma, dst_dma, src_offset, dst_offset;
++    s32 src_pitch, dst_pitch;
++    u32 length, count, format;
++} s_nv0039 = { .src_dma = 0xFEED0001u, .dst_dma = 0xFEED0000u };
++
++static u32 nv0039_address(u32 dma, s64 offset, u32 bytes)
++{
++    if (offset < 0 || (u64)offset + bytes > 0x100000000ull) return 0;
++    if (dma == 0xFEED0000u) {
++        if ((u64)offset + bytes > s_config.localSize) return 0;
++        return cellGcmResolveLocated(1, (u32)offset);
++    }
++    if (dma != 0xFEED0001u) return 0;
++    const u32 ea = cellGcmResolveIO((u32)offset);
++    if (!ea || (u64)ea + bytes > 0x100000000ull ||
++        cellGcmResolveIO((u32)offset + bytes - 1u) != ea + bytes - 1u)
++        return 0;
++    return ea;
++}
++
++static void nv0039_copy(void)
++{
++    const u32 in_stride = s_nv0039.format & 0xFFu;
++    const u32 out_stride = (s_nv0039.format >> 8) & 0xFFu;
++    const u64 total = (u64)s_nv0039.length * s_nv0039.count;
++    if (!total) return;
++    if (in_stride < 1 || in_stride > 4 || out_stride < 1 || out_stride > 4 ||
++        total > (256u << 20)) {
++        fprintf(stderr, "[NV0039] rejected transfer length=%u count=%u format=%04X\n",
++                s_nv0039.length, s_nv0039.count, s_nv0039.format);
++        return;
++    }
++    const u32 in_bytes = (s_nv0039.length - 1u) * in_stride + 1u;
++    const u32 out_bytes = (s_nv0039.length - 1u) * out_stride + 1u;
++    /* Validate every row before writing. Snapshot input to preserve overlapping
++     * and negative-pitch transfers, including byte-stride channel gathers. */
++    for (u32 y = 0; y < s_nv0039.count; y++) {
++        if (!nv0039_address(s_nv0039.src_dma,
++                            (s64)s_nv0039.src_offset + (s64)y * s_nv0039.src_pitch, in_bytes) ||
++            !nv0039_address(s_nv0039.dst_dma,
++                            (s64)s_nv0039.dst_offset + (s64)y * s_nv0039.dst_pitch, out_bytes)) {
++            fprintf(stderr, "[NV0039] rejected unmapped/out-of-range row %u\n", y);
++            return;
++        }
++    }
++    u8* copy = (u8*)malloc((size_t)total);
++    if (!copy) return;
++    for (u32 y = 0; y < s_nv0039.count; y++) {
++        const u8* src = vm_base + nv0039_address(s_nv0039.src_dma,
++            (s64)s_nv0039.src_offset + (s64)y * s_nv0039.src_pitch, in_bytes);
++        u8* row = copy + (size_t)y * s_nv0039.length;
++        if (in_stride == 1) memcpy(row, src, s_nv0039.length);
++        else for (u32 x = 0; x < s_nv0039.length; x++) row[x] = src[x * in_stride];
++    }
++    for (u32 y = 0; y < s_nv0039.count; y++) {
++        u8* dst = vm_base + nv0039_address(s_nv0039.dst_dma,
++            (s64)s_nv0039.dst_offset + (s64)y * s_nv0039.dst_pitch, out_bytes);
++        const u8* row = copy + (size_t)y * s_nv0039.length;
++        if (out_stride == 1) memcpy(dst, row, s_nv0039.length);
++        else for (u32 x = 0; x < s_nv0039.length; x++) dst[x * out_stride] = row[x];
++    }
++    free(copy);
++    { static u32 logs; if (logs++ < 24)
++        fprintf(stderr, "[NV0039] copied %ux%u stride=%u/%u %08X:%08X -> %08X:%08X\n",
++                s_nv0039.length, s_nv0039.count, in_stride, out_stride,
++                s_nv0039.src_dma, s_nv0039.src_offset, s_nv0039.dst_dma, s_nv0039.dst_offset); }
++}
+ 
+ static struct {
+     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
+@@ -1014,6 +1085,21 @@ static void nv3089_blit(void)
+ 
+ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+ {
++    if (subch == 1) {
++        switch (method) {
++        case 0x0184: s_nv0039.src_dma = data; return;
++        case 0x0188: s_nv0039.dst_dma = data; return;
++        case 0x030C: s_nv0039.src_offset = data; return;
++        case 0x0310: s_nv0039.dst_offset = data; return;
++        case 0x0314: s_nv0039.src_pitch = (s32)data; return;
++        case 0x0318: s_nv0039.dst_pitch = (s32)data; return;
++        case 0x031C: s_nv0039.length = data; return;
++        case 0x0320: s_nv0039.count = data; return;
++        case 0x0324: s_nv0039.format = data; return;
++        case 0x0328: nv0039_copy(); return;
++        }
++        return;
++    }
+     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
+      * subchannel a title binds each 2D object to is libgcm-version-specific and
+      * SET_OBJECT binds are not tracked, so state landing on an unexpected
+@@ -1798,22 +1884,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                           printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
+                                  subch, h, 10); fflush(stdout);
+                       } } }
+-                /* The subchannel is a binding slot, not an engine selector: a
+-                 * title may bind NV4097 to something other than subchannel 0.
+-                 * Twisted Metal uses subchannel 1, and caner (canersaka) hit
+-                 * the same thing in Yakuza Dead Souls, where SPU-built command
+-                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
+-                 * subchannel out of the method for exactly this reason.
+-                 *
+-                 * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
+-                 * NV308A/NV309E, NV3089), so anything arriving on 1 was being
+-                 * dropped on the floor -- for this title that included
+-                 * SET_SHADER_PROGRAM, leaving one stale fragment program bound
+-                 * for every draw in the game. Treat the subchannels the 2D path
+-                 * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
+-                 */
+-                static int s1_2d = -1;
+-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
++                /* libgcm starts with NV0039 on subchannel 1. Some ports rebind
++                 * NV4097 there; preserve their explicit override and recognise
++                 * the standard object handles instead of assuming all words
++                 * on 1 are 3D (copy descriptors overlap blend/colour state). */
++                static int s1_2d = -1, s1_forced = 0;
++                if (s1_2d < 0) {
++                    const char* e = getenv("GCM_SUBCH1_2D");
++                    const char* d = getenv("GCM_SUBCH1_3D");
++                    s1_forced = e != NULL || d != NULL;
++                    s1_2d = e ? atoi(e) : (d && atoi(d) ? 0 : 1);
++                }
++                if (!s1_forced && subch == 1) {
++                    const u32 object = vm_read32(dea);
++                    if (m == 0 && object == 0x31337303u) s1_2d = 1;
++                    else if ((m == 0 && object == 0x31337000u) || m >= 0x0800u)
++                        s1_2d = 0;
++                }
+                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
+                  * non-zero subchannel -- what each binding slot actually carries. */
+                 { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
+@@ -1850,7 +1937,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * same reason the live engine does, and masks them itself. */
+                 { static int eng = -1;
+                   if (eng < 0) eng = rsx_draw_engine_enabled();
+-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
++                  /* Transfer objects reuse NV4097 method numbers (e.g.
++                   * NV308A SIZE_OUT is ALPHA_FUNC). Do not fold their state
++                   * into the 3D register file. Match the routing below. */
++                  const u32 mfull = (subch << 13) | m;
++                  if (eng && (subch == 0 || (subch == 1 && !s1_2d) ||
++                              mfull == 0xE920u || mfull == 0xE924u ||
++                              mfull == 0xE944u))
++                      rsx_draw_engine_method(mfull, vm_read32(dea)); }
+ 
+                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
+                  * for any run, live engine or not, so the method stream and the
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 5c50e4a..5c5adde 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -754,6 +754,13 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+     const u8* src = eng_guest_ptr(NULL, location, offset, span);
+     if (!src) return 0;
+ 
++    { static u32 logs; if (getenv("RSX_TEXTURE_TRACE") && logs++ < 32)
++        fprintf(stderr, "[rsx texture] loc=%u off=%08X fmt=%02X size=%ux%u pitch=%u"
++                        " span=%u swizzled=%u first=%02X%02X%02X%02X\n",
++                location, offset, fmt, w, h, pitch, span, lv[0].tl.swizzled,
++                src[0], span > 1 ? src[1] : 0, span > 2 ? src[2] : 0,
++                span > 3 ? src[3] : 0); }
++
+     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
+                                             w, h, nlv, faces, remap, fmt);
+     if (!handle) return 0;
+@@ -1635,6 +1642,11 @@ void rsx_draw_engine_set_default(int on)
+     g.default_on = on;
+ }
+ 
++const rsx_draw_backend* rsx_draw_engine_get_backend(void)
++{
++    return g.be;
++}
++
+ int rsx_draw_engine_enabled(void)
+ {
+     static int cached = -1;
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index fa8b57d..e7cc374 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -211,6 +211,8 @@ typedef struct rsx_draw_backend {
+ 
+ /* Register the backend the engine drives. Passing NULL unregisters it. */
+ void rsx_draw_engine_set_backend(const rsx_draw_backend* backend);
++/* The registered backend, for diagnostic wrappers installed before FIFO work. */
++const rsx_draw_backend* rsx_draw_engine_get_backend(void);
+ 
+ /* Is the engine the path this run takes? True when PS3RECOMP_RSX_ENGINE names
+  * "dispatch" (or the backend asked for it by default) and a backend has been
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index d04b34e..f90860f 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -3052,6 +3052,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+             stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
+                                       options:MTLResourceStorageModeShared];
+         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
++        [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
++            if (completed.status == MTLCommandBufferStatusError)
++                fprintf(stderr, "[rsx engine/metal] command buffer failed: %s\n",
++                        [[completed.error localizedDescription] UTF8String]);
++        }];
+         eng_encode_records(cb, stage);
+         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+         if (drawable) [cb presentDrawable:drawable];

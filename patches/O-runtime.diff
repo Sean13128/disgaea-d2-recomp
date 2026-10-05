@@ -1,0 +1,583 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -20,6 +20,7 @@
+ 
+ /* Hoisted: code below was added above the original include block, so these
+  * have to be visible from here rather than 160 lines further down. */
++#include "../platform/guest_poll.h"
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -932,9 +933,12 @@
+ {
+     uint32_t exp_raw = __builtin_bswap32(expected);
+     uint32_t new_raw = __builtin_bswap32(val);
+-    if (resv_off())
+-        return __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
+-                                           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
++    if (resv_off()) {
++        int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
++                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
++        if (ok) ps3_poll_notify((uint32_t)ea, 4);
++        return ok;
++    }
+     ppu_context* self = g_active_ctx;
+     if (resv_diag() && self) resv_check_reg(self);
+     volatile LONG* L = resv_slot(ea);
+@@ -964,6 +968,7 @@
+     }
+     if (ok) ppu_resv_break(ea);
+     resv_unlock(L);
++    if (ok) ps3_poll_notify((uint32_t)ea, 4);
+     /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
+      * PPU_WWATCH hooks plain stores only; an atomic counter (a semaphore an SPU
+      * spins on) is written exclusively through here and looked untouched. */
+@@ -1017,9 +1022,12 @@
+ {
+     uint64_t exp_raw = __builtin_bswap64(expected);
+     uint64_t new_raw = __builtin_bswap64(val);
+-    if (resv_off())
+-        return __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw,
+-                                           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
++    if (resv_off()) {
++        int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw,
++                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
++        if (ok) ps3_poll_notify((uint32_t)ea, 8);
++        return ok;
++    }
+     ppu_context* self = g_active_ctx;
+     if (resv_diag() && self) resv_check_reg(self);
+     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
+@@ -1034,6 +1042,7 @@
+     }
+     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
+     resv_unlock(L);
++    if (ok) ps3_poll_notify((uint32_t)ea, 8);
+     if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
+         /* Report as two words: the watch window is word-granular, and a
+          * doubleword CAS on a counter pair is exactly the case worth seeing. */
+@@ -1441,10 +1450,33 @@
+ static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
+ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
+ 
++/* The HOTREAD diagnostic uses repeated addresses. Scheduling additionally
++ * requires an unchanged value, and keeps detection active with tracing off.
++ * All widths share one sequence: return-address stack loads in otherwise
++ * active code are not spin waits. Any intervening store resets the sequence. */
++static PPU_THREAD_LOCAL uint32_t ppu_poll_store_epoch;
++static inline void ppu_poll_read(uint32_t ea, void* value, uint32_t size)
++{
++    struct Poll { uint32_t ea, size, repeats, epoch; uint64_t value; };
++    static PPU_THREAD_LOCAL Poll p = {};
++    uint64_t v = 0;
++    memcpy(&v, value, size);
++    if (p.ea != ea || p.size != size || p.value != v || p.epoch != ppu_poll_store_epoch) {
++        p.ea = ea; p.size = size; p.value = v; p.epoch = ppu_poll_store_epoch;
++        p.repeats = 0; return;
++    }
++    if (p.repeats < 264) p.repeats++;
++    if (p.repeats >= 256 && ps3_poll_enabled) {
++        ps3_poll_backoff(p.repeats - 224, ea, value, size);
++        memcpy(value, vm_base + ea, size);
++    }
++}
++
+ /* Every guest store commits through this: on a line no SPU has reserved (all of
+  * them, until SPU code runs) it is the plain memcpy it replaced. */
+ #define VM_WRITE_COH(a, src, n)                                               \
+     do {                                                                      \
++        ppu_poll_store_epoch++;                                               \
+         if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+             spu_lockline_lock();                                              \
+             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+@@ -1453,6 +1485,7 @@
+         } else {                                                              \
+             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+         }                                                                     \
++        ps3_poll_notify((uint32_t)(a), (n));                              \
+     } while (0)
+ 
+ extern "C" {
+@@ -1566,10 +1599,11 @@
+                   ppu_prof_resolve_host(__builtin_return_address(0)));
+           n=0; } }
+       else { last=(uint32_t)a; n=0; } }
+-    return vm_base[(uint32_t)a]; }
++    uint8_t v = vm_base[(uint32_t)a]; ppu_poll_read((uint32_t)a, &v, 1); return v; }
+ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+     if (ps3_log_hotread() || ppu_spinbt_enabled()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) { if (ps3_log_hotread()) fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
++    ppu_poll_read((uint32_t)a, &v, 2);
+     return __builtin_bswap16(v); }
+ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+@@ -1683,6 +1717,7 @@
+ #endif
+       } }
+       else { last=(uint32_t)a; n=0; } }
++    ppu_poll_read((uint32_t)a, &v, 4);
+     return __builtin_bswap32(v); }
+ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+@@ -1711,6 +1746,7 @@
+             if(bg&&(tgt-bh)<0x1400) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); }
+           fprintf(stderr,"%s\n",ln); } } } }
+ #endif
++    ppu_poll_read((uint32_t)a, &v, 8);
+     return __builtin_bswap64(v); }
+ /* Self-arming write-watch on the Bink SPURS sync area (skip-freeze debug).
+  * The barrier probe in the lifted code sets g_barrier_sync_watch = sync base;
+@@ -3714,6 +3750,7 @@
+      * made "the log line is absent" unusable as evidence. */
+     setvbuf(stdout, NULL, _IONBF, 0);
+ 
++    ps3_poll_thread_start("PPU main", 1);
+     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
+     uint32_t code = 0, toc = 0;
+     ppu_opd_resolve(entry_opd, &code, &toc);
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -16,6 +16,7 @@
+ #define SPU_DMA_H
+ 
+ #include "spu_context.h"
++#include "../platform/guest_poll.h"
+ #include <stdint.h>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -176,6 +177,30 @@
+     }
+ #endif
+     memcpy(dst, src, size);
++}
++
++/* Compare delivered bytes with a private snapshot, never with LS that the
++ * guest may have changed. A different DMA/context/site resets the detector. */
++static inline void mfc_poll(spu_context* spu, uint32_t lsa, uint32_t ea,
++                            uint32_t size, uint32_t cmd, uint8_t* delivered)
++{
++    static SPU_THREAD_LOCAL spu_context* last_ctx;
++    static SPU_THREAD_LOCAL uint32_t last_ea, last_lsa, last_size, last_cmd, last_pc, repeats;
++    static SPU_THREAD_LOCAL uint8_t last[128];
++    if (!ps3_poll_enabled || !mfc_is_get(cmd) || size > sizeof last) {
++        last_ctx = NULL; repeats = 0; return;
++    }
++    if (last_ctx == spu && last_ea == ea && last_lsa == lsa && last_size == size &&
++        last_cmd == cmd && last_pc == spu->pc && !memcmp(last, delivered, size)) {
++        if (repeats < 40) repeats++;
++        if (repeats >= 32) {
++            ps3_poll_backoff(repeats, ea, delivered, size);
++            mfc_copy(delivered, vm_base + ea, size);
++        }
++    } else repeats = 0;
++    last_ctx = spu; last_ea = ea; last_lsa = lsa; last_size = size;
++    last_cmd = cmd; last_pc = spu->pc;
++    memcpy(last, delivered, size);
+ }
+ 
+ /*
+@@ -579,6 +604,7 @@
+           } }
+         /* GET: main memory -> local store */
+         mfc_copy(ls_ptr, ea_ptr, size);
++        mfc_poll(spu, lsa, (uint32_t)ea, size, cmd, ls_ptr);
+         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
+          * dword = the completion-word EA arriving in a job buffer. */
+         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+@@ -681,6 +707,8 @@
+                 }
+             }
+         }
++        mfc_poll(spu, lsa, (uint32_t)ea, size, cmd, ls_ptr);
++        ps3_poll_notify((uint32_t)ea, size);
+         /* Tell whoever is listening where this PUT landed.
+          *
+          * A title whose SPUs build the RSX command stream never tells libgcm
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 7ac619f..9399e9b 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -10,6 +10,7 @@
+  * on every PPU store.
+  */
+ 
++#include "../platform/guest_poll.h"
+ #include <stdlib.h>
+ #include "spu_coherency.h"
+ 
+@@ -51,9 +52,23 @@ void spu_lockline_lock(void)
+ void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+ #else
+ #include <stdatomic.h>
+-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
+-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
+-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
++#include <sched.h>
++static atomic_uint g_lockline;
++void spu_lockline_lock(void)
++{
++    unsigned spins = 0;
++    while (atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire)) {
++        do {
++#if defined(__aarch64__)
++            __asm__ __volatile__("yield" ::: "memory");
++#elif defined(__x86_64__) || defined(__i386__)
++            __asm__ __volatile__("pause" ::: "memory");
++#endif
++            if (++spins >= 4096) { spins = 0; sched_yield(); }
++        } while (atomic_load_explicit(&g_lockline, memory_order_relaxed));
++    }
++}
++void spu_lockline_unlock(void) { atomic_store_explicit(&g_lockline, 0, memory_order_release); }
+ #endif
+ 
+ /* ===========================================================================
+@@ -174,6 +189,7 @@ int spu_coh_is_reserved(uint32_t addr)
+  * before notifying; this gives the DMA path the same ability. */
+ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+ {
++    ps3_poll_notify(ea & ~127u, 128);
+     uint32_t line = ea & ~127u;
+     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+         spu_context* c = s_coh_ctxs[i];
+@@ -189,6 +205,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+ 
+ void spu_coh_notify_write(uint32_t ea)
+ {
++    ps3_poll_notify(ea & ~127u, 128);
+     uint32_t line = ea & ~127u;
+     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+         spu_context* c = s_coh_ctxs[i];
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -2,6 +2,7 @@
+  * ps3recomp - PPU thread management syscalls (implementation)
+  */
+ 
++#include "../platform/guest_poll.h"
+ #include "../ps3_log.h"
+ #include <setjmp.h>
+ 
+@@ -105,6 +106,7 @@
+ #endif
+ {
+     ppu_thread_info* info = (ppu_thread_info*)param;
++    ps3_poll_thread_start(info->name, 1);
+ 
+ #ifdef _WIN32
+     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -10,6 +10,7 @@
+  * remain available as direct C calls for the runtime to use.
+  */
+ 
++#include "../platform/guest_poll.h"
+ #include <stdlib.h>   /* calloc, free */
+ #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
+ #include "lv2_syscall_table.h"
+@@ -682,6 +683,9 @@
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+ #endif
+     spu_thread_t* t = (spu_thread_t*)arg;
++    spu_group_t* group = spu_find_group(t->group_id);
++    ps3_poll_thread_start(group ? group->name : "SPU worker",
++                          group && strstr(group->name, "synth"));
+     spu_lifted_thread_result r;
+     spu_lifted_thread_run(t->sctx, &r);
+     t->exit_status = r.exit_status;
+diff --git a/libs/sync/cellSync.c b/libs/sync/cellSync.c
+--- a/libs/sync/cellSync.c
++++ b/libs/sync/cellSync.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "cellSync.h"
++#include "../../runtime/platform/guest_poll.h"
+ #include <stdint.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+ /* HLE args arrive as guest effective addresses (ps3_hle_call passes raw
+@@ -78,6 +79,7 @@
+     int ok = atomic_compare_exchange_strong(&m->lock, expected, desired);
+     if (ok && spu_coh_is_reserved(ea)) spu_coh_notify_write(ea);
+     spu_lockline_unlock();
++    if (ok) ps3_poll_notify(ea, 4);
+     return ok;
+ }
+ 
+@@ -118,13 +120,15 @@
+     /* Wait until it is served. */
+     int spins = 0;
+     for (;;) {
+-        g = sync_bswap32(atomic_load(&mutex->lock));
++        raw = atomic_load(&mutex->lock);
++        g = sync_bswap32(raw);
+         if ((uint16_t)(g >> 16) == ticket) {
+             if (sync_trace()) fprintf(stderr, "[SYNC] LOCK    ea=0x%08X tid=%lu ticket=%u\n",
+                                       _ea, SYNC_TID(), ticket);
+             return CELL_OK;
+         }
+-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
++        if (spins < 264) spins++;
++        if (spins >= 256) ps3_poll_backoff((uint32_t)spins - 224, _ea, &raw, 4);
+     }
+ }
+ 
+diff --git a/runtime/platform/guest_poll.h b/runtime/platform/guest_poll.h
+--- /dev/null
++++ b/runtime/platform/guest_poll.h
+@@ -0,0 +1,15 @@
++/* Bounded host waits for unchanged guest-memory polls. */
++#ifndef PS3_GUEST_POLL_H
++#define PS3_GUEST_POLL_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int ps3_poll_enabled;
++void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
++void ps3_poll_notify(uint32_t ea, uint32_t size);
++void ps3_poll_thread_start(const char* name, int interactive);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/platform/guest_poll.c b/runtime/platform/guest_poll.c
+--- /dev/null
++++ b/runtime/platform/guest_poll.c
+@@ -0,0 +1,171 @@
++/* Polling is a scheduling hint, never a substitute for a guest read/DMA.
++ * Notifications cover PPU stores and SPU writes. HLE/direct mapped writes
++ * need not notify: every wait is bounded to 100 us and callers re-read.
++ * No guest reservation is created, consumed, or invalidated by a poll. */
++#include "guest_poll.h"
++#include "win32_compat.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++int ps3_poll_enabled = 1;
++#ifndef _WIN32
++#include <pthread.h>
++#include <time.h>
++#include <sched.h>
++#include <stdatomic.h>
++
++#define POLL_BUCKETS 256
++typedef struct poll_bucket {
++    pthread_mutex_t lock;
++    pthread_cond_t changed;
++    atomic_uint waiters;
++} poll_bucket;
++static poll_bucket s_buckets[POLL_BUCKETS];
++static pthread_once_t s_init = PTHREAD_ONCE_INIT;
++static poll_bucket* poll_slot(uint32_t ea)
++{
++    return &s_buckets[((ea >> 7) ^ (ea >> 15)) & (POLL_BUCKETS - 1)];
++}
++static void poll_init(void)
++{
++    const char* e = getenv("PS3_POLL_BACKOFF");
++    ps3_poll_enabled = !(e && *e == '0');
++#ifndef __APPLE__
++    pthread_condattr_t attr;
++    pthread_condattr_init(&attr);
++    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
++#endif
++    for (unsigned i = 0; i < POLL_BUCKETS; i++) {
++        pthread_mutex_init(&s_buckets[i].lock, NULL);
++#ifdef __APPLE__
++        pthread_cond_init(&s_buckets[i].changed, NULL);
++#else
++        pthread_cond_init(&s_buckets[i].changed, &attr);
++#endif
++    }
++#ifndef __APPLE__
++    pthread_condattr_destroy(&attr);
++#endif
++}
++void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{
++    if (!ps3_poll_enabled || repeats < 32) return;
++    pthread_once(&s_init, poll_init);
++    if (!ps3_poll_enabled) return;
++    if (repeats < 40) { sched_yield(); return; }
++    extern uint8_t* vm_base;
++    poll_bucket* b = poll_slot(ea);
++    pthread_mutex_lock(&b->lock);
++    atomic_fetch_add_explicit(&b->waiters, 1, memory_order_seq_cst);
++    /* Register before checking the value, under the same lock as notify.
++     * A store racing registration is either seen here or wakes the wait. */
++    if (!memcmp(vm_base + ea, value, size)) {
++#ifdef __APPLE__
++        struct timespec delay = {0, 100000};
++        pthread_cond_timedwait_relative_np(&b->changed, &b->lock, &delay);
++#else
++        struct timespec deadline;
++        clock_gettime(CLOCK_MONOTONIC, &deadline);
++        deadline.tv_nsec += 100000;
++        if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
++        pthread_cond_timedwait(&b->changed, &b->lock, &deadline);
++#endif
++    }
++    atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
++    pthread_mutex_unlock(&b->lock);
++}
++void ps3_poll_notify(uint32_t ea, uint32_t size)
++{
++    if (!size) return;
++    uint32_t last = (uint32_t)(((uint64_t)ea + size - 1) >> 7);
++    for (uint32_t line = ea >> 7; line <= last; line++) {
++        poll_bucket* b = poll_slot(line << 7);
++        if (!atomic_load_explicit(&b->waiters, memory_order_seq_cst)) continue;
++        pthread_mutex_lock(&b->lock);
++        pthread_cond_broadcast(&b->changed);
++        pthread_mutex_unlock(&b->lock);
++    }
++}
++
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <sys/resource.h>
++static pthread_once_t s_profile_once = PTHREAD_ONCE_INIT;
++static void* cpu_profile(void* unused)
++{
++    (void)unused;
++    struct rusage prev;
++    getrusage(RUSAGE_SELF, &prev);
++    uint64_t previous[1024] = {0};
++    mach_port_t previous_port[1024] = {0};
++    struct timespec prior_time;
++    clock_gettime(CLOCK_MONOTONIC, &prior_time);
++    for (;;) {
++        struct timespec delay = {5, 0};
++        nanosleep(&delay, NULL);
++        struct timespec current_time;
++        clock_gettime(CLOCK_MONOTONIC, &current_time);
++        double elapsed = current_time.tv_sec - prior_time.tv_sec +
++                         (current_time.tv_nsec - prior_time.tv_nsec) / 1e9;
++        prior_time = current_time;
++        struct rusage cur;
++        getrusage(RUSAGE_SELF, &cur);
++        double cpu = cur.ru_utime.tv_sec - prev.ru_utime.tv_sec +
++                     cur.ru_stime.tv_sec - prev.ru_stime.tv_sec +
++                     (cur.ru_utime.tv_usec - prev.ru_utime.tv_usec +
++                      cur.ru_stime.tv_usec - prev.ru_stime.tv_usec) / 1e6;
++        fprintf(stderr, "[HOSTCPU] process=%.1f%% interval=%.3fs\n", cpu * 100 / elapsed, elapsed);
++        prev = cur;
++        thread_act_array_t threads;
++        mach_msg_type_number_t count;
++        if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) continue;
++        for (unsigned i = 0; i < count; i++) {
++            thread_basic_info_data_t info;
++            mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
++            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&info, &n) == KERN_SUCCESS) {
++                uint64_t us = (uint64_t)(info.user_time.seconds + info.system_time.seconds) * 1000000 +
++                              info.user_time.microseconds + info.system_time.microseconds;
++                unsigned slot = (threads[i] >> 8) & 1023;
++                uint64_t old = previous_port[slot] == threads[i] ? previous[slot] : 0;
++                double pct = us >= old ? (us - old) / (elapsed * 10000) : 0;
++                previous[slot] = us; previous_port[slot] = threads[i];
++                char name[64] = "host";
++                pthread_t pt = pthread_from_mach_thread_np(threads[i]);
++                if (pt) pthread_getname_np(pt, name, sizeof name);
++                if (pct >= 0.5) fprintf(stderr, "[HOSTCPU] thread=%s port=%u cpu=%.1f%%\n", name, threads[i], pct);
++            }
++            mach_port_deallocate(mach_task_self(), threads[i]);
++        }
++        vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
++    }
++    return NULL;
++}
++static void profile_start(void)
++{
++    if (!getenv("PS3_HOST_CPU")) return;
++    pthread_t thread;
++    if (!pthread_create(&thread, NULL, cpu_profile, NULL)) pthread_detach(thread);
++}
++#endif
++void ps3_poll_thread_start(const char* name, int interactive)
++{
++    pthread_once(&s_init, poll_init);
++#ifdef __APPLE__
++    pthread_setname_np(name);
++    if (ps3_poll_enabled)
++        pthread_set_qos_class_self_np(interactive ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_DEFAULT, 0);
++    pthread_once(&s_profile_once, profile_start);
++#else
++    (void)name; (void)interactive;
++#endif
++}
++#else
++void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{
++    (void)ea; (void)value; (void)size;
++    if (repeats >= 32) SwitchToThread();
++}
++void ps3_poll_notify(uint32_t ea, uint32_t size) { (void)ea; (void)size; }
++void ps3_poll_thread_start(const char* name, int interactive) { (void)name; (void)interactive; }
++#endif
+diff --git a/runtime/platform/tests/test_guest_poll.c b/runtime/platform/tests/test_guest_poll.c
+--- /dev/null
++++ b/runtime/platform/tests/test_guest_poll.c
+@@ -0,0 +1,56 @@
++/* Standalone: cc -std=c17 -pthread test_guest_poll.c ../guest_poll.c */
++#include "../guest_poll.h"
++#include <assert.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++static uint8_t memory[512];
++uint8_t* vm_base = memory;
++static double now(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec + t.tv_nsec / 1e9;
++}
++static void* publish(void* unused)
++{
++    struct timespec t = {0, 2000000};
++    nanosleep(&t, NULL);
++    __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
++    /* Deliberately straddles two cache lines. */
++    if (unused) ps3_poll_notify(127, 5);
++    return NULL;
++}
++int main(void)
++{
++    ps3_poll_thread_start("poll test", 0);
++    uint32_t zero = 0, one = 1;
++    double start = now();
++    for (unsigned i = 0; i < 100; i++) ps3_poll_backoff(40, 128, &zero, 4);
++    double elapsed = now() - start;
++    assert(elapsed >= 0.005 && elapsed < 1.0);
++    /* Already changed: must not sleep awaiting a notification that preceded
++     * registration. This catches the check/register lost-wakeup error. */
++    memcpy(memory + 128, &one, 4);
++    start = now();
++    for (unsigned i = 0; i < 1000; i++) ps3_poll_backoff(40, 128, &zero, 4);
++    assert(now() - start < 0.05);
++    /* Writes racing a wait, with and without notification, always become
++     * visible. Timed rechecks also cover HLE writes outside vm_write*. */
++    for (unsigned i = 0; i < 20; i++) {
++        __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
++        pthread_t writer;
++        assert(!pthread_create(&writer, NULL, publish, (void*)(uintptr_t)(i & 1)));
++        start = now();
++        while (!__atomic_load_n((uint32_t*)(memory + 128), __ATOMIC_ACQUIRE)) {
++            ps3_poll_backoff(40, 128, &zero, 4);
++            assert(now() - start < 1.0);
++        }
++        pthread_join(writer, NULL);
++    }
++    puts("guest poll: bounded wait, changed-before-wait, concurrent notified/unnotified writes PASS");
++    return 0;
++}

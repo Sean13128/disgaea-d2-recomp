@@ -1,0 +1,1252 @@
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -14,6 +14,7 @@
+ #include <limits.h>
+ #include <errno.h>
+ #include <sys/stat.h>
++#include "param_sfo.h"
+ 
+ #ifdef _WIN32
+ #  include <windows.h>
+@@ -23,6 +24,8 @@
+ #  define HOST_STAT_T   struct __stat64
+ #else
+ #  include <unistd.h>
++#  include <dirent.h>
++#  include <pthread.h>
+ #  include <sys/types.h>
+ #  include <sys/statvfs.h>
+ #  define HOST_MKDIR(p) mkdir(p, 0755)
+@@ -60,7 +63,7 @@
+  *
+  * The literal below is only the fallback for a host with no VFS configured;
+  * content_root() resolves the real one on first use. */
+-static char s_content_path[CELL_GAME_PATH_MAX] = "./gamedata/dev_hdd0/game";
++static char s_content_path[1024] = "./gamedata/dev_hdd0/game";
+ static int  s_content_path_resolved = 0;
+ 
+ /* Resolved the same way ppu_fs.cpp resolves the /dev_hdd0 mount: $PS3_HDD0_ROOT
+@@ -86,9 +89,9 @@
+     }
+     return s_content_path;
+ }
+-static char s_content_info_path[CELL_GAME_PATH_MAX] = "";
+-static char s_usrdir_path[CELL_GAME_PATH_MAX] = "";
+-static char s_tmp_path[CELL_GAME_PATH_MAX] = "";
++static char s_content_info_path[1100] = "";
++static char s_usrdir_path[1100] = "";
++static char s_tmp_path[1100] = "";
+ static char s_exit_param[256] = "";
+ 
+ static int  s_boot_checked = 0;
+@@ -102,10 +105,57 @@
+  * semaphore forever. */
+ static int  s_check_is_disc = 1;
+ static char s_check_dir[64] = "";
++static SaveSfo s_check_sfo;
++static int s_check_exists = 1;
++static int s_check_can_create = 0;
++static int s_check_dirty = 0;
++static char s_create_dir[64] = "";
++
++static int valid_content_name(const char* name)
++{
++    size_t len = strnlen(name, CELL_GAME_DIRNAME_SIZE);
++    if (!len || len >= CELL_GAME_DIRNAME_SIZE) return 0;
++    for (size_t i = 0; i < len; i++) {
++        char c = name[i];
++        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++              (c >= '0' && c <= '9') || c == '_' || c == '-')) return 0;
++    }
++    return 1;
++}
++
++static const char* param_string(SaveSfo* sfo, const char* key)
++{
++    SaveSfoEntry* e = sfo_find(sfo, key);
++    if (!e || e->format != 0x0204 || !e->size ||
++        !memchr(e->data, 0, e->size)) return NULL;
++    return (const char*)e->data;
++}
++
++static void begin_content_check(int disc, const char* name, int can_create)
++{
++    sfo_free(&s_check_sfo);
++    s_check_is_disc = disc;
++    snprintf(s_check_dir, sizeof(s_check_dir), "%s", name);
++    s_check_can_create = can_create;
++    s_check_dirty = 0;
++    s_check_exists = 0;
++    s_create_dir[0] = 0;
++}
++
++static void load_disc_sfo(void)
++{
++    const char* root = getenv("PS3_VFS_ROOT");
++    if (!root || !*root) root = ppu_vfs_root;
++    char path[1100];
++    snprintf(path, sizeof(path), "%s/PS3_GAME/PARAM.SFO", root ? root : ".");
++    sfo_load(path, &s_check_sfo);
++    s_check_exists = 1;
++}
++
+ 
+ static void ensure_dirs(const char* path)
+ {
+-    char tmp[CELL_GAME_PATH_MAX];
++    char tmp[1100];
+     strncpy(tmp, path, sizeof(tmp) - 1);
+     tmp[sizeof(tmp) - 1] = '\0';
+ 
+@@ -136,7 +186,7 @@
+  * so installation checks use the destination volume, without creating data. */
+ static s32 content_free_kb(void)
+ {
+-    char path[CELL_GAME_PATH_MAX];
++    char path[1100];
+     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
+     for (;;) {
+ #ifdef _WIN32
+@@ -243,47 +293,13 @@
+ static int sfo_read_string(const char* sfo_path, const char* key,
+                            char* out, int out_size)
+ {
+-    FILE* fp = fopen(sfo_path, "rb");
+-    if (!fp) return -1;
+-    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+-    if (sz < 0x14 || sz > (1 << 20)) { fclose(fp); return -1; }
+-    unsigned char* d = (unsigned char*)malloc((size_t)sz);
+-    if (!d) { fclose(fp); return -1; }
+-    int ok = (fread(d, 1, (size_t)sz, fp) == (size_t)sz);
+-    fclose(fp);
+-    if (!ok) { free(d); return -1; }
+-
+-    int ret = -1;
+-    if (d[0]==0x00 && d[1]==0x50 && d[2]==0x53 && d[3]==0x46) {  /* "\0PSF" */
+-        #define SFO_RD32(o) ((u32)d[o] | ((u32)d[(o)+1]<<8) | ((u32)d[(o)+2]<<16) | ((u32)d[(o)+3]<<24))
+-        #define SFO_RD16(o) ((u16)d[o] | ((u16)d[(o)+1]<<8))
+-        u32 key_tab  = SFO_RD32(0x08);
+-        u32 data_tab = SFO_RD32(0x0C);
+-        u32 n        = SFO_RD32(0x10);
+-        for (u32 i = 0; i < n; i++) {
+-            u32 e = 0x14 + i * 0x10;
+-            if (e + 0x10 > (u32)sz) break;
+-            u32 key_off  = SFO_RD16(e + 0x00);
+-            u32 data_len = SFO_RD32(e + 0x04);
+-            u32 data_off = SFO_RD32(e + 0x0C);
+-            if (key_tab + key_off >= (u32)sz) continue;
+-            if (strcmp((const char*)(d + key_tab + key_off), key) != 0) continue;
+-            u32 src = data_tab + data_off;
+-            if (src >= (u32)sz) break;
+-            int copy = (int)data_len;
+-            if (copy > (int)((u32)sz - src)) copy = (int)((u32)sz - src);
+-            if (copy >= out_size) copy = out_size - 1;
+-            if (copy < 0) copy = 0;
+-            memcpy(out, d + src, (size_t)copy);
+-            out[copy] = '\0';
+-            ret = 0;
+-            break;
+-        }
+-        #undef SFO_RD32
+-        #undef SFO_RD16
+-    }
+-    free(d);
+-    return ret;
++    SaveSfo sfo;
++    if (!sfo_load(sfo_path, &sfo)) return -1;
++    const char* value = param_string(&sfo, key);
++    if (value) snprintf(out, (size_t)out_size, "%s", value);
++    int result = value ? 0 : -1;
++    sfo_free(&sfo);
++    return result;
+ }
+ 
+ /* Read title/version fields from the game's PARAM.SFO at boot. Call once
+@@ -340,7 +356,7 @@
+     return CELL_GAME_ERROR_NOTPATCH;
+ }
+ 
+-s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
++static s32 cellGameBootCheck_impl(u32* type, u32* attributes, CellGameContentSize* size,
+                        char* dirName)
+ {
+     load_title_metadata();
+@@ -375,7 +391,7 @@
+     if (size_ea) {
+         vm_write32(size_ea + 0, (u32)content_free_kb());
+         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
+-        vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
++        vm_write32(size_ea + 8, 4);                           /* boot system overhead */
+     }
+ 
+     if (dir_ea) {
+@@ -388,99 +404,98 @@
+     s_boot_checked = 1;
+     /* Open a check session for the BOOT content (disc titles boot from
+      * /dev_bdvd, not from the game-data dir). */
+-    s_check_is_disc = (s_game_type == CELL_GAME_GAMETYPE_DISC);
+-    strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
+-    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
++    begin_content_check(s_game_type == CELL_GAME_GAMETYPE_DISC, s_title_id, 0);
++    load_disc_sfo();
+     printf("[cellGame] BootCheck: type=%u, titleId='%s'\n", s_game_type, s_title_id);
+     return CELL_OK;
+ }
+ 
+-s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
+-{
+-    printf("[cellGame] ContentPermit() -> %s\n",
+-           s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
+-
+-    if (!s_check_is_disc) {
+-        /* DataCheck can precede BootCheck and can name a different directory. */
+-        snprintf(s_content_info_path, sizeof(s_content_info_path),
+-                 "%s/%s", content_root(), s_check_dir);
+-        snprintf(s_usrdir_path, sizeof(s_usrdir_path),
+-                 "%s/%s/USRDIR", content_root(), s_check_dir);
+-        /* Ensure directories exist. IMPORTANT: also create them at the SAME host
+-         * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
+-         * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
+-         * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
+-         * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
+-         * forever and exits. Create it where cellFs will actually find it. */
+-        ensure_dirs(s_content_info_path);
+-        ensure_dirs(s_usrdir_path);
+-    }
+-
+-    /* Both paths are GUEST addresses; format into a host temp, copy into the
+-     * guest buffer through vm_base (a raw snprintf to the guest addr faults).
+-     * The paths must match the content the current session checked: the disc
+-     * for BootCheck/DataCheck(DISC), the game-data dir otherwise. */
+-    char tmp[CELL_GAME_PATH_MAX];
++static s32 cellGameContentPermit_impl(char* contentInfoPath, char* usrdirPath)
++{
+     uint32_t cip_ea = (uint32_t)(uintptr_t)contentInfoPath;
+     uint32_t usr_ea = (uint32_t)(uintptr_t)usrdirPath;
+-    if (cip_ea) {
+-        int n = s_check_is_disc
+-              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME")
+-              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s", s_check_dir);
+-        memcpy(vm_base + cip_ea, tmp, (size_t)n + 1);
+-    }
+-    if (usr_ea) {
+-        int n = s_check_is_disc
+-              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME/USRDIR")
+-              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
+-        memcpy(vm_base + usr_ea, tmp, (size_t)n + 1);
+-    }
+-
+-    return CELL_OK;
+-}
+-
+-s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
+-{
+-    /* dirName is a GUEST address -- translate BEFORE any use. The old code
+-     * printf'd the raw EA as a host char* and crashed (LBP: read fault at
+-     * 0x94AEA0 = the guest EA of its dir string). */
+-    uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addr */
+-    const char* check_dir = dir_ea ? (const char*)(vm_base + dir_ea) : s_title_id;
++    if (!cip_ea || !usr_ea) return CELL_GAME_ERROR_PARAM;
++
++    /* A missing check is not an installation. Firmware returns empty paths
++     * unless CreateGameData actually prepared new content. In particular,
++     * never turn a read-only NONE check into an empty installed directory. */
++    if (!s_check_is_disc && !s_check_exists && !s_check_dirty && !s_create_dir[0]) {
++        vm_base[cip_ea] = 0;
++        vm_base[usr_ea] = 0;
++        printf("[cellGame] ContentPermit() -> no game data (empty paths)\n");
++        return CELL_OK;
++    }
++
++    if (!s_check_is_disc && s_check_dirty) {
++        char path[1200];
++        const char* name = s_create_dir[0] ? s_create_dir : s_check_dir;
++        snprintf(path, sizeof(path), "%s/%s/PARAM.SFO", content_root(), name);
++        if (!sfo_store(path, &s_check_sfo)) return CELL_GAME_ERROR_ACCESS_ERROR;
++        if (s_create_dir[0]) {
++            snprintf(path, sizeof(path), "%s/%s", content_root(), s_create_dir);
++            snprintf(s_content_info_path, sizeof(s_content_info_path),
++                     "%s/%s", content_root(), s_check_dir);
++#ifdef _WIN32
++            if (!MoveFileExA(path, s_content_info_path, MOVEFILE_WRITE_THROUGH))
++                return CELL_GAME_ERROR_ACCESS_ERROR;
++#else
++            if (rename(path, s_content_info_path) != 0)
++                return CELL_GAME_ERROR_ACCESS_ERROR;
++#endif
++            s_create_dir[0] = 0;
++        }
++        s_check_exists = 1;
++        s_check_dirty = 0;
++        printf("[cellGame] ContentPermit: committed PARAM.SFO for '%s'\n", s_check_dir);
++    }
++
++    char tmp[CELL_GAME_PATH_MAX];
++    if (s_check_is_disc) snprintf(tmp, sizeof(tmp), "/dev_bdvd/PS3_GAME");
++    else snprintf(tmp, sizeof(tmp), "/dev_hdd0/game/%s", s_check_dir);
++    strcpy((char*)vm_base + cip_ea, tmp);
++    snprintf((char*)vm_base + usr_ea, CELL_GAME_PATH_MAX, "%s/USRDIR", tmp);
++    printf("[cellGame] ContentPermit() -> %s\n", tmp);
++    return CELL_OK;
++}
++
++static s32 cellGameDataCheck_impl(u32 type, const char* dirName, CellGameContentSize* size)
++{
++    load_title_metadata();
++    uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;
++    if (type < CELL_GAME_GAMETYPE_DISC || type > CELL_GAME_GAMETYPE_GAMEDATA ||
++        (type != CELL_GAME_GAMETYPE_DISC && !dir_ea)) return CELL_GAME_ERROR_PARAM;
++    const char* check_dir = dir_ea ? (const char*)vm_base + dir_ea : s_title_id;
++    if (type != CELL_GAME_GAMETYPE_DISC && !valid_content_name(check_dir))
++        return CELL_GAME_ERROR_PARAM;
+     printf("[cellGame] DataCheck(type=%u, dir='%s')\n", type, check_dir);
+-
+-    /* Open a check session for this content; the next ContentPermit reports
+-     * its paths (disc -> /dev_bdvd/PS3_GAME, else the game-data dir). */
+-    s_check_is_disc = (type == CELL_GAME_GAMETYPE_DISC);
+-    strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
+-    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
+-
+-    char path[CELL_GAME_PATH_MAX];
+-    snprintf(path, sizeof(path), "%s/%s", content_root(), check_dir);
++    begin_content_check(type == CELL_GAME_GAMETYPE_DISC, check_dir,
++                        type == CELL_GAME_GAMETYPE_GAMEDATA);
++    if (s_check_is_disc) {
++        load_disc_sfo();
++    } else {
++        char path[1200];
++        snprintf(path, sizeof(path), "%s/%s/PARAM.SFO", content_root(), check_dir);
++        if (sfo_load(path, &s_check_sfo)) {
++            const char* category = param_string(&s_check_sfo, "CATEGORY");
++            const char* title_id = param_string(&s_check_sfo, "TITLE_ID");
++            const char* title = param_string(&s_check_sfo, "TITLE");
++            const char* version = param_string(&s_check_sfo, "VERSION");
++            s_check_exists = category && title_id && title_id[0] && title && version;
++            if (s_check_exists && strcmp(category, type == 3 ? "GD" : "HG"))
++                return CELL_GAME_ERROR_BROKEN;
++            if (!s_check_exists) sfo_free(&s_check_sfo);
++        }
++    }
+ 
+     uint32_t size_ea = (uint32_t)(uintptr_t)size;
+     if (size_ea) {
+         vm_write32(size_ea + 0, (u32)content_free_kb());
+-        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
+-        vm_write32(size_ea + 8, 0);
+-    }
+-
+-    /* Disc-content check (type 1 = CELL_GAME_GAMETYPE_DISC): the disc is
+-     * inherently present (mounted via the VFS root); a NOTFOUND here makes
+-     * disc titles bail out of boot. */
+-    if (type == 1)
+-        return CELL_OK;
+-
+-    if (dir_exists(path)) {
+-        return CELL_OK;
+-    }
+-
+-    /* Missing game-data dir is NOT an error: firmware (and RPCS3) return
+-     * CELL_GAME_RET_NONE (2) so the title knows to cellGameCreateGameData.
+-     * Returning ERROR_NOTFOUND here made LBP treat first boot as fatal and
+-     * exit(0) politely. sizeKB must read 0 (not NOTCALC) for the no-data case. */
+-    if (size_ea)
+-        vm_write32(size_ea + 4, 0);   /* sizeKB = 0 (no data yet) */
+-    return CELL_GAME_RET_NONE;
++        vm_write32(size_ea + 4, s_check_exists ? (u32)CELL_GAME_SIZEKB_NOTCALC : 0);
++        vm_write32(size_ea + 8, 0); /* firmware's system overhead, not file bytes */
++    }
++    printf("[cellGame] DataCheck: %s (PARAM.SFO %s)\n",
++           s_check_exists ? "OK" : "NONE", s_check_exists ? "valid" : "missing/invalid");
++    return s_check_exists ? CELL_GAME_RET_OK : CELL_GAME_RET_NONE;
+ }
+ 
+ /* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
+@@ -611,47 +626,42 @@
+     return CELL_HDDGAME_RET_OK;
+ }
+ 
+-/* The write side of GetParamString: a title that has just created its game data
+- * fills PARAM.SFO in before writing it out. Twisted Metal only reaches this at
+- * all once cellGameCreateGameData works, which is why the NID sat unresolved
+- * until sage's cellGame work landed -- the regression gate caught it as
+- * UNRESOLVED 0xDAA5CD20 the first time the two were built together.
+- *
+- * Stores into the same statics GetParamString reads, so Create -> Set -> Get
+- * returns what the title wrote. ponytail: in memory only, not persisted to a
+- * PARAM.SFO on disk. Add that when a title is found that writes the data, exits,
+- * and expects to read it back on the next run. */
+-s32 cellGameSetParamString(s32 id, const char* buf)
+-{
+-    /* `buf` is a GUEST address (raw r4), like GetParamString's -- a host
+-     * dereference here faults. See [[guest-pointer-abi]]. */
++/* Firmware string ids map to distinct SFO keys, including localized titles. */
++static const char* param_string_key(s32 id, char key[16], u32* capacity)
++{
++    *capacity = 128;
++    if (id == CELL_GAME_PARAMID_TITLE || id == CELL_GAME_PARAMID_TITLE_DEFAULT)
++        return "TITLE";
++    if (id >= CELL_GAME_PARAMID_TITLE_JAPANESE && id <= CELL_GAME_PARAMID_TITLE_TURKISH) {
++        snprintf(key, 16, "TITLE_%02d", id - CELL_GAME_PARAMID_TITLE_JAPANESE);
++        return key;
++    }
++    switch (id) {
++    case CELL_GAME_PARAMID_TITLE_ID: *capacity = 16; return "TITLE_ID";
++    case CELL_GAME_PARAMID_VERSION: *capacity = 6; return "VERSION";
++    case CELL_GAME_PARAMID_PS3_SYSTEM_VER: *capacity = 8; return "PS3_SYSTEM_VER";
++    case CELL_GAME_PARAMID_APP_VER: *capacity = 6; return "APP_VER";
++    default: return NULL;
++    }
++}
++
++static s32 cellGameSetParamString_impl(s32 id, const char* buf)
++{
+     uint32_t buf_ea = (uint32_t)(uintptr_t)buf;
+-    if (!buf_ea)
++    if (!buf_ea) return CELL_GAME_ERROR_PARAM;
++    char key[16]; u32 capacity;
++    const char* name = param_string_key(id, key, &capacity);
++    if (!name) return CELL_GAME_ERROR_INVALID_ID;
++    if (!s_check_can_create) return CELL_GAME_ERROR_NOTSUPPORTED;
++    if (id > CELL_GAME_PARAMID_TITLE_TURKISH) return CELL_GAME_ERROR_NOTSUPPORTED;
++    if (!sfo_set_str(&s_check_sfo, name, (const char*)vm_base + buf_ea, capacity))
+         return CELL_GAME_ERROR_PARAM;
+-    const char* src = (const char*)(vm_base + buf_ea);
+-
+-    char*  dst;
+-    size_t cap;
+-    if (id >= CELL_GAME_PARAMID_TITLE && id <= CELL_GAME_PARAMID_TITLE_TURKISH) {
+-        dst = s_title;      cap = sizeof s_title;      /* localised TITLE_## all land here */
+-    } else {
+-        switch (id) {
+-        case CELL_GAME_PARAMID_TITLE_ID:       dst = s_title_id;   cap = sizeof s_title_id;   break;
+-        case CELL_GAME_PARAMID_VERSION:        dst = s_version;    cap = sizeof s_version;    break;
+-        case CELL_GAME_PARAMID_PS3_SYSTEM_VER: dst = s_system_ver; cap = sizeof s_system_ver; break;
+-        case CELL_GAME_PARAMID_APP_VER:        dst = s_app_ver;    cap = sizeof s_app_ver;    break;
+-        default:
+-            printf("[cellGame] SetParamString: unknown param id %d (ignored)\n", id);
+-            return CELL_OK;
+-        }
+-    }
+-    strncpy(dst, src, cap - 1);
+-    dst[cap - 1] = '\0';
+-    printf("[cellGame] SetParamString(id=%d) = \"%s\"\n", id, dst);
+-    return CELL_OK;
+-}
+-
+-s32 cellGameGetParamInt(s32 id, s32* value)
++    s_check_dirty = 1;
++    printf("[cellGame] SetParamString(id=%d) = \"%s\"\n", id, (char*)vm_base + buf_ea);
++    return CELL_OK;
++}
++
++static s32 cellGameGetParamInt_impl(s32 id, s32* value)
+ {
+     printf("[cellGame] GetParamInt(id=%d)\n", id);
+ 
+@@ -660,24 +670,21 @@
+     if (!value_ea)
+         return CELL_GAME_ERROR_PARAM;
+ 
+-    uint32_t v = 0;
++    const char* key;
+     switch (id) {
+-    case CELL_GAME_PARAMID_PARENTAL_LEVEL:
+-    case CELL_GAME_PARAMID_RESOLUTION:
+-    case CELL_GAME_PARAMID_SOUND_FORMAT:
+-        v = 0;
+-        break;
+-    default:
+-        printf("[cellGame] WARNING: unknown param int id %d\n", id);
+-        v = 0;
+-        break;
+-    }
++    case CELL_GAME_PARAMID_PARENTAL_LEVEL: key = "PARENTAL_LEVEL"; break;
++    case CELL_GAME_PARAMID_RESOLUTION: key = "RESOLUTION"; break;
++    case CELL_GAME_PARAMID_SOUND_FORMAT: key = "SOUND_FORMAT"; break;
++    default: return CELL_GAME_ERROR_INVALID_ID;
++    }
++    SaveSfoEntry* e = sfo_find(&s_check_sfo, key);
++    uint32_t v = e && e->format == 0x0404 && e->size == 4 ? sfo_le32(e->data) : 0;
+     vm_write32(value_ea, v);
+ 
+     return CELL_OK;
+ }
+ 
+-s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
++static s32 cellGameGetParamString_impl(s32 id, char* buf, u32 bufsize)
+ {
+     load_title_metadata();
+     printf("[cellGame] GetParamString(id=%d, bufsize=%u)\n", id, bufsize);
+@@ -690,28 +697,17 @@
+         return CELL_GAME_ERROR_PARAM;
+     char* hbuf = (char*)(vm_base + buf_ea);
+ 
+-    const char* src;
+-    if (id >= CELL_GAME_PARAMID_TITLE && id <= CELL_GAME_PARAMID_TITLE_TURKISH) {
+-        /* Localized TITLE_## fields are not tracked separately yet. */
+-        src = s_title;
+-    } else {
+-        switch (id) {
+-        case CELL_GAME_PARAMID_TITLE_ID:       src = s_title_id;   break;
+-        case CELL_GAME_PARAMID_VERSION:        src = s_version;    break;
+-        case CELL_GAME_PARAMID_PS3_SYSTEM_VER: src = s_system_ver; break;
+-        case CELL_GAME_PARAMID_APP_VER:        src = s_app_ver;    break;
+-        default:
+-            printf("[cellGame] WARNING: unknown param string id %d\n", id);
+-            src = "";
+-            break;
+-        }
+-    }
++    char key[16]; u32 capacity;
++    const char* name = param_string_key(id, key, &capacity);
++    if (!name) return CELL_GAME_ERROR_INVALID_ID;
++    const char* src = param_string(&s_check_sfo, name);
++    if (!src) src = "";
+     strncpy(hbuf, src, bufsize - 1);
+     hbuf[bufsize - 1] = '\0';
+     return CELL_OK;
+ }
+ 
+-s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
++static s32 cellGameCreateGameData_impl(CellGameSetInitParams* init, char* tmp_contentInfoPath,
+                             char* tmp_usrdirPath)
+ {
+     printf("[cellGame] CreateGameData()\n");
+@@ -720,29 +716,49 @@
+     if (!init_ea)
+         return CELL_GAME_ERROR_PARAM;
+ 
+-    /* Create the directory the title ASKED for, not s_title_id.
+-     *
+-     * The install handshake is: cellGameDataCheck(type=GAMEDATA, dirName) ->
+-     * CELL_GAME_RET_NONE ("no data yet") -> the title calls
+-     * cellGameCreateGameData -> it checks again and expects to find it. This
+-     * created <content>/s_title_id instead, and s_title_id is the placeholder
+-     * "BLES00000" unless a PARAM.SFO set it -- so DataCheck kept looking for
+-     * <content>/NPUA80523, never found it, and Tokyo Jungle's installer span
+-     * DataCheck/CreateGameData forever.
+-     *
+-     * s_check_dir is the dirName from the check session that immediately
+-     * precedes this call, which is exactly what firmware creates. */
+-    const char* create_dir = s_check_dir[0] ? s_check_dir : s_title_id;
+-
+-    char path[CELL_GAME_PATH_MAX];
+-    snprintf(path, sizeof(path), "%s/%s", content_root(), create_dir);
+-
+-    ensure_dirs(path);
+-
+-    /* Also create USRDIR */
+-    char usrdir[CELL_GAME_PATH_MAX];
++    if (s_check_is_disc || !s_check_dir[0]) return CELL_GAME_ERROR_FAILURE;
++    if (!s_check_can_create) return CELL_GAME_ERROR_NOTSUPPORTED;
++    if (s_check_exists) return CELL_GAME_ERROR_EXIST;
++    if (s_create_dir[0]) return CELL_GAME_ERROR_EXIST;
++    const CellGameSetInitParams* params = (const void*)(vm_base + init_ea);
++    if (!memchr(params->title, 0, sizeof(params->title)) ||
++        !memchr(params->titleId, 0, sizeof(params->titleId)) ||
++        !memchr(params->version, 0, sizeof(params->version)) || !params->titleId[0])
++        return CELL_GAME_ERROR_PARAM;
++
++    /* The guest writes installed files here; publish the whole directory only
++     * at ContentPermit, once its binary SFO is ready. */
++    static unsigned sequence;
++    char path[1100], usrdir[1200];
++    ensure_dirs(content_root());
++    snprintf(path, sizeof(path), "%s/%s", content_root(), s_check_dir);
++    if (!dir_exists(path)) {
++        for (;;) {
++            snprintf(s_create_dir, sizeof(s_create_dir), "_GDATA_%u", ++sequence);
++            snprintf(path, sizeof(path), "%s/%s", content_root(), s_create_dir);
++            if (HOST_MKDIR(path) == 0) break;
++            if (errno != EEXIST) { s_create_dir[0] = 0; return CELL_GAME_ERROR_ACCESS_ERROR; }
++        }
++    }
++    /* Repair a legacy orphan in place: retain its files and atomically publish
++     * PARAM.SFO at Permit. Fresh installations publish a staged directory. */
+     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
+     ensure_dirs(usrdir);
++    if (!dir_exists(usrdir)) return CELL_GAME_ERROR_ACCESS_ERROR;
++    sfo_free(&s_check_sfo);
++    int ok = sfo_set_str(&s_check_sfo, "CATEGORY", "GD", 4) &&
++             sfo_set_str(&s_check_sfo, "TITLE_ID", params->titleId, 16) &&
++             sfo_set_str(&s_check_sfo, "TITLE", params->title, 128) &&
++             sfo_set_str(&s_check_sfo, "VERSION", params->version, 6) &&
++             sfo_set_str(&s_check_sfo, "APP_VER", params->version, 6) &&
++             sfo_set_str(&s_check_sfo, "PS3_SYSTEM_VER", s_system_ver, 8) &&
++             sfo_set_int(&s_check_sfo, "ATTRIBUTE", 0) &&
++             sfo_set_int(&s_check_sfo, "PARENTAL_LEVEL", 0) &&
++             sfo_set_int(&s_check_sfo, "RESOLUTION", 0) &&
++             sfo_set_int(&s_check_sfo, "SOUND_FORMAT", 0);
++    if (!ok) return CELL_GAME_ERROR_INTERNAL;
++    s_check_dirty = 1;
++    const char* create_dir = s_create_dir[0] ? s_create_dir : s_check_dir;
+ 
+     /* Host paths are only for host filesystem access. Guest code feeds these
+      * results back to cellFs, which resolves PS3 virtual paths through VFS. */
+@@ -777,7 +793,47 @@
+ /* cellGameSetExitParam is implemented in cellGameExec.c with the correct
+  * PS3 SDK signature (CellGameExecBootParam*). Not duplicated here. */
+ 
+-s32 cellGameGetSizeKB(s32* sizeKB)
++/* Like RPCS3 get_dir_size(..., 1024), round each regular file to a KB.
++ * Do not follow symbolic links outside the selected content directory. */
++static int content_size_kb(const char* path, u64* total)
++{
++#ifdef _WIN32
++    char pattern[1200]; snprintf(pattern, sizeof(pattern), "%s/*", path);
++    WIN32_FIND_DATAA entry;
++    HANDLE find = FindFirstFileA(pattern, &entry);
++    if (find == INVALID_HANDLE_VALUE) return dir_exists(path);
++    int ok = 1;
++    do {
++        if (!strcmp(entry.cFileName, ".") || !strcmp(entry.cFileName, "..") ||
++            (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
++        char child[1200]; snprintf(child, sizeof(child), "%s/%s", path, entry.cFileName);
++        if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = content_size_kb(child, total);
++        else *total += ((((u64)entry.nFileSizeHigh << 32) | entry.nFileSizeLow) + 1023) / 1024;
++    } while (ok && FindNextFileA(find, &entry));
++    FindClose(find);
++    return ok;
++#else
++    DIR* dir = opendir(path);
++    if (!dir) return 0;
++    int ok = 1;
++    struct dirent* entry;
++    while (ok && (entry = readdir(dir))) {
++        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
++        char child[1200];
++        if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) >= (int)sizeof(child)) {
++            ok = 0; break;
++        }
++        struct stat st;
++        if (lstat(child, &st) != 0) { ok = 0; break; }
++        if (S_ISDIR(st.st_mode)) ok = content_size_kb(child, total);
++        else if (S_ISREG(st.st_mode)) *total += ((u64)st.st_size + 1023) / 1024;
++    }
++    closedir(dir);
++    return ok;
++#endif
++}
++
++static s32 cellGameGetSizeKB_impl(s32* sizeKB)
+ {
+     printf("[cellGame] GetSizeKB()\n");
+ 
+@@ -785,8 +841,15 @@
+     if (!sizeKB_ea)
+         return CELL_GAME_ERROR_PARAM;
+ 
+-    /* Report the content directory's size (guest addr; 0 for now). */
+     vm_write32(sizeKB_ea, 0);
++    if (s_check_is_disc) return CELL_GAME_ERROR_NOTSUPPORTED;
++    if (!s_check_exists && !s_check_dirty) return CELL_OK;
++    char path[1100];
++    snprintf(path, sizeof(path), "%s/%s", content_root(),
++             s_create_dir[0] ? s_create_dir : s_check_dir);
++    u64 kb = 0;
++    if (!content_size_kb(path, &kb)) return CELL_GAME_ERROR_ACCESS_ERROR;
++    vm_write32(sizeKB_ea, kb > INT32_MAX ? INT32_MAX : (u32)kb);
+     return CELL_OK;
+ }
+ 
+@@ -842,3 +905,79 @@
+ 
+     return CELL_OK;
+ }
++
++/* Game check sessions are shared. Serialize entry points so concurrent title
++ * threads cannot free/read the selected SFO at the same time. */
++#ifdef _WIN32
++static SRWLOCK s_param_lock = SRWLOCK_INIT;
++#  define PARAM_LOCK() AcquireSRWLockExclusive(&s_param_lock)
++#  define PARAM_UNLOCK() ReleaseSRWLockExclusive(&s_param_lock)
++#else
++static pthread_mutex_t s_param_lock = PTHREAD_MUTEX_INITIALIZER;
++#  define PARAM_LOCK() pthread_mutex_lock(&s_param_lock)
++#  define PARAM_UNLOCK() pthread_mutex_unlock(&s_param_lock)
++#endif
++
++s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size, char* dirName)
++{
++    PARAM_LOCK();
++    s32 result = cellGameBootCheck_impl(type, attributes, size, dirName);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
++{
++    PARAM_LOCK();
++    s32 result = cellGameDataCheck_impl(type, dirName, size);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
++{
++    PARAM_LOCK();
++    s32 result = cellGameContentPermit_impl(contentInfoPath, usrdirPath);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath, char* tmp_usrdirPath)
++{
++    PARAM_LOCK();
++    s32 result = cellGameCreateGameData_impl(init, tmp_contentInfoPath, tmp_usrdirPath);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameSetParamString(s32 id, const char* buf)
++{
++    PARAM_LOCK();
++    s32 result = cellGameSetParamString_impl(id, buf);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
++{
++    PARAM_LOCK();
++    s32 result = cellGameGetParamString_impl(id, buf, bufsize);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameGetParamInt(s32 id, s32* value)
++{
++    PARAM_LOCK();
++    s32 result = cellGameGetParamInt_impl(id, value);
++    PARAM_UNLOCK();
++    return result;
++}
++
++s32 cellGameGetSizeKB(s32* sizeKB)
++{
++    PARAM_LOCK();
++    s32 result = cellGameGetSizeKB_impl(sizeKB);
++    PARAM_UNLOCK();
++    return result;
++}
+--- a/libs/system/savedata_sfo.h
++++ b/libs/system/savedata_sfo.h
+@@ -4,137 +4,8 @@
+ #ifndef PS3RECOMP_SAVEDATA_SFO_H
+ #define PS3RECOMP_SAVEDATA_SFO_H
+ 
+-#define SAVE_SFO_MAX 256
+-typedef struct SaveSfoEntry {
+-    char key[64];
+-    u16 format;
+-    u32 size, capacity;
+-    u8* data;
+-} SaveSfoEntry;
+-typedef struct SaveSfo { u32 count; SaveSfoEntry entries[SAVE_SFO_MAX]; } SaveSfo;
++#include "param_sfo.h"
+ 
+-static u32 sfo_le32(const u8* p)
+-{
+-    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+-}
+-static void sfo_put32(u8* p, u32 n)
+-{
+-    p[0] = (u8)n; p[1] = (u8)(n >> 8); p[2] = (u8)(n >> 16); p[3] = (u8)(n >> 24);
+-}
+-static void sfo_free(SaveSfo* s)
+-{
+-    for (u32 i = 0; i < s->count; i++) free(s->entries[i].data);
+-    memset(s, 0, sizeof(*s));
+-}
+-static SaveSfoEntry* sfo_find(SaveSfo* s, const char* key)
+-{
+-    for (u32 i = 0; i < s->count; i++)
+-        if (!strcmp(s->entries[i].key, key)) return &s->entries[i];
+-    return NULL;
+-}
+-static int sfo_set(SaveSfo* s, const char* key, u16 format,
+-                   const void* data, u32 size, u32 capacity)
+-{
+-    if (strlen(key) >= 64 || size > capacity || capacity > 65536) return 0;
+-    SaveSfoEntry* e = sfo_find(s, key);
+-    if (!e) {
+-        if (s->count == SAVE_SFO_MAX) return 0;
+-        e = &s->entries[s->count++];
+-        strcpy(e->key, key);
+-    }
+-    u8* copy = calloc(1, capacity ? capacity : 1);
+-    if (!copy) return 0;
+-    if (size) memcpy(copy, data, size);
+-    free(e->data); e->data = copy;
+-    e->format = format; e->size = size; e->capacity = capacity;
+-    return 1;
+-}
+-static int sfo_set_int(SaveSfo* s, const char* key, u32 n)
+-{
+-    u8 data[4]; sfo_put32(data, n);
+-    return sfo_set(s, key, 0x0404, data, 4, 4);
+-}
+-static int sfo_set_str(SaveSfo* s, const char* key, const char* text, u32 capacity)
+-{
+-    u32 len = (u32)strnlen(text, capacity);
+-    if (len == capacity) return 0;
+-    return sfo_set(s, key, 0x0204, text, len + 1, capacity);
+-}
+-static void sfo_remove(SaveSfo* s, const char* key)
+-{
+-    SaveSfoEntry* e = sfo_find(s, key);
+-    if (!e) return;
+-    u32 i = (u32)(e - s->entries);
+-    free(e->data);
+-    memmove(e, e + 1, (s->count - i - 1) * sizeof(*e));
+-    memset(&s->entries[--s->count], 0, sizeof(*e));
+-}
+-static int sfo_load(const char* path, SaveSfo* s)
+-{
+-    memset(s, 0, sizeof(*s));
+-    FILE* f = fopen(path, "rb");
+-    if (!f) return 0;
+-    fseek(f, 0, SEEK_END); long length = ftell(f); rewind(f);
+-    if (length < 20 || length > 1024 * 1024) { fclose(f); return 0; }
+-    u8* bytes = malloc((size_t)length);
+-    if (!bytes) { fclose(f); return 0; }
+-    int ok = fread(bytes, 1, (size_t)length, f) == (size_t)length;
+-    fclose(f);
+-    u32 keys = sfo_le32(bytes + 8), data = sfo_le32(bytes + 12);
+-    u32 count = sfo_le32(bytes + 16);
+-    ok = ok && !memcmp(bytes, "\0PSF", 4) && count <= SAVE_SFO_MAX &&
+-         20 + count * 16 <= keys && keys <= data && data <= (u32)length;
+-    for (u32 i = 0; ok && i < count; i++) {
+-        const u8* e = bytes + 20 + i * 16;
+-        u32 key = keys + ((u32)e[0] | (u32)e[1] << 8);
+-        u32 size = sfo_le32(e + 4), cap = sfo_le32(e + 8), off = sfo_le32(e + 12);
+-        ok = key < data && memchr(bytes + key, 0, data - key) &&
+-             size <= cap && cap <= 65536 && (u64)data + off + cap <= (u32)length;
+-        if (ok) ok = sfo_set(s, (char*)bytes + key, (u16)(e[2] | e[3] << 8),
+-                             bytes + data + off, size, cap);
+-    }
+-    free(bytes);
+-    if (!ok) sfo_free(s);
+-    return ok;
+-}
+-static int sfo_entry_compare(const void* a, const void* b)
+-{
+-    return strcmp(((const SaveSfoEntry*)a)->key, ((const SaveSfoEntry*)b)->key);
+-}
+-static int sfo_store(const char* path, SaveSfo* s)
+-{
+-    qsort(s->entries, s->count, sizeof(s->entries[0]), sfo_entry_compare);
+-    u32 key_size = 0, data_size = 0;
+-    for (u32 i = 0; i < s->count; i++) {
+-        key_size += (u32)strlen(s->entries[i].key) + 1;
+-        data_size += (s->entries[i].capacity + 3) & ~3u;
+-    }
+-    u32 keys = 20 + s->count * 16, data = (keys + key_size + 3) & ~3u;
+-    u32 size = data + data_size;
+-    u8* bytes = calloc(1, size);
+-    if (!bytes) return 0;
+-    memcpy(bytes, "\0PSF", 4); sfo_put32(bytes + 4, 0x101);
+-    sfo_put32(bytes + 8, keys); sfo_put32(bytes + 12, data); sfo_put32(bytes + 16, s->count);
+-    u32 k = 0, d = 0;
+-    for (u32 i = 0; i < s->count; i++) {
+-        SaveSfoEntry* entry = &s->entries[i];
+-        u8* e = bytes + 20 + i * 16;
+-        e[0] = (u8)k; e[1] = (u8)(k >> 8);
+-        e[2] = (u8)entry->format; e[3] = (u8)(entry->format >> 8);
+-        sfo_put32(e + 4, entry->size); sfo_put32(e + 8, entry->capacity); sfo_put32(e + 12, d);
+-        strcpy((char*)bytes + keys + k, entry->key);
+-        memcpy(bytes + data + d, entry->data, entry->size);
+-        k += (u32)strlen(entry->key) + 1; d += (entry->capacity + 3) & ~3u;
+-    }
+-    char temp[1100]; snprintf(temp, sizeof(temp), "%s.tmp", path);
+-    FILE* f = fopen(temp, "wb");
+-    int ok = f && fwrite(bytes, 1, size, f) == size;
+-    if (f && fclose(f) != 0) ok = 0;
+-    free(bytes);
+-    if (ok) ok = rename(temp, path) == 0;
+-    if (!ok) remove(temp);
+-    return ok;
+-}
+ static int read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
+ {
+     memset(param, 0, sizeof(*param));
+--- a/libs/system/cellGame.h
++++ b/libs/system/cellGame.h
+@@ -160,6 +160,8 @@
+ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
+                              void* funcStat, u32 container);
+ 
++s32 cellGameSetParamString(s32 id, const char* buf);
++
+ s32 cellGameGetParamInt(s32 id, s32* value);
+ 
+ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize);
+--- /dev/null
++++ b/libs/system/param_sfo.h
+@@ -0,0 +1,142 @@
++/* Binary little-endian PARAM.SFO reader/writer shared by game and save data. */
++#ifndef PS3RECOMP_PARAM_SFO_H
++#define PS3RECOMP_PARAM_SFO_H
++#include "ps3emu/ps3types.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SAVE_SFO_MAX 256
++typedef struct SaveSfoEntry {
++    char key[64];
++    u16 format;
++    u32 size, capacity;
++    u8* data;
++} SaveSfoEntry;
++typedef struct SaveSfo { u32 count; SaveSfoEntry entries[SAVE_SFO_MAX]; } SaveSfo;
++
++static u32 sfo_le32(const u8* p)
++{
++    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
++}
++static void sfo_put32(u8* p, u32 n)
++{
++    p[0] = (u8)n; p[1] = (u8)(n >> 8); p[2] = (u8)(n >> 16); p[3] = (u8)(n >> 24);
++}
++static void sfo_free(SaveSfo* s)
++{
++    for (u32 i = 0; i < s->count; i++) free(s->entries[i].data);
++    memset(s, 0, sizeof(*s));
++}
++static SaveSfoEntry* sfo_find(SaveSfo* s, const char* key)
++{
++    for (u32 i = 0; i < s->count; i++)
++        if (!strcmp(s->entries[i].key, key)) return &s->entries[i];
++    return NULL;
++}
++static int sfo_set(SaveSfo* s, const char* key, u16 format,
++                   const void* data, u32 size, u32 capacity)
++{
++    if (strlen(key) >= 64 || size > capacity || capacity > 65536) return 0;
++    SaveSfoEntry* e = sfo_find(s, key);
++    if (!e) {
++        if (s->count == SAVE_SFO_MAX) return 0;
++        e = &s->entries[s->count++];
++        strcpy(e->key, key);
++    }
++    u8* copy = calloc(1, capacity ? capacity : 1);
++    if (!copy) return 0;
++    if (size) memcpy(copy, data, size);
++    free(e->data); e->data = copy;
++    e->format = format; e->size = size; e->capacity = capacity;
++    return 1;
++}
++static int sfo_set_int(SaveSfo* s, const char* key, u32 n)
++{
++    u8 data[4]; sfo_put32(data, n);
++    return sfo_set(s, key, 0x0404, data, 4, 4);
++}
++static int sfo_set_str(SaveSfo* s, const char* key, const char* text, u32 capacity)
++{
++    u32 len = (u32)strnlen(text, capacity);
++    if (len == capacity) return 0;
++    return sfo_set(s, key, 0x0204, text, len + 1, capacity);
++}
++static void sfo_remove(SaveSfo* s, const char* key)
++{
++    SaveSfoEntry* e = sfo_find(s, key);
++    if (!e) return;
++    u32 i = (u32)(e - s->entries);
++    free(e->data);
++    memmove(e, e + 1, (s->count - i - 1) * sizeof(*e));
++    memset(&s->entries[--s->count], 0, sizeof(*e));
++}
++static int sfo_load(const char* path, SaveSfo* s)
++{
++    memset(s, 0, sizeof(*s));
++    FILE* f = fopen(path, "rb");
++    if (!f) return 0;
++    fseek(f, 0, SEEK_END); long length = ftell(f); rewind(f);
++    if (length < 20 || length > 1024 * 1024) { fclose(f); return 0; }
++    u8* bytes = malloc((size_t)length);
++    if (!bytes) { fclose(f); return 0; }
++    int ok = fread(bytes, 1, (size_t)length, f) == (size_t)length;
++    fclose(f);
++    if (!ok) { free(bytes); return 0; }
++    u32 keys = sfo_le32(bytes + 8), data = sfo_le32(bytes + 12);
++    u32 count = sfo_le32(bytes + 16);
++    ok = !memcmp(bytes, "\0PSF", 4) && sfo_le32(bytes + 4) == 0x101 &&
++         count <= SAVE_SFO_MAX &&
++         20 + count * 16 <= keys && keys <= data && data <= (u32)length;
++    for (u32 i = 0; ok && i < count; i++) {
++        const u8* e = bytes + 20 + i * 16;
++        u32 key = keys + ((u32)e[0] | (u32)e[1] << 8);
++        u32 size = sfo_le32(e + 4), cap = sfo_le32(e + 8), off = sfo_le32(e + 12);
++        ok = key < data && memchr(bytes + key, 0, data - key) &&
++             size <= cap && cap <= 65536 && (u64)data + off + cap <= (u32)length;
++        if (ok) ok = sfo_set(s, (char*)bytes + key, (u16)(e[2] | e[3] << 8),
++                             bytes + data + off, size, cap);
++    }
++    free(bytes);
++    if (!ok) sfo_free(s);
++    return ok;
++}
++static int sfo_entry_compare(const void* a, const void* b)
++{
++    return strcmp(((const SaveSfoEntry*)a)->key, ((const SaveSfoEntry*)b)->key);
++}
++static int sfo_store(const char* path, SaveSfo* s)
++{
++    qsort(s->entries, s->count, sizeof(s->entries[0]), sfo_entry_compare);
++    u32 key_size = 0, data_size = 0;
++    for (u32 i = 0; i < s->count; i++) {
++        key_size += (u32)strlen(s->entries[i].key) + 1;
++        data_size += (s->entries[i].capacity + 3) & ~3u;
++    }
++    u32 keys = 20 + s->count * 16, data = (keys + key_size + 3) & ~3u;
++    u32 size = data + data_size;
++    u8* bytes = calloc(1, size);
++    if (!bytes) return 0;
++    memcpy(bytes, "\0PSF", 4); sfo_put32(bytes + 4, 0x101);
++    sfo_put32(bytes + 8, keys); sfo_put32(bytes + 12, data); sfo_put32(bytes + 16, s->count);
++    u32 k = 0, d = 0;
++    for (u32 i = 0; i < s->count; i++) {
++        SaveSfoEntry* entry = &s->entries[i];
++        u8* e = bytes + 20 + i * 16;
++        e[0] = (u8)k; e[1] = (u8)(k >> 8);
++        e[2] = (u8)entry->format; e[3] = (u8)(entry->format >> 8);
++        sfo_put32(e + 4, entry->size); sfo_put32(e + 8, entry->capacity); sfo_put32(e + 12, d);
++        strcpy((char*)bytes + keys + k, entry->key);
++        memcpy(bytes + data + d, entry->data, entry->size);
++        k += (u32)strlen(entry->key) + 1; d += (entry->capacity + 3) & ~3u;
++    }
++    char temp[1100]; snprintf(temp, sizeof(temp), "%s.tmp", path);
++    FILE* f = fopen(temp, "wb");
++    int ok = f && fwrite(bytes, 1, size, f) == size;
++    if (f && fclose(f) != 0) ok = 0;
++    free(bytes);
++    if (ok) ok = rename(temp, path) == 0;
++    if (!ok) remove(temp);
++    return ok;
++}
++#endif
+--- /dev/null
++++ b/libs/system/tests/test_gamedata_roundtrip.c
+@@ -0,0 +1,152 @@
++/* Separate create/check processes exercise actual metadata persistence. */
++#include "../cellGame.c"
++#include <assert.h>
++#include <pthread.h>
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++ps3_guest_caller_fn g_ps3_guest_caller;
++const char* ppu_vfs_root = ".";
++
++static void string_param(s32 id, const char* expected)
++{
++    assert(cellGameGetParamString(id, (void*)0x800, 256) == CELL_OK);
++    assert(!strcmp((char*)vm_base + 0x800, expected));
++}
++static void* parallel_check(void* arg)
++{
++    (void)arg;
++    for (int i = 0; i < 20; i++)
++        assert(cellGameDataCheck(3, (void*)0x100, NULL) == CELL_OK);
++    return NULL;
++}
++int main(int argc, char** argv)
++{
++    assert(argc == 3);
++    vm_base = calloc(1, 65536); assert(vm_base);
++    cellGame_set_content_path(argv[2]);
++    cellGame_set_title_id("BLUS31313"); cellGame_set_title("Disc title");
++    strcpy((char*)vm_base + 0x100, "NPUB31321");
++    char target[1200], sfo[1200], file[1200];
++    snprintf(target, sizeof(target), "%s/NPUB31321", argv[2]);
++    snprintf(sfo, sizeof(sfo), "%s/PARAM.SFO", target);
++    snprintf(file, sizeof(file), "%s/USRDIR/payload.bin", target);
++    if (!strcmp(argv[1], "create") || !strcmp(argv[1], "heal")) {
++        if (!strcmp(argv[1], "heal")) {
++            ensure_dirs(target);
++            char usr[1200]; snprintf(usr, sizeof(usr), "%s/USRDIR", target);
++            ensure_dirs(usr);
++            FILE* f = fopen(file, "wb"); assert(f);
++            assert(fwrite("keep", 1, 4, f) == 4); assert(fclose(f) == 0);
++        }
++        assert(cellGameDataCheck(3, (void*)0x100, (void*)0x200) == CELL_GAME_RET_NONE);
++        assert(vm_read32(0x200) > 0 && vm_read32(0x204) == 0 && vm_read32(0x208) == 0);
++        assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
++        assert(!vm_base[0x400] && !vm_base[0x500]);
++        if (!strcmp(argv[1], "create")) assert(!dir_exists(target));
++        assert(access(sfo, F_OK) != 0);
++        CellGameSetInitParams* init = (void*)(vm_base + 0x1000);
++        strcpy(init->title, "Installed guest title");
++        strcpy(init->titleId, "NPUB31321"); strcpy(init->version, "02.34");
++        assert(cellGameCreateGameData((void*)0x1000, (void*)0x400, (void*)0x500) == CELL_OK);
++        string_param(CELL_GAME_PARAMID_TITLE_ID, "NPUB31321");
++        string_param(CELL_GAME_PARAMID_VERSION, "02.34");
++        strcpy((char*)vm_base + 0x600, "Updated guest title");
++        assert(cellGameSetParamString(CELL_GAME_PARAMID_TITLE, (void*)0x600) == CELL_OK);
++        strcpy((char*)vm_base + 0x600, "Localized guest title");
++        assert(cellGameSetParamString(CELL_GAME_PARAMID_TITLE_JAPANESE, (void*)0x600) == CELL_OK);
++        assert(access(sfo, F_OK) != 0); /* metadata has not been published */
++        char staged[1200];
++        snprintf(staged, sizeof(staged), "%s/%s/USRDIR/new.bin", argv[2],
++                 s_create_dir[0] ? s_create_dir : "NPUB31321");
++        FILE* f = fopen(staged, "wb"); assert(f);
++        char data[1025] = { 1 }; assert(fwrite(data, 1, sizeof(data), f) == sizeof(data));
++        assert(fclose(f) == 0);
++        assert(cellGameGetSizeKB((void*)0x900) == CELL_OK);
++        assert(vm_read32(0x900) == (!strcmp(argv[1], "heal") ? 3 : 2));
++        assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
++        assert(!strcmp((char*)vm_base + 0x400, "/dev_hdd0/game/NPUB31321"));
++        assert(access(sfo, F_OK) == 0);
++        assert(cellGameCreateGameData((void*)0x1000, NULL, NULL) == CELL_GAME_ERROR_EXIST);
++        puts("PASS create/legacy repair: NONE has empty paths; Create + Set + Permit publishes binary SFO");
++    } else if (!strcmp(argv[1], "invalid")) {
++        ensure_dirs(target);
++        FILE* f = fopen(sfo, "wb"); assert(f);
++        assert(fwrite("invalid PARAM.SFO", 1, 17, f) == 17); assert(fclose(f) == 0);
++        assert(cellGameDataCheck(3, (void*)0x100, (void*)0x200) == CELL_GAME_RET_NONE);
++        assert(vm_read32(0x204) == 0 && vm_read32(0x208) == 0);
++        assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
++        assert(!vm_base[0x400] && !vm_base[0x500]);
++        puts("PASS malformed SFO: NONE, zero sizes, empty permission paths");
++    } else {
++        assert(!strcmp(argv[1], "check"));
++        assert(cellGameDataCheck(3, (void*)0x100, (void*)0x200) == CELL_OK);
++        assert(vm_read32(0x200) > 0 && vm_read32(0x204) == (u32)-1 && vm_read32(0x208) == 0);
++        string_param(CELL_GAME_PARAMID_TITLE_ID, "NPUB31321");
++        string_param(CELL_GAME_PARAMID_TITLE, "Updated guest title");
++        string_param(CELL_GAME_PARAMID_TITLE_JAPANESE, "Localized guest title");
++        string_param(CELL_GAME_PARAMID_VERSION, "02.34");
++        string_param(CELL_GAME_PARAMID_APP_VER, "02.34");
++        assert(cellGameGetParamInt(CELL_GAME_PARAMID_PARENTAL_LEVEL, (void*)0x900) == CELL_OK);
++        assert(vm_read32(0x900) == 0);
++        SaveSfo disk; assert(sfo_load(sfo, &disk));
++        assert(!strcmp(param_string(&disk, "CATEGORY"), "GD"));
++        assert(sfo_le32(sfo_find(&disk, "ATTRIBUTE")->data) == 0); sfo_free(&disk);
++        assert(cellGameGetSizeKB((void*)0x900) == CELL_OK);
++        HOST_STAT_T st; assert(HOST_STAT(sfo, &st) == 0);
++        u32 expected = 2 + ((u64)st.st_size + 1023) / 1024;
++        if (access(file, F_OK) == 0) {
++            FILE* f = fopen(file, "rb"); assert(f); char data[5] = {0};
++            assert(fread(data, 1, 4, f) == 4 && !strcmp(data, "keep")); fclose(f);
++            expected++;
++        }
++        assert(vm_read32(0x900) == expected);
++        strcpy((char*)vm_base + 0x600, "Reboot update");
++        assert(cellGameSetParamString(CELL_GAME_PARAMID_TITLE, (void*)0x600) == CELL_OK);
++        char temp[1200]; snprintf(temp, sizeof(temp), "%s.tmp", sfo);
++        assert(mkdir(temp, 0700) == 0);
++        char blocker[1300]; snprintf(blocker, sizeof(blocker), "%s/blocker", temp);
++        FILE* block = fopen(blocker, "wb"); assert(block); assert(fclose(block) == 0);
++        assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_GAME_ERROR_ACCESS_ERROR);
++        SaveSfo unchanged; assert(sfo_load(sfo, &unchanged));
++        assert(!strcmp(param_string(&unchanged, "TITLE"), "Updated guest title"));
++        sfo_free(&unchanged); assert(unlink(blocker) == 0); assert(rmdir(temp) == 0);
++        assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
++        assert(cellGameDataCheck(3, (void*)0x100, NULL) == CELL_OK);
++        string_param(CELL_GAME_PARAMID_TITLE, "Reboot update");
++        strcpy((char*)vm_base + 0x600, "99.99");
++        assert(cellGameSetParamString(CELL_GAME_PARAMID_VERSION, (void*)0x600) == CELL_GAME_ERROR_NOTSUPPORTED);
++        puts("PASS atomic update: failed Permit retained original SFO, retry committed update");
++        /* Imported unknown keys survive ordinary metadata updates. */
++        assert(sfo_set_int(&s_check_sfo, "ATTRIBUTE", 7));
++        assert(sfo_set_int(&s_check_sfo, "PARENTAL_LEVEL", 5));
++        assert(sfo_set_str(&s_check_sfo, "EXTRA", "preserved", 16));
++        s_check_dirty = 1;
++        assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
++        assert(cellGameDataCheck(3, (void*)0x100, NULL) == CELL_OK);
++        assert(cellGameGetParamInt(CELL_GAME_PARAMID_PARENTAL_LEVEL, (void*)0x900) == CELL_OK);
++        assert(vm_read32(0x900) == 5 && sfo_le32(sfo_find(&s_check_sfo, "ATTRIBUTE")->data) == 7);
++        assert(!strcmp(param_string(&s_check_sfo, "EXTRA"), "preserved"));
++        assert(!strcmp(cellGame_get_title_id(), "BLUS31313"));
++        pthread_t a, b;
++        assert(!pthread_create(&a, NULL, parallel_check, NULL));
++        assert(!pthread_create(&b, NULL, parallel_check, NULL));
++        pthread_join(a, NULL); pthread_join(b, NULL);
++        puts("PASS reboot: stored strings/integers, content size, unknown fields, disc identity, concurrent checks");
++    }
++    assert(cellGameBootCheck((void*)0x900, (void*)0x904, (void*)0xA00, NULL) == CELL_OK);
++    assert(vm_read32(0x900) == 1 && vm_read32(0x904) == 0);
++    assert(vm_read32(0xA04) == (u32)-1 && vm_read32(0xA08) == 4);
++    assert(cellGameDataCheck(3, NULL, NULL) == CELL_GAME_ERROR_PARAM);
++    strcpy((char*)vm_base + 0x100, "../escape");
++    assert(cellGameDataCheck(3, (void*)0x100, NULL) == CELL_GAME_ERROR_PARAM);
++    sfo_free(&s_check_sfo); free(vm_base);
++    return 0;
++}
+--- a/libs/system/tests/test_savedata_io.c
++++ b/libs/system/tests/test_savedata_io.c
+@@ -70,7 +70,9 @@
+ {
+     char root[] = "/tmp/ps3recomp-savedata-io-XXXXXX";
+     assert(mkdtemp(root)); strcpy(s_save_root, root);
+-    vm_base = calloc(1, 0x200000); assert(vm_base);
++    void* arena = NULL;
++    assert(posix_memalign(&arena, vm_host_page_size(), 0x200000) == 0);
++    vm_base = arena; memset(vm_base, 0, 0x200000);
+     assert(cellSaveData_set_scratch_region(0x100000, 0x20000) == CELL_OK);
+     strcpy((char*)vm_base + 0x300, "TEST00000");
+     strcpy((char*)vm_base + 0x340, "DATA.BIN");
+--- a/libs/system/tests/test_savedata_fixed.c
++++ b/libs/system/tests/test_savedata_fixed.c
+@@ -67,7 +67,9 @@
+         snprintf(path, sizeof(path), "%s/TEST0000%d", root, n);
+         assert(write_param_sfo(path, &param));
+     }
+-    vm_base = calloc(1, 0x200000); assert(vm_base);
++    void* arena = NULL;
++    assert(posix_memalign(&arena, vm_host_page_size(), 0x200000) == 0);
++    vm_base = arena; memset(vm_base, 0, 0x200000);
+     assert(cellSaveData_set_scratch_region(0x100000, 0x20000) == CELL_OK);
+     assert(cellSaveData_set_scratch_region(0x100001, 0x20000) == CELL_SAVEDATA_ERROR_PARAM);
+     assert(cellSaveData_set_scratch_region(0xFFFF0000, 0x20000) == CELL_SAVEDATA_ERROR_PARAM);
+--- a/libs/system/tests/test_game_paths.c
++++ b/libs/system/tests/test_game_paths.c
+@@ -19,7 +19,9 @@
+ 
+ int main(void)
+ {
+-    char root[] = "/tmp/ps3recomp-game-paths-XXXXXX";
++    char root[1024];
++    snprintf(root, sizeof(root), "%s/ps3recomp-game-paths-XXXXXX",
++             getenv("TMPDIR") ? getenv("TMPDIR") : ".");
+     assert(mkdtemp(root));
+     vm_base = calloc(1, 65536); assert(vm_base);
+     cellGame_set_content_path(root);
+@@ -28,20 +30,26 @@
+     char disc[256], host[256];
+     snprintf(disc, sizeof(disc), "%s/disc", root);
+     assert(mkdir(disc, 0700) == 0); ppu_vfs_root = disc;
+-    /* DataCheck before BootCheck: create the checked HDD directory and never
+-     * mirror game data into the mounted disc. */
++    /* A check alone never creates installed content or touches the disc. */
+     assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
+-    assert(strcmp((char*)vm_base + 0x400, "/dev_hdd0/game/TEST00000") == 0);
++    assert(vm_base[0x400] == 0 && vm_base[0x500] == 0);
+     snprintf(host, sizeof(host), "%s/game", disc); assert(!dir_exists(host));
+     assert(rmdir(disc) == 0); ppu_vfs_root = ".";
++    CellGameSetInitParams* init = (void*)(vm_base + 0x300);
++    strcpy(init->title, "Game paths"); strcpy(init->titleId, "TEST00000");
++    strcpy(init->version, "01.00");
+     assert(cellGameCreateGameData((void*)0x300, (void*)0x400, (void*)0x500) == CELL_OK);
++    assert(strncmp((char*)vm_base + 0x400, "/dev_hdd0/game/_GDATA_", 22) == 0);
++    assert(cellGameContentPermit((void*)0x400, (void*)0x500) == CELL_OK);
+     assert(strcmp((char*)vm_base + 0x400, "/dev_hdd0/game/TEST00000") == 0);
+     assert(strcmp((char*)vm_base + 0x500, "/dev_hdd0/game/TEST00000/USRDIR") == 0);
+     assert(cellGameDataCheck(3, (void*)0x100, NULL) == CELL_OK);
+     snprintf(host, sizeof(host), "%s/TEST00000/USRDIR", root);
+     assert(dir_exists(host)); assert(rmdir(host) == 0);
++    snprintf(host, sizeof(host), "%s/TEST00000/PARAM.SFO", root); assert(unlink(host) == 0);
+     snprintf(host, sizeof(host), "%s/TEST00000", root);
+     assert(rmdir(host) == 0); assert(rmdir(root) == 0);
++    sfo_free(&s_check_sfo);
+     free(vm_base);
+     puts("Game creation returns guest paths and creates host directories");
+ }
