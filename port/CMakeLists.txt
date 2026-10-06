@@ -45,7 +45,7 @@ if(D2_GAME_VERSION STREQUAL "140")
     set(D2_EXPECTED_TOC "0x0047DF98")
     set(D2_DEFAULT_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu-140")
     set(D2_MOVIE_OVERRIDES 001686AC 00168304 00167FC8)
-    set(D2_NATIVE_OVERRIDES 0033D91C)   # guest memset -> src/d2_fill.cpp
+    set(D2_NATIVE_OVERRIDES 002FE4AC 0033D91C)   # VP upload -> d2_shader.cpp, memset -> d2_fill.cpp (lift file order)
 elseif(D2_GAME_VERSION STREQUAL "100")
     set(D2_DEFAULT_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp")
     set(D2_DEFAULT_D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out")
@@ -144,7 +144,7 @@ if(NOT "${D2_NATIVE_FOUND}" STREQUAL "${D2_NATIVE_OVERRIDES}")
 endif()
 set(D2_NATIVE_SOURCES)
 if(D2_NATIVE_OVERRIDES)
-    set(D2_NATIVE_SOURCES src/d2_fill.cpp)
+    set(D2_NATIVE_SOURCES src/d2_fill.cpp src/d2_shader.cpp)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -249,6 +249,7 @@ add_executable(${PROJECT_NAME}
     src/d2_audio.cpp
     src/d2_debug_warp.cpp
     src/d2_cheats.cpp
+    src/d2_items.cpp
     ${D2_NATIVE_SOURCES}
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -386,6 +387,9 @@ install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
 if(APPLE)
     include(src/d2_bundle.cmake)
     target_sources(${PROJECT_NAME} PRIVATE src/d2_flags.cpp src/d2_flags.m)
+    # AT: native Item Editor window (bridge in src/d2_items.cpp).
+    target_sources(${PROJECT_NAME} PRIVATE src/d2_item_editor.m)
+    set_source_files_properties(src/d2_item_editor.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     set_source_files_properties(src/d2_flags.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/video")
 endif()

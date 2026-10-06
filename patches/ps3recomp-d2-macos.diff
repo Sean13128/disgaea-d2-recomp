@@ -17722,7 +17722,7 @@ index acbaf12..1655114 100644
      /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
       * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index e73a151..0a1d58d 100644
+index e73a151..1bf9bcb 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
 @@ -20,10 +20,12 @@
@@ -18103,54 +18103,85 @@ index e73a151..0a1d58d 100644
  /* See the note on the forward declaration above ppu_stwcx32. */
  extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
  {
-@@ -1891,6 +2010,46 @@ void vm_write64(uint64_t a, uint64_t v) {
+@@ -1891,6 +2010,77 @@ void vm_write64(uint64_t a, uint64_t v) {
      barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
      if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
      v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
 +
-+/* One bulk guest fill for native memset overrides: the commit a run of lifted
-+ * stores would make (poll reset, SPU lock-line coherence, poll wakeups), in one
-+ * pass. Returns 0 and writes nothing when a store watch is armed or the range is
-+ * out of bounds, in the null page, mid null-sweep, raw SPU MMIO or the GCM
-+ * control window; the caller then runs the lifted loop so those per-store paths
-+ * see every store exactly as before. */
-+int vm_fill(uint32_t a, uint8_t v, uint32_t n)
++/* Commit n bytes at guest a the way a run of lifted stores would (poll reset,
++ * SPU lock-line coherence, poll wakeups), in one pass. src == nullptr fills v. */
++static void vm_bulk_commit(uint32_t a, uint32_t n, const uint8_t* src, uint8_t v)
 +{
-+    static const bool watched = getenv("PPU_WVAL") || getenv("PPU_WWATCH");
-+    const uint64_t end = (uint64_t)a + n, gcm = VM_HLE_INJECT_BASE;
-+    if (watched || g_barrier_sync_watch || g_null_sweep_hi || a < 0x1000u ||
-+        (ppu_vm_size && end > ppu_vm_size) || end > SPU_RAW_BASE ||
-+        (a < gcm + 0x2004u && end > gcm))
-+        return 0;
-+#ifdef _WIN32
-+    if (g_pt_val != -1) return 0;
-+#endif
-+    if (!n) return 1;
 +    ppu_poll_store();
-+    const uint32_t first = a & ~127u, last = (uint32_t)(end - 1) & ~127u;
++    const uint32_t first = a & ~127u, last = (uint32_t)((uint64_t)a + n - 1) & ~127u;
 +    bool reserved = false;
 +    for (uint32_t line = first; !reserved; line += 128u) {
 +        reserved = spu_coh_is_reserved(line);
 +        if (line == last) break;
 +    }
++    if (reserved) spu_lockline_lock();
++    if (src) memcpy(vm_base + a, src, n);
++    else memset(vm_base + a, v, n);
 +    if (reserved) {
-+        spu_lockline_lock();
-+        memset(vm_base + a, v, n);
 +        for (uint32_t line = first; ; line += 128u) {
 +            if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
 +            if (line == last) break;
 +        }
 +        spu_lockline_unlock();
-+    } else {
-+        memset(vm_base + a, v, n);
 +    }
 +    ps3_poll_notify(a, n);
++}
++
++/* Store-side ranges the bulk paths leave to the per-store accessors: null page
++ * or sweep, out of bounds, raw SPU MMIO, the GCM control window. */
++static bool vm_bulk_store_ok(uint32_t a, uint32_t n)
++{
++    static const bool watched = getenv("PPU_WVAL") || getenv("PPU_WWATCH");
++    const uint64_t end = (uint64_t)a + n, gcm = VM_HLE_INJECT_BASE;
++#ifdef _WIN32
++    if (g_pt_val != -1) return false;
++#endif
++    return !(watched || g_barrier_sync_watch || g_null_sweep_hi || a < 0x1000u ||
++             (ppu_vm_size && end > ppu_vm_size) || end > SPU_RAW_BASE ||
++             (a < gcm + 0x2004u && end > gcm));
++}
++
++/* One bulk guest fill for native memset overrides. Returns 0 and writes
++ * nothing when a store watch is armed or the range is one vm_bulk_store_ok
++ * declines; the caller then runs the lifted loop so those per-store paths see
++ * every store exactly as before. */
++int vm_fill(uint32_t a, uint8_t v, uint32_t n)
++{
++    if (!vm_bulk_store_ok(a, n)) return 0;
++    if (n) vm_bulk_commit(a, n, nullptr, v);
++    return 1;
++}
++
++/* One guest-to-guest copy for native overrides of lifted word-copy loops: the
++ * bytes and commit side effects of n/4 vm_read32 + vm_write32 pairs. Returns 0
++ * and touches nothing when any read diagnostic or store watch is armed, the
++ * ranges overlap, or either range is low/OOB/raw SPU MMIO/the GCM window
++ * (refpoll, put/label notify); the caller then does the scalar accesses. */
++int vm_copy(uint32_t dst, uint32_t src, uint32_t n)
++{
++    static const bool rdiag = s_rwatch_enabled || getenv("PPU_FORCE_READ_ADDR") ||
++        getenv("PT") || getenv("YDKJ_RWATCH") || getenv("PPU_RVAL") ||
++        getenv("PPU_HOTMAP") || getenv("PPU_SPINBT");
++    const uint64_t send = (uint64_t)src + n, gcm = VM_HLE_INJECT_BASE;
++#ifdef VM_SAMPLE_READS
++    return 0;
++#endif
++    if (rdiag || ps3_log_hotread() || !vm_bulk_store_ok(dst, n) || dst < 0x10000u ||
++        src < 0x10000u || (ppu_vm_size && send > ppu_vm_size) || send > SPU_RAW_BASE ||
++        (src < gcm + 0x8000u && send > gcm) || (dst < send && src < (uint64_t)dst + n))
++        return 0;
++    if (n) vm_bulk_commit(dst, n, vm_base + src, 0);
 +    return 1;
 +}
  }
  
  /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------
-@@ -3202,8 +3361,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+@@ -3202,8 +3392,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                      (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                      (unsigned)ctx->lr);
              fflush(stderr); } }
@@ -18161,7 +18192,7 @@ index e73a151..0a1d58d 100644
              static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
              uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
              ULONGLONG _t0 = GetTickCount64();
-@@ -3270,65 +3429,98 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+@@ -3270,65 +3460,98 @@ extern "C" uint32_t ppu_load_elf(const char* path)
  {
      FILE* f = fopen(path, "rb");
      if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
@@ -18232,6 +18263,21 @@ index e73a151..0a1d58d 100644
 -            fprintf(stderr, "[ppu] PT_TLS template vaddr=0x%08X filesz=0x%X memsz=0x%X\n",
 -                    g_tls_vaddr, g_tls_filesz, g_tls_memsz);
 -            continue;
+-        }
+-        if (p_type != 1 /*PT_LOAD*/) continue;
+-        uint64_t p_offset = be64(ph + 8);
+-        uint64_t p_vaddr  = be64(ph + 16);
+-        uint64_t p_filesz = be64(ph + 32);
+-        uint64_t p_memsz  = be64(ph + 40);
+-        if (p_memsz == 0) continue;
+-        /* Bounds-check both ends before touching host memory: the source range
+-         * must lie inside the ELF file, and the destination range inside the
+-         * guest VM (ppu_vm_size==0 = unchecked, matching the vm accessors).
+-         * Skip malformed/oversized segments rather than overflowing the host. */
+-        if (p_offset > fsz || p_filesz > fsz || p_offset + p_filesz > fsz) {
+-            fprintf(stderr, "[ppu] segment %u file range 0x%llX+0x%llX exceeds ELF (0x%llX), skipped\n",
+-                    i, (unsigned long long)p_offset, (unsigned long long)p_filesz, (unsigned long long)fsz);
+-            continue;
 +        const uint8_t* ph = file + phoff + (uint64_t)i * phentsize;
 +        uint32_t type = be32(ph);
 +        uint64_t off = be64(ph + 8), va = be64(ph + 16);
@@ -18251,21 +18297,6 @@ index e73a151..0a1d58d 100644
 +            have_tls = true;
 +            tls_vaddr = (uint32_t)va; tls_filesz = (uint32_t)filesz; tls_memsz = (uint32_t)memsz;
          }
--        if (p_type != 1 /*PT_LOAD*/) continue;
--        uint64_t p_offset = be64(ph + 8);
--        uint64_t p_vaddr  = be64(ph + 16);
--        uint64_t p_filesz = be64(ph + 32);
--        uint64_t p_memsz  = be64(ph + 40);
--        if (p_memsz == 0) continue;
--        /* Bounds-check both ends before touching host memory: the source range
--         * must lie inside the ELF file, and the destination range inside the
--         * guest VM (ppu_vm_size==0 = unchecked, matching the vm accessors).
--         * Skip malformed/oversized segments rather than overflowing the host. */
--        if (p_offset > fsz || p_filesz > fsz || p_offset + p_filesz > fsz) {
--            fprintf(stderr, "[ppu] segment %u file range 0x%llX+0x%llX exceeds ELF (0x%llX), skipped\n",
--                    i, (unsigned long long)p_offset, (unsigned long long)p_filesz, (unsigned long long)fsz);
--            continue;
--        }
 -        if (ppu_vm_size && (p_vaddr > ppu_vm_size || p_memsz > ppu_vm_size ||
 -                            p_vaddr + p_memsz > ppu_vm_size)) {
 -            fprintf(stderr, "[ppu] segment %u vaddr 0x%llX+0x%llX exceeds VM (0x%X), skipped\n",
@@ -18312,7 +18343,7 @@ index e73a151..0a1d58d 100644
      free(file);
      fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
  
-@@ -3545,6 +3737,33 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
+@@ -3545,6 +3768,33 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
          s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
  }
  
@@ -18346,7 +18377,7 @@ index e73a151..0a1d58d 100644
  extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
-@@ -3569,14 +3788,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3569,14 +3819,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                  vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
          return 0; }
  
@@ -18363,7 +18394,7 @@ index e73a151..0a1d58d 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3595,7 +3811,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3595,7 +3842,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
      ctx.thread_id = saved_active ? saved_active->thread_id
                                   : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
  #else
@@ -18372,7 +18403,7 @@ index e73a151..0a1d58d 100644
  #endif
      g_active_ctx = &ctx;
      fn(&ctx);
-@@ -3616,12 +3832,11 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3616,12 +3863,11 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      ppu_fn fn = ppu_lookup(code);
      if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
  
@@ -18387,7 +18418,7 @@ index e73a151..0a1d58d 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3635,7 +3850,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3635,7 +3881,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      ctx.thread_id = saved_active ? saved_active->thread_id
                                   : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
  #else
@@ -18396,7 +18427,7 @@ index e73a151..0a1d58d 100644
  #endif
      g_active_ctx = &ctx;
      fn(&ctx);
-@@ -3646,12 +3861,52 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3646,12 +3892,52 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
  
  extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
  {
@@ -18449,7 +18480,7 @@ index e73a151..0a1d58d 100644
      g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
      uint32_t code = 0, toc = 0;
      ppu_opd_resolve(entry_opd, &code, &toc);
-@@ -3867,4 +4122,3 @@ extern "C" void ppu_guest_callstack(const char* tag)
+@@ -3867,4 +4153,3 @@ extern "C" void ppu_guest_callstack(const char* tag)
      (void)tag;
  #endif
  }

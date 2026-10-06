@@ -1,8 +1,9 @@
 # Keep the CLI runner intact; Finder launches a small AppKit path resolver.
 enable_language(OBJC)
-target_sources(${PROJECT_NAME} PRIVATE src/d2_settings.m)
+target_sources(${PROJECT_NAME} PRIVATE src/d2_settings.m src/d2_cheats_ui.m)
 # Mach-O needs an explicitly optional undefined symbol for an unlinked cheat UI.
-target_link_options(${PROJECT_NAME} PRIVATE "LINKER:-U,_d2_cheats_toggle_menu")
+target_link_options(${PROJECT_NAME} PRIVATE "LINKER:-U,_d2_cheats_menu_install" "LINKER:-U,_d2_item_editor_show")
+set_source_files_properties(src/d2_cheats_ui.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 set_source_files_properties(src/d2_settings.m PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc;-UNDEBUG"
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${PS3RECOMP_DIR}/libs/video;${PS3RECOMP_DIR}/libs/audio")

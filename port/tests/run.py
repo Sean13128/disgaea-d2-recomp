@@ -15,7 +15,7 @@ parser.add_argument('test')
 parser.add_argument('--sdk', type=Path, required=True)
 parser.add_argument('--work', type=Path, required=True)
 parser.add_argument('--runtime', type=Path, help='selected CMake SDK runtime library for loader tests')
-parser.add_argument('--lift', type=Path, help='lifted PPU source directory (AQ-fill)')
+parser.add_argument('--lift', type=Path, help='lifted PPU source directory (AQ-fill, AR-shader)')
 args = parser.parse_args()
 sdk, work = args.sdk.resolve(), args.work.resolve()
 work.mkdir(parents=True, exist_ok=True)
@@ -118,9 +118,7 @@ elif name.startswith('editor-'):
     for hook in ('exp', 'sp', 'shop'):
         header = header.replace(f'@D2_CHEAT_{hook}_ADDR@', profile['hooks'][hook])
     (work/'d2_cheats_data.h').write_text(header)
-    obj = work/'overlay.o'
-    run([cc, '-std=gnu17', *flags, '-c', sdk/'libs/system/sys_overlay.c', '-o', obj])
-    cmd = [cxx, '-std=c++20', *flags, f'-DD2_CHEATS_VERSION={version}', source('AF.editor-test.cpp'), obj]
+    cmd = [cxx, '-std=c++20', *flags, f'-DD2_CHEATS_VERSION={version}', source('AF.editor-test.cpp')]
     run_args = [work]
 elif name == 'loader-validation':
     if args.runtime is None or not args.runtime.is_file():
@@ -144,6 +142,18 @@ elif name == 'AQ-fill':
            ROOT/'port/src/d2_fill.cpp', sdk/'runtime/ppu/ppu_loader.cpp', args.runtime]
     cmd += ['-framework', 'CoreFoundation', '-framework', 'Cocoa', '-framework', 'Metal',
             '-framework', 'QuartzCore', '-framework', 'CoreText', f'-L{brew}/lib', '-lSDL2']
+elif name == 'AR-shader':
+    if args.runtime is None or not args.runtime.is_file() or args.lift is None:
+        sys.exit('AR-shader needs --runtime and --lift')
+    sig = 'void func_002FE4AC(ppu_context* ctx) {'
+    text = next(t for t in (f.read_text() for f in sorted(args.lift.glob('ppu_recomp_*.cpp'))) if sig in t)
+    start = text.index(sig)
+    body = text[start:text.index('\n}\n', start) + 3].replace('func_002FE4AC', 'd2_original_002FE4AC', 1)
+    (work/'shader_lift.cpp').write_text(text[:text.index('\nvoid func_')] + '\n' + body)
+    cmd = [cxx, '-std=c++20', *flags, '-I', args.lift, source('AR.shader-test.cpp'), work/'shader_lift.cpp',
+           ROOT/'port/src/d2_shader.cpp', sdk/'runtime/ppu/ppu_loader.cpp', args.runtime]
+    cmd += ['-framework', 'CoreFoundation', '-framework', 'Cocoa', '-framework', 'Metal',
+            '-framework', 'QuartzCore', '-framework', 'CoreText', f'-L{brew}/lib', '-lSDL2']
 elif name == 'guest-poll':
     cmd += [sdk/'runtime/platform/tests/test_guest_poll.c', sdk/'runtime/platform/guest_poll.c']
 elif name == 'spu-cache':
@@ -164,6 +174,8 @@ elif name == 'metal-overlay':
     cmd += ['-framework', 'Metal', '-framework', 'AppKit', '-framework', 'QuartzCore', '-framework', 'CoreText']
     (work/'port/runs').mkdir(parents=True, exist_ok=True)
     run_args = ['--metal']
+elif name == 'AS-ui':
+    cmd += ['-fobjc-arc', '-I', ROOT/'port/src', source('AS.ui-test.m'), '-framework', 'AppKit', '-Wl,-U,_d2_item_editor_show']
 elif name == 'hotkey':
     cmd += ['-fobjc-arc', source('AF.hotkey-test.m'), sdk/'libs/input/cellPad.c', sdk/'libs/input/pad_macos.m']
     cmd += ['-framework', 'AppKit', '-framework', 'Foundation', f'-L{brew}/lib', '-lSDL2']

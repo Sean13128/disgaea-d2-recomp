@@ -7,7 +7,8 @@
 #include "rsx_host_settings.h"
 #include "cellAudio_host.h"
 
-extern void d2_cheats_toggle_menu(void) __attribute__((weak_import));
+/* Native Cheats menu/window (d2_cheats_ui.m); optional for standalone fixtures. */
+extern void d2_cheats_menu_install(NSMenu* main, NSWindow* game) __attribute__((weak_import));
 /* Standalone settings fixtures need no issue recorder. The port overrides these. */
 void __attribute__((weak)) d2_flags_init(void) {}
 void __attribute__((weak)) d2_flags_configure(double scale, unsigned cap) { (void)scale; (void)cap; }
@@ -253,12 +254,12 @@ static void install_menu(void)
     command(game, @"Export Save…", @"export", @"");
     command(game, @"Open Save Folder", @"saves", @"");
     command(game, @"Open Log", @"log", @"");
-    command(game, @"Cheats…", @"cheats", @"");
     unichar f2 = NSF2FunctionKey;
     NSMenuItem* flag = command(game, @"Flag Issue…", @"flag", [NSString stringWithCharacters:&f2 length:1]);
     flag.keyEquivalentModifierMask = 0;
     NSMenu* controls = submenu(menu, @"Controls");
     command(controls, @"Keyboard Mapping…", @"controls", @"");
+    if (d2_cheats_menu_install) d2_cheats_menu_install(menu, s_window); /* top-level Cheats after Game */
     NSApp.mainMenu = menu;
     fprintf(stderr, "[D2 settings] native menus installed on main thread\n");
 }
@@ -285,8 +286,7 @@ static void toggle_borderless(void)
         id value = item.representedObject[@"value"];
         BOOL checked = value == NSNull.null ? [s_settings[key] boolValue] : [s_settings[key] isEqual:value];
         item.state = checked ? NSControlStateValueOn : NSControlStateValueOff;
-    } else if ([item.representedObject isEqual:@"cheats"]) return d2_cheats_toggle_menu != NULL;
-    else if ([item.representedObject isEqual:@"borderless"]) item.state = s_borderless;
+    } else if ([item.representedObject isEqual:@"borderless"]) item.state = s_borderless;
     return YES;
 }
 - (void)change:(NSMenuItem*)item
@@ -321,8 +321,7 @@ static void toggle_borderless(void)
         }
     } else if ([name isEqual:@"controls"]) {
         message(@"Keyboard Mapping", @"Arrows: D-pad / left stick\nZ: Cross   X / Esc / Backspace: Circle\nA: Square   S: Triangle\nQ / W: L1 / R1   1 / 2: L2 / R2\nSpace: Start   Shift: Select\nReturn: Cross + Start\n\nClick the game window to focus. A connected gamepad takes precedence.");
-    } else if ([name isEqual:@"cheats"]) { if (d2_cheats_toggle_menu) d2_cheats_toggle_menu(); }
-    else if ([name isEqual:@"flag"]) d2_flags_request();
+    } else if ([name isEqual:@"flag"]) d2_flags_request();
     else if ([name isEqual:@"saves"]) open_save_folder();
     else if ([name isEqual:@"log"]) {
         char file[PATH_MAX] = {0}; const char* env = getenv("D2_LOG_PATH");
@@ -536,7 +535,13 @@ int d2_settings_self_test(void)
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskResizable
                 backing:NSBackingStoreBuffered defer:NO];
             assert(window); ps3_host_window_created((__bridge void*)window);
-            assert(NSApp.mainMenu.numberOfItems == 6);
+            assert(NSApp.mainMenu.numberOfItems == (d2_cheats_menu_install ? 7 : 6));
+            if (d2_cheats_menu_install) {
+                NSMenu* cheats = [NSApp.mainMenu itemWithTitle:@"Cheats"].submenu;
+                assert([NSApp.mainMenu indexOfItemWithTitle:@"Cheats"] == [NSApp.mainMenu indexOfItemWithTitle:@"Game"] + 1);
+                assert(cheats && [cheats itemWithTitle:@"Infinite HP"] && [cheats itemWithTitle:@"Item Editor…"]);
+                assert(![[NSApp.mainMenu itemWithTitle:@"Game"].submenu itemWithTitle:@"Cheats…"]);
+            }
             NSMenu* menu = [NSMenu new];
             NSMenuItem* mute = option(menu, @"Mute", @"mute", nil);
             s_settings[@"mute"] = @NO; s_settings[@"volume"] = @0.5;

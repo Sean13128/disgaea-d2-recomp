@@ -115,4 +115,5 @@
 !/codex/AO.host-check.sh
 
 !/codex/AP.host-check.sh
+!/codex/AS.host-check.sh
 !/codex/AP.atrac-check.py

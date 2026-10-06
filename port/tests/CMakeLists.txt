@@ -26,6 +26,15 @@ if(NOT WIN32)
     add_test(NAME d2.guest-poll-filter COMMAND d2_guest_poll_filter)
     set_tests_properties(d2.guest-poll-filter PROPERTIES LABELS "asset-free;cpu" TIMEOUT 30)
 endif()
+# AT: Item Editor record/validation/icon/action-queue logic against a mock guest.
+if(CMAKE_CXX_COMPILER_LOADED)
+    add_executable(d2_at_items AT.items-test.cpp ../src/d2_items.cpp)
+    target_compile_features(d2_at_items PRIVATE cxx_std_17)
+    target_compile_definitions(d2_at_items PRIVATE D2_ITEMS_TEST)
+    target_compile_options(d2_at_items PRIVATE -UNDEBUG)
+    add_test(NAME d2.AT-items COMMAND d2_at_items)
+    set_tests_properties(d2.AT-items PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60)
+endif()
 set(D2_CPU_TESTS Q-sync T-sync Y-sync AA-sync AB-sync AG2-fifo
     draw AG2-engine hash vertex cache audio-clock AP-atrac-stream AP-audio-gain AP-audio-init filesystem edat save-import
     savedata-io savedata-fixed overlay system-overlay editor-100 editor-140
@@ -37,7 +46,7 @@ foreach(test IN LISTS D2_CPU_TESTS)
     set_tests_properties(d2.${test} PROPERTIES LABELS "asset-free;cpu" TIMEOUT 120)
 endforeach()
 if(APPLE)
-    foreach(test IN ITEMS metal metal-overlay hotkey)
+    foreach(test IN ITEMS metal metal-overlay hotkey AS-ui)
         add_test(NAME d2.${test}
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
                 "${test}" --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/${test}")
@@ -46,7 +55,7 @@ if(APPLE)
 endif()
 
 if(APPLE)
-    set_tests_properties(d2.hotkey PROPERTIES LABELS "asset-free;host-ui")
+    set_tests_properties(d2.hotkey d2.AS-ui PROPERTIES LABELS "asset-free;host-ui")
 endif()
 
 # Failure fixtures supplied by newer SDK exports; the pinned baseline predates them.
@@ -75,6 +84,11 @@ if(APPLE AND TARGET ps3recomp_runtime AND D2_GAME_VERSION STREQUAL "140")
             AQ-fill --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/AQ-fill"
             --runtime "$<TARGET_FILE:ps3recomp_runtime>" --lift "${RECOMP_DIR}")
     set_tests_properties(d2.AQ-fill PROPERTIES LABELS "asset-free;cpu" TIMEOUT 300)
+    add_test(NAME d2.AR-shader
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
+            AR-shader --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/AR-shader"
+            --runtime "$<TARGET_FILE:ps3recomp_runtime>" --lift "${RECOMP_DIR}")
+    set_tests_properties(d2.AR-shader PROPERTIES LABELS "asset-free;cpu" TIMEOUT 300)
 endif()
 if(APPLE AND TARGET DisgaeaD2Recomp AND D2_GAME_VERSION STREQUAL "140" AND EXISTS "${PS3RECOMP_DIR}/runtime/ppu/tests/test_runner_failures.py")
     add_test(NAME d2.runner-failures
