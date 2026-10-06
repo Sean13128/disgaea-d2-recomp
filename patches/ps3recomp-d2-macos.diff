@@ -17722,7 +17722,7 @@ index acbaf12..1655114 100644
      /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
       * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index e73a151..e2861b8 100644
+index e73a151..0a1d58d 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
 @@ -20,10 +20,12 @@
@@ -18103,7 +18103,54 @@ index e73a151..e2861b8 100644
  /* See the note on the forward declaration above ppu_stwcx32. */
  extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
  {
-@@ -3202,8 +3321,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+@@ -1891,6 +2010,46 @@ void vm_write64(uint64_t a, uint64_t v) {
+     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
+     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
+     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
++
++/* One bulk guest fill for native memset overrides: the commit a run of lifted
++ * stores would make (poll reset, SPU lock-line coherence, poll wakeups), in one
++ * pass. Returns 0 and writes nothing when a store watch is armed or the range is
++ * out of bounds, in the null page, mid null-sweep, raw SPU MMIO or the GCM
++ * control window; the caller then runs the lifted loop so those per-store paths
++ * see every store exactly as before. */
++int vm_fill(uint32_t a, uint8_t v, uint32_t n)
++{
++    static const bool watched = getenv("PPU_WVAL") || getenv("PPU_WWATCH");
++    const uint64_t end = (uint64_t)a + n, gcm = VM_HLE_INJECT_BASE;
++    if (watched || g_barrier_sync_watch || g_null_sweep_hi || a < 0x1000u ||
++        (ppu_vm_size && end > ppu_vm_size) || end > SPU_RAW_BASE ||
++        (a < gcm + 0x2004u && end > gcm))
++        return 0;
++#ifdef _WIN32
++    if (g_pt_val != -1) return 0;
++#endif
++    if (!n) return 1;
++    ppu_poll_store();
++    const uint32_t first = a & ~127u, last = (uint32_t)(end - 1) & ~127u;
++    bool reserved = false;
++    for (uint32_t line = first; !reserved; line += 128u) {
++        reserved = spu_coh_is_reserved(line);
++        if (line == last) break;
++    }
++    if (reserved) {
++        spu_lockline_lock();
++        memset(vm_base + a, v, n);
++        for (uint32_t line = first; ; line += 128u) {
++            if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
++            if (line == last) break;
++        }
++        spu_lockline_unlock();
++    } else {
++        memset(vm_base + a, v, n);
++    }
++    ps3_poll_notify(a, n);
++    return 1;
++}
+ }
+ 
+ /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------
+@@ -3202,8 +3361,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                      (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                      (unsigned)ctx->lr);
              fflush(stderr); } }
@@ -18114,7 +18161,7 @@ index e73a151..e2861b8 100644
              static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
              uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
              ULONGLONG _t0 = GetTickCount64();
-@@ -3270,65 +3389,98 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+@@ -3270,65 +3429,98 @@ extern "C" uint32_t ppu_load_elf(const char* path)
  {
      FILE* f = fopen(path, "rb");
      if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
@@ -18128,14 +18175,6 @@ index e73a151..e2861b8 100644
 -
 -    if (sz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
 -        fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); free(file); return 0;
--    }
--    uint64_t fsz = (uint64_t)sz;
--    uint32_t entry = (uint32_t)be64(file + 24);
--    uint64_t phoff = be64(file + 32);
--    uint16_t phentsize = be16(file + 54);
--    uint16_t phnum = be16(file + 56);
--
--    int loaded = 0;
 +    if (sz < 64 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
 +    uint8_t* file = (uint8_t*)malloc((size_t)sz);
 +    bool read_ok = file && fread(file, 1, (size_t)sz, f) == (size_t)sz;
@@ -18167,7 +18206,14 @@ index e73a151..e2861b8 100644
 +        if (be32(sh + 4) != 8 /* SHT_NOBITS */ &&
 +            !range(be64(sh + 24), be64(sh + 32), fsz))
 +            return invalid("section file range exceeds ELF");
-+    }
+     }
+-    uint64_t fsz = (uint64_t)sz;
+-    uint32_t entry = (uint32_t)be64(file + 24);
+-    uint64_t phoff = be64(file + 32);
+-    uint16_t phentsize = be16(file + 54);
+-    uint16_t phnum = be16(file + 56);
+-
+-    int loaded = 0;
 +    /* Validate everything before the first guest write or TLS-state change. */
 +    uint32_t tls_vaddr = 0, tls_filesz = 0, tls_memsz = 0;
 +    bool have_tls = false;
@@ -18266,7 +18312,7 @@ index e73a151..e2861b8 100644
      free(file);
      fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
  
-@@ -3545,6 +3697,33 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
+@@ -3545,6 +3737,33 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
          s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
  }
  
@@ -18300,7 +18346,7 @@ index e73a151..e2861b8 100644
  extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
-@@ -3569,14 +3748,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3569,14 +3788,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                  vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
          return 0; }
  
@@ -18317,7 +18363,7 @@ index e73a151..e2861b8 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3595,7 +3771,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3595,7 +3811,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
      ctx.thread_id = saved_active ? saved_active->thread_id
                                   : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
  #else
@@ -18326,7 +18372,7 @@ index e73a151..e2861b8 100644
  #endif
      g_active_ctx = &ctx;
      fn(&ctx);
-@@ -3616,12 +3792,11 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3616,12 +3832,11 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      ppu_fn fn = ppu_lookup(code);
      if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
  
@@ -18341,7 +18387,7 @@ index e73a151..e2861b8 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3635,7 +3810,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3635,7 +3850,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      ctx.thread_id = saved_active ? saved_active->thread_id
                                   : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
  #else
@@ -18350,7 +18396,7 @@ index e73a151..e2861b8 100644
  #endif
      g_active_ctx = &ctx;
      fn(&ctx);
-@@ -3646,12 +3821,52 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3646,12 +3861,52 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
  
  extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
  {
@@ -18403,7 +18449,7 @@ index e73a151..e2861b8 100644
      g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
      uint32_t code = 0, toc = 0;
      ppu_opd_resolve(entry_opd, &code, &toc);
-@@ -3867,4 +4082,3 @@ extern "C" void ppu_guest_callstack(const char* tag)
+@@ -3867,4 +4122,3 @@ extern "C" void ppu_guest_callstack(const char* tag)
      (void)tag;
  #endif
  }

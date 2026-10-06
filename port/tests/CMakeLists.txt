@@ -69,6 +69,13 @@ if(APPLE AND TARGET ps3recomp_runtime AND EXISTS "${PS3RECOMP_DIR}/runtime/ppu/t
             --runtime "$<TARGET_FILE:ps3recomp_runtime>")
     set_tests_properties(d2.loader-validation PROPERTIES LABELS "asset-free;cpu" TIMEOUT 120)
 endif()
+if(APPLE AND TARGET ps3recomp_runtime AND D2_GAME_VERSION STREQUAL "140")
+    add_test(NAME d2.AQ-fill
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
+            AQ-fill --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/AQ-fill"
+            --runtime "$<TARGET_FILE:ps3recomp_runtime>" --lift "${RECOMP_DIR}")
+    set_tests_properties(d2.AQ-fill PROPERTIES LABELS "asset-free;cpu" TIMEOUT 300)
+endif()
 if(APPLE AND TARGET DisgaeaD2Recomp AND D2_GAME_VERSION STREQUAL "140" AND EXISTS "${PS3RECOMP_DIR}/runtime/ppu/tests/test_runner_failures.py")
     add_test(NAME d2.runner-failures
         COMMAND "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/runtime/ppu/tests/test_runner_failures.py"

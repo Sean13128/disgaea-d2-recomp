@@ -15,6 +15,7 @@ parser.add_argument('test')
 parser.add_argument('--sdk', type=Path, required=True)
 parser.add_argument('--work', type=Path, required=True)
 parser.add_argument('--runtime', type=Path, help='selected CMake SDK runtime library for loader tests')
+parser.add_argument('--lift', type=Path, help='lifted PPU source directory (AQ-fill)')
 args = parser.parse_args()
 sdk, work = args.sdk.resolve(), args.work.resolve()
 work.mkdir(parents=True, exist_ok=True)
@@ -130,6 +131,19 @@ elif name == 'loader-validation':
     cmd += ['-framework', 'CoreFoundation', '-framework', 'Cocoa', '-framework', 'Metal',
             '-framework', 'QuartzCore', '-framework', 'CoreText', f'-L{brew}/lib', '-lSDL2']
     run_args = [work/'synthetic.elf']
+elif name == 'AQ-fill':
+    if args.runtime is None or not args.runtime.is_file() or args.lift is None:
+        sys.exit('AQ-fill needs --runtime and --lift')
+    # The lift's helper preamble plus the one body, renamed as CMake renames it.
+    sig = 'void func_0033D91C(ppu_context* ctx) {'
+    text = next(t for t in (f.read_text() for f in sorted(args.lift.glob('ppu_recomp_*.cpp'))) if sig in t)
+    start = text.index(sig)
+    body = text[start:text.index('\n}\n', start) + 3].replace('func_0033D91C', 'd2_original_0033D91C', 1)
+    (work/'fill_lift.cpp').write_text(text[:text.index('\nvoid func_')] + '\n' + body)
+    cmd = [cxx, '-std=c++20', *flags, '-I', args.lift, source('AQ.fill-test.cpp'), work/'fill_lift.cpp',
+           ROOT/'port/src/d2_fill.cpp', sdk/'runtime/ppu/ppu_loader.cpp', args.runtime]
+    cmd += ['-framework', 'CoreFoundation', '-framework', 'Cocoa', '-framework', 'Metal',
+            '-framework', 'QuartzCore', '-framework', 'CoreText', f'-L{brew}/lib', '-lSDL2']
 elif name == 'guest-poll':
     cmd += [sdk/'runtime/platform/tests/test_guest_poll.c', sdk/'runtime/platform/guest_poll.c']
 elif name == 'spu-cache':

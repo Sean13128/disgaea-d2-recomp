@@ -45,6 +45,7 @@ if(D2_GAME_VERSION STREQUAL "140")
     set(D2_EXPECTED_TOC "0x0047DF98")
     set(D2_DEFAULT_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu-140")
     set(D2_MOVIE_OVERRIDES 001686AC 00168304 00167FC8)
+    set(D2_NATIVE_OVERRIDES 0033D91C)   # guest memset -> src/d2_fill.cpp
 elseif(D2_GAME_VERSION STREQUAL "100")
     set(D2_DEFAULT_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp")
     set(D2_DEFAULT_D2_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out")
@@ -101,13 +102,17 @@ include(src/d2_cheats_lift.cmake)
 foreach(source IN LISTS RECOMP_SOURCES)
     file(READ "${source}" text)
     set(changed FALSE)
-    foreach(address IN LISTS D2_MOVIE_OVERRIDES)
+    foreach(address IN LISTS D2_MOVIE_OVERRIDES D2_NATIVE_OVERRIDES)
         set(signature "void func_${address}(ppu_context* ctx) {")
         string(FIND "${text}" "${signature}" found)
         if(NOT found EQUAL -1)
             string(REPLACE "${signature}" "void d2_original_${address}(ppu_context* ctx) {" text "${text}")
             set(changed TRUE)
-            list(APPEND D2_MOVIE_FOUND ${address})
+            if(address IN_LIST D2_NATIVE_OVERRIDES)
+                list(APPEND D2_NATIVE_FOUND ${address})
+            else()
+                list(APPEND D2_MOVIE_FOUND ${address})
+            endif()
         endif()
     endforeach()
 
@@ -133,6 +138,13 @@ endforeach()
 list(LENGTH D2_MOVIE_FOUND D2_MOVIE_COUNT)
 if(NOT D2_MOVIE_COUNT EQUAL 3)
     message(FATAL_ERROR "D2 movie facade changed; expected three BLUS31313 definitions")
+endif()
+if(NOT "${D2_NATIVE_FOUND}" STREQUAL "${D2_NATIVE_OVERRIDES}")
+    message(FATAL_ERROR "D2 native overrides '${D2_NATIVE_OVERRIDES}' not all found in this lift")
+endif()
+set(D2_NATIVE_SOURCES)
+if(D2_NATIVE_OVERRIDES)
+    set(D2_NATIVE_SOURCES src/d2_fill.cpp)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -237,6 +249,7 @@ add_executable(${PROJECT_NAME}
     src/d2_audio.cpp
     src/d2_debug_warp.cpp
     src/d2_cheats.cpp
+    ${D2_NATIVE_SOURCES}
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
