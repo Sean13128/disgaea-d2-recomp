@@ -102,3 +102,22 @@ extern "C" void ps3_load_prx_modules(void)
  *   // Replace a function call with a direct return
  *   ps3::patches::force_return(0x009A1000, 0);  // return 0
  */
+
+/* The generated workload registry assigns NisGraphics image 2; synth2 is 1. */
+extern "C" int ps3_spu_poll_idle_graphics(int image_id)
+{
+    return image_id == 2;
+}
+
+/* FIOS serves foreground I/O; leave rendering and the audio chain interactive. */
+extern "C" int ps3_ppu_thread_interactive(const char* name)
+{
+    const char* policy = std::getenv("PS3_D2_FIOS_QOS");
+    bool fios = name && (!std::strncmp(name, "fios mediathread", 16) ||
+                         !std::strncmp(name, "fios scheduler", 14));
+    int interactive = !fios || (policy && !std::strcmp(policy, "interactive"));
+    if (fios && std::getenv("PS3_MULTIWAIT_STATS"))
+        std::fprintf(stderr, "[d2-qos] thread=\"%s\" role=%s\n", name,
+                     interactive ? "interactive" : "default");
+    return interactive;
+}

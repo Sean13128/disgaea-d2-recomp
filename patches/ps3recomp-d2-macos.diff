@@ -11992,7 +11992,7 @@ index 0000000..2e07a6b
 +    puts("[P-test] guest-pointer dialogs, deferred sysutil callback/results, error/progress, abort/no callback: PASS");
 +}
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index cdb0464..baf1b4e 100644
+index cdb0464..ae75111 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -24,6 +24,8 @@ static u32 s_gcm_context_ea = 0;
@@ -12623,13 +12623,13 @@ index cdb0464..baf1b4e 100644
  static void gcm_rsx_process_fifo_unlocked(void);
  
  /* Kick event: a game thread whose fence wait finds the queue DRY signals the
-@@ -1407,27 +1737,113 @@ static void gcm_rsx_process_fifo_unlocked(void);
+@@ -1407,27 +1737,117 @@ static void gcm_rsx_process_fifo_unlocked(void);
   * 16 ms tick per fence was ~0.75 s/frame (the 2 FPS intro). The walker (and
   * the D3D12 backend it feeds) stays on the present thread -- running it from
   * the polling game thread killed the process silently. */
 +/* The PPU/SPU store paths already notify O's memory wait API. Bridge those
 + * notifications to the render event without changing their implementations.
-+ * Its bounded 100us wait also covers HLE/direct stores lacking notification.
++ * Its bounded idle wait also covers HLE/direct stores lacking notification.
 + * Direct lifted stores kick immediately; keep this fallback for other writers. */
 +static atomic_int s_put_watch_started;
 +static atomic_uint s_fifo_wait_label_ea;
@@ -12656,9 +12656,13 @@ index cdb0464..baf1b4e 100644
 +        } else {
 +            wait_ea = GCM_CONTROL_GUEST_ADDR;
 +        }
-+        if (ps3_poll_enabled)
-+            ps3_poll_backoff(40, wait_ea, &raw, sizeof(raw));
-+        else
++        if (ps3_poll_enabled) {
++            /* Label equality waits may observe transient reference values. */
++            if (wait_ea == GCM_CONTROL_GUEST_ADDR)
++                ps3_poll_backoff_idle_graphics(40, wait_ea, &raw, sizeof(raw));
++            else
++                ps3_poll_backoff(40, wait_ea, &raw, sizeof(raw));
++        } else
 +            Sleep(1); /* explicit diagnostic opt-out of notified waits */
 +    }
 +    s_put_watch_started = 0;
@@ -12749,7 +12753,7 @@ index cdb0464..baf1b4e 100644
  
  /* Serializes fence publication between the present ticker and every guest
   * thread poll-reading the ref register (REFPOLL default-on made this path
-@@ -1438,32 +1854,41 @@ static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+@@ -1438,32 +1858,41 @@ static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
  
  void cellGcm_ref_on_poll(void)
  {
@@ -12810,7 +12814,7 @@ index cdb0464..baf1b4e 100644
  }
  
  static void gcm_rsx_process_fifo_unlocked(void)
-@@ -1491,6 +1916,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1491,6 +1920,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * by s_gcm_ctx_out_ea, which stays 0 on that path. */
      if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
      if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
@@ -12825,7 +12829,7 @@ index cdb0464..baf1b4e 100644
  
      /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
       * offset in the control register), decoding method headers and following
-@@ -1507,6 +1940,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1507,6 +1944,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * then runs off the end of the previous frame's bytes until it meets a
       * word that is not a command, and parks there forever. */
      atomic_thread_fence(memory_order_acquire);
@@ -12840,7 +12844,7 @@ index cdb0464..baf1b4e 100644
  
      /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
       * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
-@@ -1582,8 +2023,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1582,8 +2027,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * short of `put` every tick is the signature of a FIFO that can never
       * catch up, and the reason is the whole diagnosis. */
      const char* why = "caught-up";
@@ -12861,7 +12865,7 @@ index cdb0464..baf1b4e 100644
          if (!ea) {
              /* get is sitting on an IO offset with no mapping -- the title
               * branched into a region and then unmapped it, or the offset was
-@@ -1605,7 +2056,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1605,7 +2060,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              why = "no-io-mapping";
              break;
          }
@@ -12870,7 +12874,7 @@ index cdb0464..baf1b4e 100644
          /* Only remember offsets BELOW put -- those are positions in the
           * ring the title is writing. A park in another region is where the
           * walker gave up, not how far it got through the ring. */
-@@ -1622,8 +2073,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1622,8 +2077,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
               * flip-gated present shows exactly the completed frame -- draining
               * on would mix the next frame's head into the batch (wave: every
               * frame split across 4 presents, layout flashing/zooming). */
@@ -12880,7 +12884,7 @@ index cdb0464..baf1b4e 100644
              /* Count the flip WORDS the title actually writes into the FIFO,
               * separately from the presents that result. When a title stops
               * appearing on screen the first question is which side stopped:
-@@ -1638,27 +2089,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1638,27 +2093,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
              if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                  /* Queued by _cellGcmSetFlipCommand, which already did the
                   * guest-visible half of the request. */
@@ -12924,7 +12928,7 @@ index cdb0464..baf1b4e 100644
          if (type == 1) {                       /* JUMP: 0x20000000 | offset */
              { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
                if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
-@@ -1735,32 +2185,40 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1735,32 +2189,40 @@ static void gcm_rsx_process_fifo_unlocked(void)
              if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
                  int sem_blocked = 0;
                  for (u32 i = 0; i < count; i++) {
@@ -12975,7 +12979,7 @@ index cdb0464..baf1b4e 100644
                  u32 m = (type == 0) ? method + i * 4 : method;
                  /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                   * splits into subchannel 7 / method 0x0B00 -- so it was landing
-@@ -1772,10 +2230,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1772,10 +2234,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
                    if (sd && subch == 7 && (s7++ < 16))
                        fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
@@ -12988,7 +12992,7 @@ index cdb0464..baf1b4e 100644
                      continue;
                  }
                  /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
-@@ -1792,28 +2250,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1792,28 +2254,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
                    if (od && m == 0) {
                        static unsigned seen[8]; static int have[8];
@@ -13035,7 +13039,7 @@ index cdb0464..baf1b4e 100644
                  /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                   * non-zero subchannel -- what each binding slot actually carries. */
                  { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
-@@ -1822,7 +2281,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1822,7 +2285,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    /* GCM_VAL_WATCH=<hex>: every FIFO word carrying that value, any method. */
                    { static u32 vw = 1;
                      if (vw == 1) { const char* e = getenv("GCM_VAL_WATCH"); vw = e ? (u32)strtoul(e, 0, 16) : 0; }
@@ -13044,7 +13048,7 @@ index cdb0464..baf1b4e 100644
                          static int vn; if (vn++ < 64)
                              printf("[valwatch] subch=%u method=0x%04X = 0x%08X get=0x%X%c", subch, m, vw, s_fifo_getoff, 10);
                      } }
-@@ -1830,11 +2289,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1830,11 +2293,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    if (sg && !subch && (cm3 == 0x210 || cm3 == 0x214 || cm3 == 0x218 || cm3 == 0x288 || cm3 == 0x28C ||
                                         cm3 == 0x1A20)) {
                        if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
@@ -13058,7 +13062,7 @@ index cdb0464..baf1b4e 100644
                    } }
                  /* Mirror the whole method stream into the live NV4097->D3D12
                   * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
-@@ -1842,7 +2301,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1842,7 +2305,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * canonicalises with & 0x1FFC itself. */
                  { static int live = -1;
                    if (live < 0) live = rsx_live_draw_enabled();
@@ -13067,7 +13071,7 @@ index cdb0464..baf1b4e 100644
  
                  /* And into the platform-neutral register-file draw engine,
                   * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
-@@ -1850,7 +2309,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1850,7 +2313,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * same reason the live engine does, and masks them itself. */
                  { static int eng = -1;
                    if (eng < 0) eng = rsx_draw_engine_enabled();
@@ -13084,7 +13088,7 @@ index cdb0464..baf1b4e 100644
  
                  /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                   * for any run, live engine or not, so the method stream and the
-@@ -1873,12 +2340,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1873,12 +2344,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   * truncates them.  Reconstruct the full address the same way
                   * the draw-engine call above does. */
                  { const u32 mfull = (subch << 13) | m;
@@ -13109,7 +13113,7 @@ index cdb0464..baf1b4e 100644
                      /* NV406E_SET_REFERENCE: queue the fence value for PACED
                       * publication (gcm_ref_publish below) instead of letting a
                       * later fence in the same batch overwrite it. */
-@@ -1888,7 +2362,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1888,7 +2366,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       * reports "visible" -- the conservative answer; reading 0
                       * tells the title every queried object is occluded. */
                      if (m == 0x1800) {
@@ -13118,7 +13122,7 @@ index cdb0464..baf1b4e 100644
                          { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
                          if (idx < CELL_GCM_MAX_REPORT_COUNT) {
                              s_report_data[idx].timestamp = get_timestamp_ns();
-@@ -1896,15 +2370,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1896,15 +2374,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
                          }
                      }
                  } else
@@ -13149,7 +13153,7 @@ index cdb0464..baf1b4e 100644
      }
  
      /* Walker watchdog. Everything above recovers from a *recognised* stall --
-@@ -1935,7 +2423,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1935,7 +2427,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      { static int burned = 0, passes = -1;
        if (passes < 0) { const char* e = getenv("GCM_FIFO_CIRCLE_PASSES");
                          passes = e ? atoi(e) : 4; }
@@ -13158,7 +13162,7 @@ index cdb0464..baf1b4e 100644
            if (++burned >= passes) {
                static int n = 0;
                if (n++ < 8)
-@@ -1948,7 +2436,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1948,7 +2440,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
        } else burned = 0; }
  
      { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
@@ -13167,7 +13171,7 @@ index cdb0464..baf1b4e 100644
            if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                               gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
        } else { stuck = 0; last = s_fifo_getoff; } }
-@@ -1981,7 +2469,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1981,7 +2473,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
       *
       * ponytail: append the JUMP at `current` the way the SDK's own callback
       * does, rather than tracking a second copy of the ring's geometry. */
@@ -13184,7 +13188,7 @@ index cdb0464..baf1b4e 100644
          u32 ctx = vm_read32(s_gcm_ctx_out_ea);
          u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
          u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
-@@ -2048,20 +2544,37 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2048,20 +2548,37 @@ static void gcm_rsx_process_fifo_unlocked(void)
          }
      }
  
@@ -13232,7 +13236,7 @@ index cdb0464..baf1b4e 100644
  }
  
  /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
-@@ -2089,6 +2602,19 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+@@ -2089,6 +2606,19 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      u32 current = vm_read32(ctx_ea + 0x8);
      if (current <= begin) return;                       /* nothing to recycle */
  
@@ -13252,7 +13256,7 @@ index cdb0464..baf1b4e 100644
      if (getenv("CELLMARK_BLINKDBG"))
          printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
  
-@@ -2101,12 +2627,32 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+@@ -2101,12 +2631,32 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                  vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                  g_gcm_fifo_drained_ea);
  
@@ -13290,7 +13294,7 @@ index cdb0464..baf1b4e 100644
          vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
          /* The jump has to be in guest memory before `put` moves behind the
           * walker's `get`. Program order is not enough on arm64: the walker
-@@ -2114,20 +2660,39 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+@@ -2114,20 +2664,39 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
           * word at `current` before the jump lands there. */
          atomic_thread_fence(memory_order_release);
          vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
@@ -13338,7 +13342,7 @@ index cdb0464..baf1b4e 100644
  
      if (s_recdbg)
          fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
-@@ -2158,8 +2723,9 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
+@@ -2158,8 +2727,9 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
       * always in RSX local memory (location 0). */
      if (rsx_live_draw_enabled())
          rsx_live_draw_set_display_buffer(bufferId, 0, offset, pitch, width, height);
@@ -13350,7 +13354,7 @@ index cdb0464..baf1b4e 100644
  
      return CELL_OK;
  }
-@@ -2240,29 +2806,22 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+@@ -2240,29 +2810,22 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
          return CELL_GCM_ERROR_INVALID_VALUE;
  
  
@@ -13395,7 +13399,7 @@ index cdb0464..baf1b4e 100644
  
      return CELL_OK;
  }
-@@ -2287,20 +2846,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+@@ -2287,20 +2850,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
       * ring wraps, and the recycle above keys on them. */
      if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
      vm_write32(cur, GCM_FLIP_MARKER | bufferId);
@@ -13422,7 +13426,7 @@ index cdb0464..baf1b4e 100644
      vm_write32(ctx + 8, cur + 4);
      return 1;
  }
-@@ -2317,12 +2868,21 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
+@@ -2317,12 +2872,21 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
  /* NID: 0xD01B570F */
  s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
  {
@@ -13448,7 +13452,7 @@ index cdb0464..baf1b4e 100644
  
      return cellGcmSetFlipCommand(bufferId);
  }
-@@ -2338,21 +2898,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+@@ -2338,21 +2902,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
      if (!s_display_buffer_set[bufferId])
          return CELL_GCM_ERROR_INVALID_VALUE;
  
@@ -13471,7 +13475,7 @@ index cdb0464..baf1b4e 100644
  }
  
  /* NID: 0x1BFAB6EE */
-@@ -2764,12 +3310,14 @@ u32 cellGcmResolveIO(u32 offset)
+@@ -2764,12 +3314,14 @@ u32 cellGcmResolveIO(u32 offset)
   * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
   * table hit returned the empty command-buffer EA instead of VRAM). Callers
   * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
@@ -13488,7 +13492,7 @@ index cdb0464..baf1b4e 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -3028,11 +3576,60 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
+@@ -3028,11 +3580,60 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
      return cellGcmSetFlipCommand(bufferId);
  }
  
@@ -13550,7 +13554,7 @@ index cdb0464..baf1b4e 100644
      return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
  }
  
-@@ -3070,8 +3667,15 @@ void cellGcmTerminate(void)
+@@ -3070,8 +3671,15 @@ void cellGcmTerminate(void)
      printf("[cellGcmSys] Terminate\n");
  
      s_gcm_initialized = 0;
@@ -13566,7 +13570,7 @@ index cdb0464..baf1b4e 100644
      s_debug_level = CELL_GCM_DEBUG_LEVEL0;
      s_vblank_count = 0;
      s_io_map_reserved = 0;
-@@ -3144,11 +3748,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+@@ -3144,11 +3752,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
      return CELL_OK;
  }
  
@@ -13582,7 +13586,7 @@ index cdb0464..baf1b4e 100644
  }
  
  /* Return tile info for a given index */
-@@ -3258,6 +3862,7 @@ s32 cellGcmSetFlipImmediate(u32 bufferId)
+@@ -3258,6 +3866,7 @@ s32 cellGcmSetFlipImmediate(u32 bufferId)
  void cellGcmSetFlipStatus(u32 status)
  {
      s_flip_status = status;
@@ -13590,7 +13594,7 @@ index cdb0464..baf1b4e 100644
  }
  
  /* Store graphics handler callback */
-@@ -3449,8 +4054,23 @@ void cellGcm_syscall_iounmap(u32 io, u32 size)
+@@ -3449,8 +4058,23 @@ void cellGcm_syscall_iounmap(u32 io, u32 size)
   * from a stale offset through whatever the driver has since overwritten. */
  void cellGcm_syscall_set_fifo(u32 put, u32 get)
  {
@@ -16699,13 +16703,14 @@ index 704ccef..d567e3c 100644
      test_scissor();
 diff --git a/runtime/platform/guest_poll.c b/runtime/platform/guest_poll.c
 new file mode 100644
-index 0000000..c8b3b33
+index 0000000..5808319
 --- /dev/null
 +++ b/runtime/platform/guest_poll.c
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,379 @@
 +/* Polling is a scheduling hint, never a substitute for a guest read/DMA.
 + * Notifications cover PPU stores and SPU writes. HLE/direct mapped writes
-+ * need not notify: every wait is bounded to 100 us and callers re-read.
++ * need not notify: every wait is bounded (100 us normally, up to 1 ms for opted-in idle
++ * graphics polls) and callers re-read.
 + * No guest reservation is created, consumed, or invalidated by a poll. */
 +#include "guest_poll.h"
 +#include "win32_compat.h"
@@ -16719,6 +16724,7 @@ index 0000000..c8b3b33
 +#include <time.h>
 +#include <sched.h>
 +#include <stdatomic.h>
++#include <errno.h>
 +#include "thread_lifecycle.h"
 +
 +#define POLL_BUCKETS 256
@@ -16734,6 +16740,44 @@ index 0000000..c8b3b33
 +} poll_bucket;
 +static poll_bucket s_buckets[POLL_BUCKETS];
 +static pthread_once_t s_init = PTHREAD_ONCE_INIT;
++static unsigned s_idle_cap_us = 1000;
++static int s_stats;
++typedef struct poll_thread {
++    uint32_t ea, size;
++    unsigned delay_us;
++    uint8_t snapshot[128];
++    char name[64];
++    uint64_t timeouts, notified, calls;
++    double stats_time;
++} poll_thread;
++static _Thread_local poll_thread s_poll;
++void ps3_poll_reset(void) { s_poll.size = 0; s_poll.delay_us = 100; }
++static double poll_now(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec + t.tv_nsec / 1e9;
++}
++static void poll_stats(unsigned cap_us)
++{
++    if (!s_stats || (++s_poll.calls & 255)) return;
++    double now = poll_now();
++    double elapsed = now - s_poll.stats_time;
++    if (elapsed < 10) return;
++    if (!s_poll.name[0]) {
++#ifdef __APPLE__
++        pthread_getname_np(pthread_self(), s_poll.name, sizeof s_poll.name);
++#else
++        snprintf(s_poll.name, sizeof s_poll.name, "host");
++#endif
++    }
++    fprintf(stderr, "[poll-stats] thread=\"%s\" tid=%llx interval=%.3fs timeouts=%llu notified=%llu current_us=%u cap_us=%u\n",
++            s_poll.name, (unsigned long long)(uintptr_t)pthread_self(), elapsed,
++            (unsigned long long)s_poll.timeouts,
++            (unsigned long long)s_poll.notified, s_poll.delay_us, cap_us);
++    s_poll.timeouts = s_poll.notified = 0;
++    s_poll.stats_time = now;
++}
 +static poll_bucket* poll_slot(uint32_t ea)
 +{
 +    return &s_buckets[((ea >> 7) ^ (ea >> 15)) & (POLL_BUCKETS - 1)];
@@ -16742,6 +16786,14 @@ index 0000000..c8b3b33
 +{
 +    const char* e = getenv("PS3_POLL_BACKOFF");
 +    ps3_poll_enabled = !(e && *e == '0');
++    e = getenv("PS3_POLL_IDLE_CAP_US");
++    if (e) {
++        char* end;
++        unsigned long cap = strtoul(e, &end, 10);
++        if (*e && !*end && cap >= 100 && cap <= 1000) s_idle_cap_us = (unsigned)cap;
++    }
++    e = getenv("PS3_POLL_STATS");
++    s_stats = e && *e == '1';
 +#ifndef __APPLE__
 +    pthread_condattr_t attr;
 +    pthread_condattr_init(&attr);
@@ -16848,43 +16900,80 @@ index 0000000..c8b3b33
 +        if (w->selected && w->joinable) ps3_guest_worker_join(w->thread);
 +}
 +
-+void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++typedef struct poll_registration {
++    poll_bucket* bucket;
++    uint32_t ea;
++} poll_registration;
++/* cond_wait cancellation reacquires the mutex before running this cleanup. */
++static void poll_unregister(void* arg)
++{
++    poll_registration* r = arg;
++    __atomic_fetch_sub(&ps3_poll_lines[(r->ea >> 7) & (POLL_LINES - 1)], 1, __ATOMIC_SEQ_CST);
++    atomic_fetch_sub_explicit(&r->bucket->waiters, 1, memory_order_seq_cst);
++    __atomic_fetch_sub(&ps3_poll_waiters, 1, __ATOMIC_SEQ_CST);
++    pthread_mutex_unlock(&r->bucket->lock);
++}
++static void poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size, int idle)
 +{
 +    pthread_testcancel();
-+    if (!ps3_poll_enabled || repeats < 32 || !size) return;
++    if (!ps3_poll_enabled || repeats < 32 || !size) { ps3_poll_reset(); return; }
 +    pthread_once(&s_init, poll_init);
-+    if (!ps3_poll_enabled) return;
-+    if (repeats < 40) { sched_yield(); return; }
-+    /* A condition belongs to the first line's bucket. A value spanning lines
-+     * could be changed by a store into a different bucket; yield/re-read for
-+     * those rare unaligned polls rather than relying on its notification. */
-+    if (size > 128 - (ea & 127)) { sched_yield(); return; }
++    if (!ps3_poll_enabled) { ps3_poll_reset(); return; }
++    if (repeats < 40) { ps3_poll_reset(); sched_yield(); return; }
++    /* Cross-line polls retain the existing yield/re-read fallback. */
++    if (size > 128 - (ea & 127)) { ps3_poll_reset(); sched_yield(); return; }
++    unsigned cap_us = idle ? s_idle_cap_us : 100;
++    if (s_stats && !s_poll.stats_time) s_poll.stats_time = poll_now();
++    if (!idle || s_poll.ea != ea || s_poll.size != size ||
++        memcmp(s_poll.snapshot, value, size)) {
++        s_poll.ea = ea; s_poll.size = size; s_poll.delay_us = 100;
++        memcpy(s_poll.snapshot, value, size);
++    }
 +    extern uint8_t* vm_base;
 +    poll_bucket* b = poll_slot(ea);
 +    pthread_mutex_lock(&b->lock);
 +    atomic_fetch_add_explicit(&b->waiters, 1, memory_order_seq_cst);
 +    __atomic_fetch_add(&ps3_poll_lines[(ea >> 7) & (POLL_LINES - 1)], 1, __ATOMIC_SEQ_CST);
 +    __atomic_fetch_add(&ps3_poll_waiters, 1, __ATOMIC_SEQ_CST);
-+    /* Register before checking the value, under the same lock as notify.
-+     * A store racing registration is seen here, wakes the wait, or (if the
-+     * relaxed global guard missed registration) is seen after the bounded
-+     * timeout. Guest memory and filters alone are not a Dekker handshake. */
++    poll_registration registration = {b, ea};
++    pthread_cleanup_push(poll_unregister, &registration);
++    /* Register then recheck under the notify lock. The finite timeout also
++     * covers relaxed-filter registration races and unnotified HLE stores. */
 +    if (!memcmp(vm_base + ea, value, size)) {
++        int rc;
 +#ifdef __APPLE__
-+        struct timespec delay = {0, 100000};
-+        pthread_cond_timedwait_relative_np(&b->changed, &b->lock, &delay);
++        struct timespec delay = {0, s_poll.delay_us * 1000};
++        rc = pthread_cond_timedwait_relative_np(&b->changed, &b->lock, &delay);
 +#else
 +        struct timespec deadline;
 +        clock_gettime(CLOCK_MONOTONIC, &deadline);
-+        deadline.tv_nsec += 100000;
++        deadline.tv_nsec += s_poll.delay_us * 1000;
 +        if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
-+        pthread_cond_timedwait(&b->changed, &b->lock, &deadline);
++        rc = pthread_cond_timedwait(&b->changed, &b->lock, &deadline);
 +#endif
-+    }
-+    __atomic_fetch_sub(&ps3_poll_lines[(ea >> 7) & (POLL_LINES - 1)], 1, __ATOMIC_SEQ_CST);
-+    atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
-+    __atomic_fetch_sub(&ps3_poll_waiters, 1, __ATOMIC_SEQ_CST);
-+    pthread_mutex_unlock(&b->lock);
++        if (s_stats) {
++            if (rc == ETIMEDOUT) s_poll.timeouts++;
++            else if (!rc) s_poll.notified++;
++        }
++        if (memcmp(vm_base + ea, value, size)) ps3_poll_reset();
++        else if (rc == ETIMEDOUT && s_poll.delay_us < cap_us) {
++            s_poll.delay_us *= 2;
++            if (s_poll.delay_us > cap_us) s_poll.delay_us = cap_us;
++        }
++        /* An unrelated bucket broadcast/spurious wake preserves the streak. */
++    } else ps3_poll_reset();
++    pthread_cleanup_pop(1);
++    /* Darwin relative waits may defer cancellation until the next point. */
++    pthread_testcancel();
++    poll_stats(cap_us);
++}
++void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{
++    poll_backoff(repeats, ea, value, size, 0);
++}
++void ps3_poll_backoff_idle_graphics(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{
++    poll_backoff(repeats, ea, value, size, 1);
 +}
 +void ps3_poll_notify_slow(uint32_t ea, uint32_t size)
 +{
@@ -16966,6 +17055,7 @@ index 0000000..c8b3b33
 +{
 +    pthread_testcancel();
 +    pthread_once(&s_init, poll_init);
++    snprintf(s_poll.name, sizeof s_poll.name, "%s", name);
 +#ifdef __APPLE__
 +    pthread_setname_np(name);
 +    if (ps3_poll_enabled)
@@ -16981,18 +17071,27 @@ index 0000000..c8b3b33
 +    (void)ea; (void)value; (void)size;
 +    if (repeats >= 32) SwitchToThread();
 +}
++void ps3_poll_reset(void) {}
++void ps3_poll_backoff_idle_graphics(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{ ps3_poll_backoff(repeats, ea, value, size); }
 +void ps3_poll_thread_start(const char* name, int interactive) { (void)name; (void)interactive; }
 +void ps3_guest_worker_register(int joinable) { (void)joinable; }
 +void ps3_guest_workers_request_stop(void) {}
 +int ps3_guest_workers_stopped(void) { return 1; }
 +void ps3_guest_workers_join(void) {}
 +#endif
++
++/* Ports opt in only known graphics images; all other SPUs keep short waits. */
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((weak))
++#endif
++int ps3_spu_poll_idle_graphics(int image_id) { (void)image_id; return 0; }
 diff --git a/runtime/platform/guest_poll.h b/runtime/platform/guest_poll.h
 new file mode 100644
-index 0000000..3309324
+index 0000000..0e13495
 --- /dev/null
 +++ b/runtime/platform/guest_poll.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,48 @@
 +/* Bounded host waits for unchanged guest-memory polls. */
 +#ifndef PS3_GUEST_POLL_H
 +#define PS3_GUEST_POLL_H
@@ -17002,10 +17101,14 @@ index 0000000..3309324
 +#endif
 +extern int ps3_poll_enabled;
 +void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
++/* Opt-in bounded adaptive wait; cap override accepts 100..1000 microseconds. */
++void ps3_poll_backoff_idle_graphics(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
++void ps3_poll_reset(void);
++int ps3_spu_poll_idle_graphics(int image_id);
 +#ifndef _WIN32
 +/* Atomic builtins keep this header usable by both C and C++ callers. The
 + * relaxed guard is only a scheduling hint: a racing registration can miss
-+ * one notification, but the under-lock recheck / 100us timeout still applies.
++ * one notification, but the under-lock recheck / bounded timeout still applies.
 + * Do not use this guard for an unbounded condition wait (Dekker requires
 + * store->load ordering on BOTH sides, not just an acquire load here). */
 +extern unsigned ps3_poll_waiters;
@@ -17039,10 +17142,10 @@ index 0000000..3309324
 +#endif
 diff --git a/runtime/platform/tests/test_guest_poll.c b/runtime/platform/tests/test_guest_poll.c
 new file mode 100644
-index 0000000..d206981
+index 0000000..8933ae0
 --- /dev/null
 +++ b/runtime/platform/tests/test_guest_poll.c
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,98 @@
 +/* Standalone: cc -std=c17 -pthread test_guest_poll.c ../guest_poll.c */
 +#include "../guest_poll.h"
 +#include <assert.h>
@@ -17055,6 +17158,7 @@ index 0000000..d206981
 +
 +static uint8_t memory[512];
 +uint8_t* vm_base = memory;
++static double published;
 +static double now(void)
 +{
 +    struct timespec t;
@@ -17065,6 +17169,7 @@ index 0000000..d206981
 +{
 +    struct timespec t = {0, 2000000};
 +    nanosleep(&t, NULL);
++    published = now();
 +    __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
 +    /* Deliberately straddles two cache lines. */
 +    if (unused) ps3_poll_notify(127, 5);
@@ -17104,6 +17209,23 @@ index 0000000..d206981
 +        }
 +        pthread_join(writer, NULL);
 +    }
++    /* Production idle cap covers unnotified writes with a 5ms host tolerance. */
++    for (unsigned i = 0; i < 40; i++) {
++        __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
++        ps3_poll_reset();
++        for (unsigned j = 0; j < 5; j++) ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++        pthread_t writer;
++        assert(!pthread_create(&writer, NULL, publish, (void*)(uintptr_t)(i & 1)));
++        start = now();
++        while (!__atomic_load_n((uint32_t*)(memory + 128), __ATOMIC_ACQUIRE)) {
++            ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++            assert(now() - start < 1);
++        }
++        double returned = now();
++        pthread_join(writer, NULL);
++        assert(returned - published < 0.006);
++    }
++    puts("idle poll: 40 notified/unnotified publications within 1ms cap + 5ms scheduling tolerance PASS");
 +    /* Race publication against zero->one waiter registration, including
 +     * deliberately omitted notifications. The production 100us timeout must
 +     * cover a relaxed-filter miss; no unbounded condition wait is permitted. */
@@ -17124,10 +17246,10 @@ index 0000000..d206981
 +}
 diff --git a/runtime/platform/tests/test_guest_poll_filter.c b/runtime/platform/tests/test_guest_poll_filter.c
 new file mode 100644
-index 0000000..72b7875
+index 0000000..b5337c2
 --- /dev/null
 +++ b/runtime/platform/tests/test_guest_poll_filter.c
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,235 @@
 +/* Standalone: clang -O2 -std=gnu17 -pthread test_guest_poll_filter.c -o test_guest_poll_filter
 + * Include the implementation to observe registration without production hooks.
 + * Extend only this test's wait to 200ms, so a missed notification cannot hide
@@ -17139,7 +17261,9 @@ index 0000000..72b7875
 +#include <stdio.h>
 +#include <time.h>
 +#include <sched.h>
++static atomic_uint idle_parked;
 +static atomic_uint broadcasts;
++static int normal_timeout;
 +static int test_broadcast(pthread_cond_t* cond)
 +{
 +    atomic_fetch_add(&broadcasts, 1);
@@ -17148,7 +17272,10 @@ index 0000000..72b7875
 +#ifdef __APPLE__
 +static int test_wait(pthread_cond_t* cond, pthread_mutex_t* lock, const struct timespec* unused)
 +{
-+    (void)unused;
++    if (normal_timeout) {
++        if (unused->tv_nsec == 20000000) atomic_store(&idle_parked, 1);
++        return pthread_cond_timedwait_relative_np(cond, lock, unused);
++    }
 +    const struct timespec delay = {0, 200000000};
 +    return pthread_cond_timedwait_relative_np(cond, lock, &delay);
 +}
@@ -17156,7 +17283,10 @@ index 0000000..72b7875
 +#else
 +static int test_wait(pthread_cond_t* cond, pthread_mutex_t* lock, const struct timespec* unused)
 +{
-+    (void)unused;
++    if (normal_timeout) {
++        /* The idle notification test marks its final wait explicitly below. */
++        return pthread_cond_timedwait(cond, lock, unused);
++    }
 +    struct timespec deadline;
 +    clock_gettime(CLOCK_MONOTONIC, &deadline);
 +    deadline.tv_nsec += 200000000;
@@ -17192,6 +17322,116 @@ index 0000000..72b7875
 +    uint32_t zero = 0;
 +    ps3_poll_backoff(40, 128, &zero, 4);
 +    return NULL;
++}
++static void* idle_wait(void* unused)
++{
++    (void)unused;
++    uint32_t zero = 0;
++    ps3_poll_thread_start("adaptive test", 0);
++    /* Test an exaggerated cap to separate notification from timeout without
++     * relying on sub-millisecond host scheduling. Production cap is 1ms. */
++    for (unsigned i = 0; i < 8; i++) ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 1000);
++    s_poll.delay_us = 20000;
++#ifndef __APPLE__
++    atomic_store(&idle_parked, 1);
++#endif
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 100);
++    return NULL;
++}
++static void* cancel_wait(void* unused)
++{
++    uint32_t zero = 0;
++    s_poll.ea = 128; s_poll.size = 4; s_poll.delay_us = 400;
++    memcpy(s_poll.snapshot, &zero, 4);
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    if (unused) assert(s_poll.delay_us == 400); /* broadcast did not reset/grow */
++    return NULL;
++}
++static void adaptive_checks(uint32_t collision)
++{
++    normal_timeout = 1;
++    uint32_t zero = 0, one = 1;
++    __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
++    ps3_poll_reset();
++    unsigned expected[] = {200, 400, 800, 1000, 1000};
++    for (unsigned i = 0; i < 5; i++) {
++        ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++        assert(s_poll.delay_us == expected[i]);
++    }
++    /* A new snapshot, EA, size or caller sequence must restart at 100us. */
++    memcpy(memory + 128, &one, 4);
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 100 && !s_poll.size);
++    ps3_poll_backoff_idle_graphics(40, 128, &one, 4);
++    assert(s_poll.delay_us == 200);
++    ps3_poll_backoff_idle_graphics(40, 256, &zero, 4);
++    assert(s_poll.delay_us == 200);
++    ps3_poll_backoff_idle_graphics(40, 256, &zero, 1);
++    assert(s_poll.delay_us == 200);
++    ps3_poll_reset();
++    assert(s_poll.delay_us == 100 && !s_poll.size);
++    for (unsigned i = 0; i < 8; i++) ps3_poll_backoff(40, 256, &zero, 4);
++    assert(s_poll.delay_us == 100);
++    ps3_poll_backoff_idle_graphics(40, 127, &zero, 4);
++    assert(!s_poll.size); /* cross-line value remains a yield */
++    __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
++    pthread_t waiter;
++    assert(!pthread_create(&waiter, NULL, idle_wait, NULL));
++    double start = now();
++    /* Wait for the long final wait, not one of its warmup waits. */
++    while (!atomic_load(&idle_parked) ||
++           !__atomic_load_n(&ps3_poll_waiters, __ATOMIC_ACQUIRE)) {
++        sched_yield(); assert(now() - start < 1);
++    }
++    pthread_mutex_lock(&poll_slot(128)->lock);
++    pthread_mutex_unlock(&poll_slot(128)->lock);
++    __atomic_store_n((uint32_t*)(memory + 128), 1, __ATOMIC_RELEASE);
++    start = now();
++    ps3_poll_notify(128, 4);
++    pthread_join(waiter, NULL);
++    double latency = now() - start;
++    assert(latency < 0.005); /* well before the test's 20ms wait */
++    printf("adaptive notified latency %.3fms (20ms diagnostic wait)\n", latency * 1000);
++    /* Unnotified publication must return by production cap + 5ms tolerance. */
++    memcpy(memory + 128, &zero, 4);
++    ps3_poll_reset();
++    for (unsigned i = 0; i < 5; i++) ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    start = now();
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(now() - start < 0.006);
++    /* Collision/spurious wake: use the existing 200ms diagnostic wait. */
++    normal_timeout = 0;
++    assert(!pthread_create(&waiter, NULL, cancel_wait, (void*)1));
++    start = now();
++    while (!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_ACQUIRE)) {
++        sched_yield(); assert(now() - start < 1);
++    }
++    pthread_mutex_lock(&poll_slot(128)->lock);
++    pthread_mutex_unlock(&poll_slot(128)->lock);
++    __atomic_store_n(&ps3_poll_lines[(collision >> 7) & (POLL_LINES - 1)], 1, __ATOMIC_SEQ_CST);
++    ps3_poll_notify(collision, 4);
++    __atomic_store_n(&ps3_poll_lines[(collision >> 7) & (POLL_LINES - 1)], 0, __ATOMIC_SEQ_CST);
++    pthread_join(waiter, NULL);
++    assert(!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_RELAXED));
++    assert(!pthread_create(&waiter, NULL, cancel_wait, NULL));
++    start = now();
++    while (!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_ACQUIRE)) {
++        sched_yield(); assert(now() - start < 1);
++    }
++    pthread_mutex_lock(&poll_slot(128)->lock);
++    assert(!pthread_cancel(waiter));
++    pthread_mutex_unlock(&poll_slot(128)->lock);
++    void* result;
++    pthread_join(waiter, &result);
++    assert(result == PTHREAD_CANCELED);
++    assert(!__atomic_load_n(&ps3_poll_waiters, __ATOMIC_RELAXED));
++    assert(!__atomic_load_n(&ps3_poll_lines[1], __ATOMIC_RELAXED));
++    assert(!atomic_load(&poll_slot(128)->waiters));
++    assert(!pthread_mutex_trylock(&poll_slot(128)->lock));
++    pthread_mutex_unlock(&poll_slot(128)->lock);
++    puts("adaptive poll: timeout ladder, snapshot/EA/size/sequence reset, short callers, cross-line, collision, cancellation PASS");
 +}
 +int main(void)
 +{
@@ -17241,9 +17481,170 @@ index 0000000..72b7875
 +    start = now();
 +    ps3_poll_backoff(40, 127, &zero, 4);
 +    assert(now() - start < 0.1);
++    adaptive_checks(collision);
 +    puts("guest poll filter: empty global fast path, 1000 registrations, hash collision, crossing store, prior publication PASS");
 +    return 0;
 +}
+diff --git a/runtime/platform/tests/test_win32_compat.c b/runtime/platform/tests/test_win32_compat.c
+index 8f199fe..dc67cee 100644
+--- a/runtime/platform/tests/test_win32_compat.c
++++ b/runtime/platform/tests/test_win32_compat.c
+@@ -262,6 +262,145 @@ static void test_semaphores(void)
+     CloseHandle(t); CloseHandle(e); CloseHandle(s);
+ }
+ 
++/* ---- multi-wait notification/lifetime regressions ------------------------- */
++#ifdef PS3_MULTIWAIT_TEST
++extern void ps3_multiwait_test_state(int*, unsigned long long*);
++extern void ps3_multiwait_test_cancel_after_wake(void);
++struct multi_case { HANDLE objects[2]; BOOL all; DWORD ms, result; volatile LONG done; };
++static DWORD WINAPI multi_case_wait(LPVOID arg)
++{
++    struct multi_case* c = arg;
++    c->result = WaitForMultipleObjects(2, c->objects, c->all, c->ms);
++    InterlockedExchange(&c->done, 1);
++    return 0;
++}
++static unsigned long long multi_waiters_ready(int expected)
++{
++    int waiters = 0;
++    unsigned long long wakes = 0, until = now_ms() + 2000;
++    do {
++        ps3_multiwait_test_state(&waiters, &wakes);
++        if (waiters == expected) break;
++        Sleep(1);
++    } while (now_ms() < until);
++    CHECK(waiters == expected);
++    return wakes;
++}
++static unsigned long long multi_registered(void) { return multi_waiters_ready(1); }
++static void* multi_raw_wait(void* arg) { multi_case_wait(arg); return NULL; }
++static void multi_join(HANDLE thread, struct multi_case* c, DWORD expected)
++{
++    CHECK(WaitForSingleObject(thread, 2000) == WAIT_OBJECT_0);
++    CHECK(c->done && c->result == expected);
++    CloseHandle(thread);
++}
++static void test_multi_notifications(void)
++{
++    HANDLE kick = CreateEventA(NULL, FALSE, FALSE, NULL);
++    HANDLE timer = CreateWaitableTimerA(NULL, FALSE, NULL);
++    HANDLE storm = CreateSemaphoreA(NULL, 0, 1, NULL);
++    struct multi_case c = {{kick, timer}, FALSE, 2000, WAIT_FAILED, 0};
++    HANDLE th = CreateThread(NULL, 0, multi_case_wait, &c, 0, NULL);
++    unsigned long long before = multi_registered(), after;
++    int waiters;
++    /* Unrelated semaphore changes must neither wake nor advance this wait. */
++    for (int i = 0; i < 100; i++) {
++        CHECK(ReleaseSemaphore(storm, 1, NULL));
++        CHECK(WaitForSingleObject(storm, 0) == WAIT_OBJECT_0);
++        Sleep(1);
++    }
++    ps3_multiwait_test_state(&waiters, &after);
++    CHECK(waiters == 1 && !InterlockedCompareExchange(&c.done, 0, 0));
++    const char* broadcast = getenv("PS3_MULTIWAIT_BROADCAST");
++    if (broadcast && !strcmp(broadcast, "1")) CHECK(after > before);
++    else CHECK(after == before);
++    CHECK(SetEvent(kick));
++    multi_join(th, &c, WAIT_OBJECT_0);
++    CHECK(WaitForSingleObject(kick, 0) == WAIT_TIMEOUT);  /* consumed exactly once */
++
++    /* An earlier rearm must replace an existing long timed sleep. */
++    LARGE_INTEGER due; due.QuadPart = -1000 * 10000LL;
++    CHECK(SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE));
++    c.done = 0;
++    th = CreateThread(NULL, 0, multi_case_wait, &c, 0, NULL);
++    multi_registered();
++    ULONGLONG start = now_ms();
++    due.QuadPart = -30 * 10000LL;
++    CHECK(SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE));
++    multi_join(th, &c, WAIT_OBJECT_0 + 1);
++    CHECK(now_ms() - start >= 20 && now_ms() - start < 500);
++    CHECK(WaitForSingleObject(timer, 0) == WAIT_TIMEOUT);
++
++    /* Wait-all cannot consume the first ready auto-reset object early. */
++    HANDLE second = CreateEventA(NULL, FALSE, FALSE, NULL);
++    c.objects[1] = second; c.all = TRUE; c.done = 0;
++    th = CreateThread(NULL, 0, multi_case_wait, &c, 0, NULL);
++    multi_registered();
++    SetEvent(kick); Sleep(20);
++    CHECK(!InterlockedCompareExchange(&c.done, 0, 0));
++    SetEvent(second);
++    multi_join(th, &c, WAIT_OBJECT_0);
++    CHECK(WaitForSingleObject(kick, 0) == WAIT_TIMEOUT);
++    CHECK(WaitForSingleObject(second, 0) == WAIT_TIMEOUT);
++
++    /* A ready timer in wait-all must release the lock to await the event. */
++    c.objects[1] = timer; c.done = 0;
++    due.QuadPart = -10 * 10000LL;
++    SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
++    th = CreateThread(NULL, 0, multi_case_wait, &c, 0, NULL);
++    multi_registered(); Sleep(30);
++    CHECK(!InterlockedCompareExchange(&c.done, 0, 0));
++    CHECK(SetEvent(kick));
++    multi_join(th, &c, WAIT_OBJECT_0);
++    CHECK(WaitForSingleObject(timer, 0) == WAIT_TIMEOUT);
++    c.objects[1] = second;
++
++    /* References survive close while parked; the outstanding wait times out. */
++    c.all = FALSE; c.ms = 60; c.done = 0;
++    th = CreateThread(NULL, 0, multi_case_wait, &c, 0, NULL);
++    multi_registered();
++    CHECK(CloseHandle(kick)); CHECK(CloseHandle(second));
++    multi_join(th, &c, WAIT_TIMEOUT);
++    ps3_multiwait_test_state(&waiters, &after);
++    CHECK(waiters == 0);
++    /* Multiple subscribers to one auto-reset event still consume one signal. */
++    kick = CreateEventA(NULL, FALSE, FALSE, NULL);
++    struct multi_case a = {{kick, timer}, FALSE, 2000, WAIT_FAILED, 0}, b = a;
++    HANDLE ta = CreateThread(NULL, 0, multi_case_wait, &a, 0, NULL);
++    HANDLE tb = CreateThread(NULL, 0, multi_case_wait, &b, 0, NULL);
++    multi_waiters_ready(2);
++    SetEvent(kick); Sleep(30);
++    CHECK(InterlockedCompareExchange(&a.done, 0, 0) +
++          InterlockedCompareExchange(&b.done, 0, 0) == 1);
++    SetEvent(kick);
++    multi_join(ta, &a, WAIT_OBJECT_0); multi_join(tb, &b, WAIT_OBJECT_0);
++
++    /* Cancellation must not leave a stack subscription or held references. */
++    a.done = 0; a.ms = INFINITE;
++    pthread_t raw; void* ret = NULL;
++    CHECK(pthread_create(&raw, NULL, multi_raw_wait, &a) == 0);
++    multi_registered();
++    CHECK(pthread_cancel(raw) == 0);
++    CHECK(pthread_join(raw, &ret) == 0 && ret == PTHREAD_CANCELED);
++    ps3_multiwait_test_state(&waiters, &after);
++    CHECK(waiters == 0);
++    CHECK(SetEvent(kick));
++    CHECK(WaitForMultipleObjects(2, a.objects, FALSE, 0) == WAIT_OBJECT_0);
++    /* The other cleanup path: cancellation after wake, while s_lock is held. */
++    CHECK(pthread_create(&raw, NULL, multi_raw_wait, &a) == 0);
++    multi_registered();
++    ps3_multiwait_test_cancel_after_wake();
++    CHECK(SetEvent(kick));
++    ret = NULL;
++    CHECK(pthread_join(raw, &ret) == 0 && ret == PTHREAD_CANCELED);
++    ps3_multiwait_test_state(&waiters, &after);
++    CHECK(waiters == 0);
++    CHECK(WaitForMultipleObjects(2, a.objects, FALSE, 0) == WAIT_OBJECT_0);
++    CloseHandle(kick); CloseHandle(timer); CloseHandle(storm);
++    printf("multiwait: storm no false progress/wakes; kick, rearm, auto-reset, wait-all, timeout, close, cancellation PASS\n");
++}
++#endif
++
+ /* ---- WaitOnAddress ------------------------------------------------------- */
+ static volatile LONG g_addr_val;
+ static DWORD WINAPI addr_waiter(LPVOID a)
+@@ -956,6 +1095,9 @@ int main(void)
+     test_thread_lifecycle();
+     test_events();
+     test_semaphores();
++#ifdef PS3_MULTIWAIT_TEST
++    test_multi_notifications();
++#endif
+     test_wait_on_address();
+     test_srw_and_cv();
+     test_init_once();
 diff --git a/runtime/platform/thread_lifecycle.h b/runtime/platform/thread_lifecycle.h
 new file mode 100644
 index 0000000..7f1a7b7
@@ -17297,9 +17698,20 @@ index 0000000..7f1a7b7
 +#endif
 +#endif
 diff --git a/runtime/platform/win32_compat.c b/runtime/platform/win32_compat.c
-index 11a7480..88d4410 100644
+index 11a7480..e6b823c 100644
 --- a/runtime/platform/win32_compat.c
 +++ b/runtime/platform/win32_compat.c
+@@ -10,8 +10,8 @@
+  * of the objects are consumed together or none is -- without a lock-ordering
+  * scheme across objects. Each object has its own condition variable, used with
+  * that shared mutex, so a SetEvent wakes only the threads waiting on that
+- * event; a separate condition variable serves multi-object waiters, and every
+- * state change broadcasts it only while such a waiter exists.
++ * event; multi-object waiters register their objects and a private condition
++ * under the same lock. Only subscribers to a changed object are notified.
+  *
+  * Threads are created detached and tracked by a reference-counted object: one
+  * reference belongs to the handle, one to the running thread, and whichever
 @@ -57,6 +57,8 @@
  #  include <ucontext.h>
  #endif
@@ -17309,6 +17721,224 @@ index 11a7480..88d4410 100644
  /* The signal that parks a thread for SuspendThread on Linux. SIGRTMIN and the
   * two above it belong to the C library's own threading, and SIGRTMIN is not a
   * compile-time constant there, so this is only ever evaluated at run time. */
+@@ -124,6 +126,83 @@ typedef struct ps3_obj {
+ static pthread_mutex_t s_lock  = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t  s_multi = PTHREAD_COND_INITIALIZER;
+ static int             s_multi_waiters;
++static pthread_once_t s_multi_once = PTHREAD_ONCE_INIT;
++typedef struct multi_waiter {
++    ps3_obj** objects;
++    DWORD count;
++    int locked;
++    pthread_cond_t cv;
++    struct multi_waiter* next;
++} multi_waiter;
++static multi_waiter* s_multi_head;
++static int s_multi_stats, s_multi_broadcast;
++static unsigned long long s_multi_since, s_multi_changes, s_multi_broadcasts, s_multi_notifications;
++static _Thread_local struct {
++    unsigned long long since, wakes, interest, useless, timers;
++    char name[64];
++} t_multi_stats;
++static void multi_init(void)
++{
++    const char* e = getenv("PS3_MULTIWAIT_STATS");
++    s_multi_stats = e && !strcmp(e, "1");
++    e = getenv("PS3_MULTIWAIT_BROADCAST");
++    s_multi_broadcast = e && !strcmp(e, "1");
++}
++static unsigned long long mono_ns(void);
++static void multi_change_stats(int broadcast, unsigned notifications)
++{
++    if (!s_multi_stats) return;
++    unsigned long long now = mono_ns();
++    if (!s_multi_since) s_multi_since = now;
++    s_multi_changes++;
++    s_multi_broadcasts += broadcast;
++    s_multi_notifications += notifications;
++    if (now - s_multi_since < 10000000000ull) return;
++    fprintf(stderr, "[multiwait-global] mode=%s interval=%.3fs changes=%llu broadcasts=%llu notifications=%llu\n",
++            s_multi_broadcast ? "broadcast" : "fanout", (now - s_multi_since) / 1e9,
++            s_multi_changes, s_multi_broadcasts, s_multi_notifications);
++    s_multi_since = now; s_multi_changes = s_multi_broadcasts = s_multi_notifications = 0;
++}
++static void multi_wake_stats(int notified, int interest)
++{
++    if (!s_multi_stats) return;
++    unsigned long long now = mono_ns();
++    if (!t_multi_stats.since) {
++        t_multi_stats.since = now;
++#if defined(__APPLE__) || defined(__linux__)
++        pthread_getname_np(pthread_self(), t_multi_stats.name, sizeof t_multi_stats.name);
++#endif
++    }
++    if (notified) {
++        t_multi_stats.wakes++;
++        if (interest) t_multi_stats.interest++;
++        else t_multi_stats.useless++;
++    } else t_multi_stats.timers++;
++    if (now - t_multi_stats.since < 10000000000ull) return;
++    fprintf(stderr, "[multiwait-stats] thread=\"%s\" interval=%.3fs wakes=%llu interest=%llu useless=%llu timers=%llu\n",
++            t_multi_stats.name, (now - t_multi_stats.since) / 1e9,
++            t_multi_stats.wakes, t_multi_stats.interest, t_multi_stats.useless, t_multi_stats.timers);
++    t_multi_stats.since = now;
++    t_multi_stats.wakes = t_multi_stats.interest = t_multi_stats.useless = t_multi_stats.timers = 0;
++}
++#ifdef PS3_MULTIWAIT_TEST
++static unsigned long long s_multi_test_wakes;
++static int s_multi_test_cancel_after_wake;
++void ps3_multiwait_test_cancel_after_wake(void)
++{
++    pthread_mutex_lock(&s_lock);
++    s_multi_test_cancel_after_wake = 1;
++    pthread_mutex_unlock(&s_lock);
++}
++/* Asset-free tests use this to wait until references/registration are held. */
++void ps3_multiwait_test_state(int* waiters, unsigned long long* wakes)
++{
++    pthread_mutex_lock(&s_lock);
++    *waiters = s_multi_waiters;
++    *wakes = s_multi_test_wakes;
++    pthread_mutex_unlock(&s_lock);
++}
++#endif
+ static ps3_obj*        s_threads;                 /* the thread table head */
+ 
+ static _Thread_local ps3_obj* t_current_thread;   /* set by the trampoline */
+@@ -168,7 +247,21 @@ static void obj_release_locked(ps3_obj* o)
+ static void obj_changed_locked(ps3_obj* o)
+ {
+     pthread_cond_broadcast(&o->cv);
+-    if (s_multi_waiters) pthread_cond_broadcast(&s_multi);
++    pthread_once(&s_multi_once, multi_init);
++    unsigned notifications = 0;
++    if (s_multi_broadcast) {
++        if (s_multi_waiters) pthread_cond_broadcast(&s_multi);
++    } else {
++        for (multi_waiter* w = s_multi_head; w; w = w->next) {
++            for (DWORD i = 0; i < w->count; i++) {
++                if (w->objects[i] != o) continue;
++                pthread_cond_signal(&w->cv);
++                notifications++;
++                break;              /* duplicate handles notify only once */
++            }
++        }
++    }
++    multi_change_stats(s_multi_broadcast && s_multi_waiters, notifications);
+ }
+ 
+ static unsigned long long mono_ns(void)
+@@ -238,11 +331,16 @@ static unsigned long long obj_next_due_locked(const ps3_obj* o)
+  * capped by `due_ns` when non-zero. Returns 0 on wake, ETIMEDOUT past the
+  * deadline. Call with s_lock held. */
+ static int wait_until_locked(pthread_cond_t* cv, unsigned long long deadline_ns,
+-                             unsigned long long due_ns)
++                             unsigned long long due_ns, int* notified)
+ {
++    if (notified) *notified = 0;
+     unsigned long long target = deadline_ns;
+     if (due_ns && (!target || due_ns < target)) target = due_ns;
+-    if (!target) return pthread_cond_wait(cv, &s_lock);
++    if (!target) {
++        int rc = pthread_cond_wait(cv, &s_lock);
++        if (notified) *notified = rc == 0;
++        return rc;
++    }
+ 
+     unsigned long long now = mono_ns();
+     if (deadline_ns && now >= deadline_ns) return ETIMEDOUT;
+@@ -257,6 +355,7 @@ static int wait_until_locked(pthread_cond_t* cv, unsigned long long deadline_ns,
+     ts.tv_nsec += (long)(remain % 1000000000ull);
+     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+     int rc = pthread_cond_timedwait(cv, &s_lock, &ts);
++    if (notified) *notified = rc == 0;
+     /* Only the caller's own deadline is a timeout. Waking at a timer's due
+      * time, or early through REALTIME/MONOTONIC jitter, means "look again". */
+     if (rc == ETIMEDOUT && (!deadline_ns || mono_ns() < deadline_ns)) rc = 0;
+@@ -1259,6 +1358,26 @@ BOOL Thread32Next(HANDLE snapshot, THREADENTRY32* entry)
+     return ok;
+ }
+ 
++/* Registration and references live together, under s_lock. */
++static void multi_unregister_locked(multi_waiter* w)
++{
++    for (multi_waiter** p = &s_multi_head; *p; p = &(*p)->next) {
++        if (*p == w) { *p = w->next; break; }
++    }
++    s_multi_waiters--;
++    for (DWORD i = 0; i < w->count; i++) obj_release_locked(w->objects[i]);
++    if (!s_multi_broadcast) pthread_cond_destroy(&w->cv);
++}
++static void multi_cancel(void* arg)
++{
++    multi_waiter* w = (multi_waiter*)arg;
++    /* Condition cancellation unlocked through thread_lifecycle.h; cancellation
++     * during stats output still owns the lock. Handle both unwind paths. */
++    if (!w->locked) pthread_mutex_lock(&s_lock);
++    multi_unregister_locked(w);
++    pthread_mutex_unlock(&s_lock);
++}
++
+ /* --- waits ----------------------------------------------------------------- */
+ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
+ {
+@@ -1273,7 +1392,7 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
+         unsigned long long now = mono_ns();
+         if (obj_signaled_locked(o, now)) { obj_consume_locked(o, now); result = WAIT_OBJECT_0; break; }
+         if (ms == 0) break;
+-        if (wait_until_locked(&o->cv, deadline, obj_next_due_locked(o)) == ETIMEDOUT) {
++        if (wait_until_locked(&o->cv, deadline, obj_next_due_locked(o), NULL) == ETIMEDOUT) {
+             /* One last look: the state may have changed exactly at the deadline. */
+             now = mono_ns();
+             if (obj_signaled_locked(o, now)) { obj_consume_locked(o, now); result = WAIT_OBJECT_0; }
+@@ -1303,7 +1422,12 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all,
+ 
+     pthread_mutex_lock(&s_lock);
+     for (DWORD i = 0; i < count; i++) objs[i]->refs++;
++    pthread_once(&s_multi_once, multi_init);
++    multi_waiter waiter = { .objects = objs, .count = count, .locked = 1, .next = s_multi_head };
++    if (!s_multi_broadcast) pthread_cond_init(&waiter.cv, NULL);
++    s_multi_head = &waiter;
+     s_multi_waiters++;
++    pthread_cleanup_push(multi_cancel, &waiter);
+     for (;;) {
+         unsigned long long now = mono_ns();
+         if (wait_all) {
+@@ -1324,12 +1448,30 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all,
+         unsigned long long due = 0;
+         for (DWORD i = 0; i < count; i++) {
+             unsigned long long d = obj_next_due_locked(objs[i]);
+-            if (d && (!due || d < due)) due = d;
++            if (d > now && (!due || d < due)) due = d;
++        }
++        int notified;
++        waiter.locked = 0;
++        int rc = wait_until_locked(s_multi_broadcast ? &s_multi : &waiter.cv, deadline, due, &notified);
++        waiter.locked = 1;
++#ifdef PS3_MULTIWAIT_TEST
++        if (notified) s_multi_test_wakes++;
++        if (s_multi_test_cancel_after_wake) {
++            s_multi_test_cancel_after_wake = 0;
++            pthread_cancel(pthread_self());
++            pthread_testcancel();  /* model cancellation in locked stats output */
+         }
+-        if (wait_until_locked(&s_multi, deadline, due) == ETIMEDOUT) break;
++#endif
++        if (s_multi_stats) {
++            int interest = 0;
++            now = mono_ns();
++            for (DWORD i = 0; i < count; i++) interest |= obj_signaled_locked(objs[i], now);
++            multi_wake_stats(notified, interest);
++        }
++        if (rc == ETIMEDOUT) break;
+     }
+-    s_multi_waiters--;
+-    for (DWORD i = 0; i < count; i++) obj_release_locked(objs[i]);
++    pthread_cleanup_pop(0);
++    multi_unregister_locked(&waiter);
+     pthread_mutex_unlock(&s_lock);
+     if (result == WAIT_TIMEOUT) SetLastError(ERROR_TIMEOUT);
+     return result;
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index e8f6c2b..6385820 100644
 --- a/runtime/ppu/ppu_fs.cpp
@@ -18593,14 +19223,19 @@ index b3bc534..171197b 100644
 +
  #endif /* PPU_MEMORY_H */
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index f2d6d7d..20f130f 100644
+index f2d6d7d..9e96778 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
-@@ -16,9 +16,11 @@
+@@ -16,9 +16,16 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
 +#include <mutex>
++#include <condition_variable>
++#include <chrono>
++#include <list>
++#include <map>
++#include <memory>
  /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
   * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
  #include "../platform/win32_compat.h"
@@ -18608,7 +19243,7 @@ index f2d6d7d..20f130f 100644
  #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
  
  extern "C" uint8_t* vm_base;
-@@ -107,9 +109,7 @@ static void sys_process_is_stack(ppu_context* ctx)
+@@ -107,9 +114,7 @@ static void sys_process_is_stack(ppu_context* ctx)
   * unregistered context (bug); stamp a sentinel that matches no real thread. */
  #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
  
@@ -18618,7 +19253,7 @@ index f2d6d7d..20f130f 100644
  static void sys_lwmutex_create(ppu_context* ctx)
  {
      uint32_t lwm  = (uint32_t)ctx->gpr[3];
-@@ -124,12 +124,10 @@ static void sys_lwmutex_create(ppu_context* ctx)
+@@ -124,12 +129,10 @@ static void sys_lwmutex_create(ppu_context* ctx)
      vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
      vm_write32(lwm + 0x10, 0);          /* sleep_queue */
      vm_write32(lwm + 0x14, 0);
@@ -18631,7 +19266,7 @@ index f2d6d7d..20f130f 100644
      ctx->gpr[3] = 0;
  }
  /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
-@@ -145,7 +143,6 @@ static void sys_lwmutex_create(ppu_context* ctx)
+@@ -145,7 +148,6 @@ static void sys_lwmutex_create(ppu_context* ctx)
   * thread. Recursion is handled explicitly via the guest owner/recur fields
   * we stamp (only the holder ever writes owner=self, so the re-lock check is
   * race-free). Keyed by guest address in an open-addressed table. */
@@ -18639,7 +19274,7 @@ index f2d6d7d..20f130f 100644
  #define LWM_HASH 65536u
  static struct LwmSlot { volatile long addr; HANDLE sem;
      volatile long holder; volatile long long acq_us; volatile long long acq_fences;
-@@ -161,13 +158,9 @@ static volatile long g_lwm_tab_lock = 0;
+@@ -161,13 +163,9 @@ static volatile long g_lwm_tab_lock = 0;
   * convoy root. Default OFF. */
  static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
  static long long lwm_now_us(void){
@@ -18653,7 +19288,7 @@ index f2d6d7d..20f130f 100644
  }
  /* Find an EXISTING slot (no create) for hold-tracking. */
  static struct LwmSlot* lwm_find(uint32_t addr){
-@@ -185,14 +178,14 @@ static HANDLE lwm_sem(uint32_t addr)
+@@ -185,14 +183,14 @@ static HANDLE lwm_sem(uint32_t addr)
      uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
      for (uint32_t i = 0; i < LWM_HASH; i++) {
          uint32_t idx = (h + i) & (LWM_HASH - 1);
@@ -18670,7 +19305,7 @@ index f2d6d7d..20f130f 100644
                  r = g_lwm[idx].sem;
              } else if ((uint32_t)g_lwm[idx].addr == addr) {
                  r = g_lwm[idx].sem;
-@@ -204,9 +197,6 @@ static HANDLE lwm_sem(uint32_t addr)
+@@ -204,9 +202,6 @@ static HANDLE lwm_sem(uint32_t addr)
      }
      return nullptr;   /* table full (raise LWM_HASH) */
  }
@@ -18680,7 +19315,7 @@ index f2d6d7d..20f130f 100644
  /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
   * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
   * logging during that window only (park hunts: gate on state, not counts). */
-@@ -221,7 +211,6 @@ static void sys_lwmutex_lock(ppu_context* ctx)
+@@ -221,7 +216,6 @@ static void sys_lwmutex_lock(ppu_context* ctx)
       * contended lock yields to other threads instead of hard-blocking). We had
       * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
      uint64_t timeout_us = ctx->gpr[4];
@@ -18688,7 +19323,7 @@ index f2d6d7d..20f130f 100644
      HANDLE s = lwm_sem(lwm);
      if (s) {
          /* Recursive re-lock by the current holder: bump the count, no wait.
-@@ -259,7 +248,6 @@ static void sys_lwmutex_lock(ppu_context* ctx)
+@@ -259,7 +253,6 @@ static void sys_lwmutex_lock(ppu_context* ctx)
          }
      }
      if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
@@ -18696,7 +19331,7 @@ index f2d6d7d..20f130f 100644
      vm_write32(lwm + LWM_OWNER, self);
      vm_write32(lwm + LWM_RECUR, 1);
      ctx->gpr[3] = 0;   // CELL_OK
-@@ -268,7 +256,6 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
+@@ -268,7 +261,6 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
  {
      uint32_t lwm = (uint32_t)ctx->gpr[3];
      uint32_t self = LWM_SELF(ctx);
@@ -18704,7 +19339,7 @@ index f2d6d7d..20f130f 100644
      HANDLE s = lwm_sem(lwm);
      if (s) {
          if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
-@@ -276,10 +263,9 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
+@@ -276,10 +268,9 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
              ctx->gpr[3] = 0;
              return;
          }
@@ -18716,7 +19351,7 @@ index f2d6d7d..20f130f 100644
      vm_write32(lwm + LWM_OWNER, self);
      vm_write32(lwm + LWM_RECUR, 1);
      ctx->gpr[3] = 0;
-@@ -295,7 +281,6 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+@@ -295,7 +286,6 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
      }
      vm_write32(lwm + LWM_RECUR, 0);
      vm_write32(lwm + LWM_OWNER, 0);
@@ -18724,7 +19359,7 @@ index f2d6d7d..20f130f 100644
      if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
          if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
              if (held > 100000) {
-@@ -328,7 +313,6 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+@@ -328,54 +318,281 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
       * hands lwmutex ownership across threads. Over-release (unlock of a free
       * mutex) fails harmlessly at the max count of 1. */
      if (s) ReleaseSemaphore(s, 1, NULL);
@@ -18732,46 +19367,317 @@ index f2d6d7d..20f130f 100644
      ctx->gpr[3] = 0;
  }
  
-@@ -338,15 +322,16 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
-  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
-  * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
-  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
+-/* sys_lwcond (sysPrxForUser) — guest-side condition variable, paired with an
+- * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
+- * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
+- * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
+- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
+- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
 - * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
 - * +0x08 lwcond_queue id. */
-+ * handshakes, not long-term blocking. sys_lwcond_t (8 bytes): +0x00 lwmutex EA
-+ * (be32), +0x04 lwcond_queue id (be32). Guest code reads +0x00 as 32-bit -- FIOS
-+ * Cond::wait refuses a cond whose first word is 0. */
++/* sys_lwcond_t is eight guest bytes: be32 lwmutex EA, be32 queue id.
++ * Keep the semaphore-backed lwmutex (guest ownership may cross host threads).
++ * Selection and registration share the queue lock; a signal has no credit for
++ * a future waiter. Never hold this lock while reacquiring the semaphore. */
++static const uint32_t LWC_ESRCH = 0x80010005u;
++static const uint32_t LWC_EPERM = 0x80010009u;
++static const uint32_t LWC_EBUSY = 0x8001000Au;
++static const uint32_t LWC_ETIMEDOUT = 0x8001000Bu;
++static void lwc_result(ppu_context* ctx, uint32_t result)
++{
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
++}
++static bool lwc_poll(void)
++{
++    static const bool enabled = [] { const char* e = getenv("PS3_LWCOND_POLL"); return e && !strcmp(e, "1"); }();
++    return enabled;
++}
++struct LwcWaiter {
++    uint64_t tid;
++    bool selected = false;
++    std::condition_variable cv;
++    explicit LwcWaiter(uint64_t id) : tid(id) {}
++};
++struct LwcQueue {
++    uint32_t mutex;
++    bool dead = false;
++    unsigned active = 0;  /* includes selected waiters still reacquiring */
++    std::mutex lock;
++    std::list<LwcWaiter*> waiters;
++    explicit LwcQueue(uint32_t addr) : mutex(addr) {}
++};
++static std::mutex s_lwc_lock;
++static std::map<uint64_t, std::shared_ptr<LwcQueue>> s_lwc_queues;
++static uint32_t s_lwc_id = 0x4C000000u;
++static uint64_t lwc_key(uint32_t addr)
++{
++    return ((uint64_t)addr << 32) | vm_read32(addr + 4);
++}
++static std::shared_ptr<LwcQueue> lwc_find(uint32_t addr)
++{
++    std::lock_guard<std::mutex> lock(s_lwc_lock);
++    auto it = s_lwc_queues.find(lwc_key(addr));
++    if (it == s_lwc_queues.end() || it->second->mutex != vm_read32(addr)) return nullptr;
++    return it->second;
++}
++/* Low-frequency interval totals. Blocked waiters need no timer for stats;
++ * another wait/signal/completion emits the next interval. */
++static void lwc_stats(unsigned waits, unsigned signals, unsigned wakes, unsigned timeouts, unsigned polls)
++{
++    static const bool enabled = [] { const char* e = getenv("PS3_LWCOND_STATS"); return e && !strcmp(e, "1"); }();
++    if (!enabled) return;
++    static std::mutex lock;
++    static auto start = std::chrono::steady_clock::now();
++    static uint64_t w = 0, s = 0, n = 0, t = 0, p = 0;
++#ifndef _WIN32
++    int previous;
++    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous);
++#endif
++    {
++        std::lock_guard<std::mutex> guard(lock);
++        w += waits; s += signals; n += wakes; t += timeouts; p += polls;
++        auto now = std::chrono::steady_clock::now();
++        double dt = std::chrono::duration<double>(now - start).count();
++        if (dt >= 10) {
++            fprintf(stderr, "[lwcond-stats] mode=%s interval=%.3fs waits=%llu signals=%llu wakes=%llu timeouts=%llu polls=%llu\n",
++                    lwc_poll() ? "poll" : "blocking", dt, (unsigned long long)w, (unsigned long long)s,
++                    (unsigned long long)n, (unsigned long long)t, (unsigned long long)p);
++            w = s = n = t = p = 0; start = now;
++        }
++    }
++#ifndef _WIN32
++    pthread_setcancelstate(previous, NULL);
++#endif
++}
  static void sys_lwcond_create(ppu_context* ctx)
  {
-     static uint32_t s_lwcond_id = 0x4C000000u;
-     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
+-    static uint32_t s_lwcond_id = 0x4C000000u;
+-    uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+-    uint32_t lwmutex = (uint32_t)ctx->gpr[4];
 -    vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
 -    vm_write32(lwcond + 0x08, ++s_lwcond_id);
-+    vm_write32(lwcond + 0x00, lwmutex);
-+    vm_write32(lwcond + 0x04, ++s_lwcond_id);
++    uint32_t addr = (uint32_t)ctx->gpr[3];
++    uint32_t mutex = (uint32_t)ctx->gpr[4];
++    if (!lwm_find(mutex)) { lwc_result(ctx, LWC_ESRCH); return; }
++    std::lock_guard<std::mutex> lock(s_lwc_lock);
++    auto old = s_lwc_queues.find(lwc_key(addr));
++    if (old != s_lwc_queues.end()) { lwc_result(ctx, LWC_EBUSY); return; }
++    uint32_t id = ++s_lwc_id;
++    s_lwc_queues.emplace(((uint64_t)addr << 32) | id, std::make_shared<LwcQueue>(mutex));
++    vm_write32(addr, mutex);
++    vm_write32(addr + 4, id);
++    ctx->gpr[3] = 0;
++}
++static void sys_lwcond_destroy(ppu_context* ctx)
++{
++    uint32_t addr = (uint32_t)ctx->gpr[3];
++    std::lock_guard<std::mutex> registry(s_lwc_lock);
++    auto it = s_lwc_queues.find(lwc_key(addr));
++    if (it == s_lwc_queues.end()) { lwc_result(ctx, LWC_ESRCH); return; }
++    auto q = it->second;
++    std::lock_guard<std::mutex> lock(q->lock);
++    /* RPCS3 refuses queued waiters and waits out relockers. We refuse both,
++     * allowing callers to retry without blocking an owner needed by relock. */
++    if (q->active) { lwc_result(ctx, LWC_EBUSY); return; }
++    q->dead = true;
++    s_lwc_queues.erase(it);
++    vm_write32(addr + 4, 0xFFFFFFFEu);  /* lwmutex_dead */
      ctx->gpr[3] = 0;
  }
- static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-@@ -360,8 +345,7 @@ static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+- * common single (non-recursive) hold. */
++extern "C" int ppu_thread_exists(uint64_t tid);
++static void lwc_signal(ppu_context* ctx, bool all, uint64_t tid, bool targeted = false)
++{
++    if (lwc_poll()) { lwc_stats(0, 1, 0, 0, 0); ctx->gpr[3] = 0; return; }
++    auto q = lwc_find((uint32_t)ctx->gpr[3]);
++    if (!q) { lwc_result(ctx, LWC_ESRCH); return; }
++    if (tid != UINT32_MAX && !ppu_thread_exists(tid)) { lwc_result(ctx, LWC_ESRCH); return; }
++    bool found = false;
++    uint32_t empty_result = 0;
++    if (targeted && tid == UINT32_MAX) {
++        /* RPCS3's signal_to(-1) retains the low-level no-waiter result:
++         * owner -> EPERM, busy -> OK, trylock succeeded -> ENOENT. */
++        if (vm_read32(q->mutex + LWM_OWNER) == LWM_SELF(ctx)) empty_result = LWC_EPERM;
++        else if (WaitForSingleObject(lwm_sem(q->mutex), 0) == WAIT_OBJECT_0) {
++            ReleaseSemaphore(lwm_sem(q->mutex), 1, NULL);
++            empty_result = 0x80010006u; /* ENOENT */
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lock(q->lock);
++        if (q->dead) { lwc_result(ctx, LWC_ESRCH); return; }
++        for (auto w : q->waiters) {
++            if (w->selected || (tid != UINT32_MAX && w->tid != tid)) continue;
++            w->selected = true;
++            w->cv.notify_one();
++            found = true;
++            if (!all) break;
++        }
++    }
++    lwc_stats(0, 1, 0, 0, 0);
++    /* sysPrxForUser normalizes no-waiter signal to OK; signal_to retains
++     * EPERM for an existing thread that isn't queued (including timed out). */
++    lwc_result(ctx, found ? 0 : (tid != UINT32_MAX ? LWC_EPERM : empty_result));
++}
++static void sys_lwcond_signal(ppu_context* ctx)     { lwc_signal(ctx, false, UINT32_MAX); }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_signal(ctx, true, UINT32_MAX); }
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_signal(ctx, false, ctx->gpr[4], true); }
++
++/* POSIX cancellation must unlink stack/heap wait state as well as unlock the
++ * queue. Explicit cleanup works on Darwin (which needn't unwind C++ locals)
++ * and is idempotent with C++ unwinding on other hosts. */
++struct LwcCleanup {
++    std::shared_ptr<LwcQueue>* queue;
++    std::unique_ptr<LwcWaiter>* waiter;
++    std::unique_lock<std::mutex>* lock;
++    HANDLE sem;
++    uint32_t mutex;
++    bool acquired = false;
++};
++static void lwc_cleanup(void* arg)
++{
++    auto c = (LwcCleanup*)arg;
++    if (!c->lock->owns_lock()) c->lock->lock();
++    (*c->queue)->waiters.remove(c->waiter->get());
++    --(*c->queue)->active;
++    c->lock->unlock();
++    if (c->acquired) {
++        vm_write32(c->mutex + LWM_RECUR, 0);
++        vm_write32(c->mutex + LWM_OWNER, 0);
++        ReleaseSemaphore(c->sem, 1, NULL);
++    }
++    c->waiter->reset();
++    c->queue->reset();
++}
  static void sys_lwcond_wait(ppu_context* ctx)
  {
-     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+-    uint32_t lwcond  = (uint32_t)ctx->gpr[3];
 -    uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
 -#ifdef _WIN32
-+    uint32_t lwmutex = vm_read32(lwcond + 0x00);
-     HANDLE s = lwm_sem(lwmutex);
-     if (s) {
-         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
-@@ -374,7 +358,6 @@ static void sys_lwcond_wait(ppu_context* ctx)
-         vm_write32(lwmutex + LWM_OWNER, own);
-         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+-    HANDLE s = lwm_sem(lwmutex);
+-    if (s) {
+-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+-        vm_write32(lwmutex + LWM_RECUR, 0);
+-        vm_write32(lwmutex + LWM_OWNER, 0);
+-        ReleaseSemaphore(s, 1, NULL);
++    uint32_t addr = (uint32_t)ctx->gpr[3];
++    uint64_t timeout = ctx->gpr[4];
++    if (lwc_poll()) {
++        /* Direct legacy path: no queue/CV allocation in the polling control.
++         * Keep its unconditional success and ignored timeout for rollback. */
++        uint32_t mutex = vm_read32(addr), self = LWM_SELF(ctx);
++        HANDLE sem = lwm_sem(mutex);
++        uint32_t recur = vm_read32(mutex + LWM_RECUR);
++        if (!sem || vm_read32(mutex + LWM_OWNER) != self || !recur) {
++            lwc_result(ctx, LWC_EPERM); return;
++        }
++        vm_write32(mutex + LWM_RECUR, 0);
++        vm_write32(mutex + LWM_OWNER, 0);
++        ReleaseSemaphore(sem, 1, NULL);
++        lwc_stats(1, 0, 0, 0, 0);
+         Sleep(1);
+-        WaitForSingleObject(s, INFINITE);
+-        vm_write32(lwmutex + LWM_OWNER, own);
+-        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++        WaitForSingleObject(sem, INFINITE);
++        vm_write32(mutex + LWM_OWNER, self);
++        vm_write32(mutex + LWM_RECUR, recur);
++        lwc_stats(0, 0, 0, 0, 1);
++        ctx->gpr[3] = 0;
++        return;
++    }
++    auto q = lwc_find(addr);
++    if (!q) { lwc_result(ctx, LWC_ESRCH); return; }
++    uint32_t mutex = q->mutex, self = LWM_SELF(ctx);
++    HANDLE sem = lwm_sem(mutex);
++    uint32_t recur = vm_read32(mutex + LWM_RECUR);
++    if (!sem || vm_read32(mutex + LWM_OWNER) != self || !recur) {
++        lwc_result(ctx, LWC_EPERM); return;
      }
--#endif
-     ctx->gpr[3] = 0;
++    auto waiter = std::make_unique<LwcWaiter>(ctx->thread_id);
++    std::unique_lock<std::mutex> lock(q->lock);
++    if (q->dead) { lwc_result(ctx, LWC_ESRCH); return; }
++    q->waiters.push_back(waiter.get());
++    ++q->active;
++    LwcCleanup cleanup { &q, &waiter, &lock, sem, mutex };
++    bool selected = false;
++#ifndef _WIN32
++    pthread_cleanup_push(lwc_cleanup, &cleanup);
+ #endif
+-    ctx->gpr[3] = 0;
++    vm_write32(mutex + LWM_RECUR, 0);
++    vm_write32(mutex + LWM_OWNER, 0);
++    if (auto sl = lwm_find(mutex)) sl->holder = 0;
++    ReleaseSemaphore(sem, 1, NULL);
++    lock.unlock();
++    lwc_stats(1, 0, 0, 0, 0);
++    lock.lock();
++#ifdef PS3_LWCOND_TEST
++    /* Test-only release/park interleaving, using the production queue. */
++    extern void lwc_test_before_park(uint32_t);
++    lock.unlock();
++    lwc_test_before_park(addr);
++    lock.lock();
++#endif
++    if (!timeout) {
++        waiter->cv.wait(lock, [&] { return waiter->selected; });
++    } else {
++        /* Saturate arbitrary u64 guest timeouts rather than overflow chrono. */
++        auto now = std::chrono::steady_clock::now();
++        auto max_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::time_point::max() - now).count();
++        auto deadline = now + std::chrono::microseconds(timeout > (uint64_t)max_us ? max_us : timeout);
++        waiter->cv.wait_until(lock, deadline, [&] { return waiter->selected; });
++    }
++#ifndef _WIN32
++    pthread_testcancel();
++#endif
++    selected = waiter->selected;
++    q->waiters.remove(waiter.get());  /* serialize timeout with signal_to */
++    lock.unlock();
++    /* Mask cancellation inside the compatibility wait so its semaphore refs
++     * stay balanced. Bounded relock attempts supply cancellation points
++     * between calls without ever cancelling while its global lock is held. */
++#ifndef _WIN32
++    for (;;) {
++        int previous;
++        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous);
++        DWORD result = WaitForSingleObject(sem, 10);
++        cleanup.acquired = result == WAIT_OBJECT_0;
++        pthread_setcancelstate(previous, NULL);
++        pthread_testcancel();
++        if (cleanup.acquired) break;
++    }
++#else
++    WaitForSingleObject(sem, INFINITE);
++#endif
++    /* Restore the validated caller, never an unvalidated saved owner. */
++    vm_write32(mutex + LWM_OWNER, self);
++    vm_write32(mutex + LWM_RECUR, recur);
++    if (lwm_trace()) { auto sl = lwm_find(mutex); if (sl) {
++        sl->holder = (long)self; sl->acq_us = lwm_now_us();
++        sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self);
++    } }
++    lwc_stats(0, 0, selected, !selected, 0);
++    lock.lock();
++    --q->active;
++    lock.unlock();
++#ifndef _WIN32
++    pthread_cleanup_pop(0);
++#endif
++    lwc_result(ctx, selected ? 0 : LWC_ETIMEDOUT);
  }
  
-@@ -483,6 +466,8 @@ static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
+ /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
+@@ -483,6 +700,8 @@ static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
  {
      /* Bump from a small scratch region below the main stack (0x0FF00000) and
       * above the TLS image -- a few control structs, never freed. */
@@ -18780,7 +19686,7 @@ index f2d6d7d..20f130f 100644
      static unsigned int bump = 0x0F800000u;
      if (align < 16) align = 16;
      bump = (bump + align - 1) & ~(align - 1);
-@@ -535,17 +520,69 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
+@@ -535,17 +754,69 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
   * _sys_net_errno_loc returns a POINTER the game dereferences. */
  #define SYS_NET_EWOULDBLOCK_V 35
  extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
@@ -18855,7 +19761,7 @@ index f2d6d7d..20f130f 100644
  }
  static void hle_net_zero(ppu_context* ctx) { ctx->gpr[3] = 0; }
  /* select/poll: nothing is ever ready offline -- but a real select BLOCKS for
-@@ -579,7 +616,18 @@ static void hle_net_poll(ppu_context* ctx)
+@@ -579,7 +850,18 @@ static void hle_net_poll(ppu_context* ctx)
  }
  /* Distinct small fds: the unresolved default handed EVERY socket() call fd 0,
   * making all sockets alias one id in the game's tables. */
@@ -18875,7 +19781,7 @@ index f2d6d7d..20f130f 100644
  /* sendto: report the full length as sent (packets vanish into the void, matching
   * the RPCS3-offline oracle where broadcasts go out and nothing answers). */
  static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[5]; }
-@@ -852,8 +900,34 @@ static void sys_spinlock_unlock(ppu_context* ctx)
+@@ -852,8 +1134,34 @@ static void sys_spinlock_unlock(ppu_context* ctx)
      _InterlockedExchange(spin_word(ea), 0);
  }
  
@@ -18910,7 +19816,7 @@ index f2d6d7d..20f130f 100644
      ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
      ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
  
-@@ -871,10 +945,14 @@ extern "C" void ppu_sysprx_register(void)
+@@ -871,10 +1179,14 @@ extern "C" void ppu_sysprx_register(void)
      ps3_hle_register_ctx(0x3F09E20Au, "sys_net_bnet_select",    hle_net_select);
      ps3_hle_register_ctx(0x139A9E9Bu, "netInitializeNetworkEx", hle_net_zero);   /* lib init ok */
      ps3_hle_register_ctx(0x9C056962u, "netSocket",              hle_net_socket);
@@ -19107,6 +20013,183 @@ index 0000000..c2fa5f0
 +    put(b,ph+16,0x10000,8); put(b,ph+32,8,8); check(argv[1],b,false,"TLS filesz greater than memsz");
 +    check_poll_store_reset();
 +    free(vm_base); remove(argv[1]); return 0;
++}
+diff --git a/runtime/ppu/tests/test_lwcond.cpp b/runtime/ppu/tests/test_lwcond.cpp
+new file mode 100644
+index 0000000..662cee8
+--- /dev/null
++++ b/runtime/ppu/tests/test_lwcond.cpp
+@@ -0,0 +1,171 @@
++/* Active context handlers against guest memory, not the inactive C HLE model.
++ * No game assets. Build with PS3_LWCOND_TEST and assertions enabled. */
++#include <atomic>
++#include <cassert>
++#include <functional>
++#include <thread>
++#include <vector>
++#include "../ppu_sysprx.cpp"
++
++alignas(8) static uint8_t memory[0x10000];
++extern "C" {
++uint8_t* vm_base = memory;
++volatile long long g_gcm_ref_pub_count = 0;
++unsigned long long ppu_thread_cpu_us(unsigned) { return 0; }
++unsigned ppu_thread_prof_pc(unsigned) { return 0; }
++int ppu_thread_exists(uint64_t tid) { return tid >= 1 && tid <= 64; }
++uint32_t vm_read32(uint64_t a) { assert(a + 4 <= sizeof memory); return __builtin_bswap32(__atomic_load_n((uint32_t*)(memory + a), __ATOMIC_SEQ_CST)); }
++uint64_t vm_read64(uint64_t a) { assert(a + 8 <= sizeof memory); return __builtin_bswap64(__atomic_load_n((uint64_t*)(memory + a), __ATOMIC_SEQ_CST)); }
++void vm_write32(uint64_t a, uint32_t v) { assert(a + 4 <= sizeof memory); __atomic_store_n((uint32_t*)(memory + a), __builtin_bswap32(v), __ATOMIC_SEQ_CST); }
++void vm_write64(uint64_t a, uint64_t v) { assert(a + 8 <= sizeof memory); __atomic_store_n((uint64_t*)(memory + a), __builtin_bswap64(v), __ATOMIC_SEQ_CST); }
++}
++static std::function<void(uint32_t)> park_hook;
++void lwc_test_before_park(uint32_t addr) { if (park_hook) park_hook(addr); }
++static constexpr uint32_t mutex_ea = 0x100, cond_ea = 0x200;
++static ppu_context context(uint64_t id) { ppu_context c = {}; c.thread_id = id; return c; }
++static uint32_t call(void (*fn)(ppu_context*), ppu_context& c, uint32_t a, uint64_t b = 0)
++{
++    c.gpr[3] = a; c.gpr[4] = b; fn(&c); return (uint32_t)c.gpr[3];
++}
++static void lock(ppu_context& c) { assert(call(sys_lwmutex_lock, c, mutex_ea) == 0); }
++static void unlock(ppu_context& c) { assert(call(sys_lwmutex_unlock, c, mutex_ea) == 0); }
++static unsigned queued()
++{
++    auto q = lwc_find(cond_ea); if (!q) return 0;
++    std::lock_guard<std::mutex> guard(q->lock);
++    unsigned n = 0; for (auto w : q->waiters) if (!w->selected) ++n; return n;
++}
++template<class F> static void until(F predicate)
++{
++    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++    while (!predicate()) { assert(std::chrono::steady_clock::now() < end); std::this_thread::yield(); }
++}
++static void fresh(ppu_context& c)
++{
++    assert(call(sys_lwmutex_create, c, mutex_ea) == 0);
++    assert(call(sys_lwcond_create, c, cond_ea, mutex_ea) == 0);
++}
++static void destroy(ppu_context& c) { assert(call(sys_lwcond_destroy, c, cond_ea) == 0); }
++
++int main(int argc, char**)
++{
++    auto main = context(1), signaler = context(2);
++    if (argc > 1) {
++        fresh(main); lock(main); lock(main);
++        assert(call(sys_lwcond_wait, main, cond_ea, 1) == 0);
++        assert(vm_read32(mutex_ea) == 1 && vm_read32(mutex_ea + LWM_RECUR) == 2);
++        unlock(main); unlock(main); destroy(main);
++        puts("PASS: polling escape hatch restores unconditional Sleep(1) success"); return 0;
++    }
++    fresh(main);
++    assert(call(sys_lwcond_wait, signaler, cond_ea, 100) == LWC_EPERM);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 9000) == LWC_ESRCH);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 1) == LWC_EPERM);
++    assert(call(sys_lwcond_signal, signaler, cond_ea) == 0);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, UINT32_MAX) == 0x80010006u);
++    lock(main);
++    assert(call(sys_lwcond_signal_to, main, cond_ea, UINT32_MAX) == LWC_EPERM);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, UINT32_MAX) == 0);
++    auto start = std::chrono::steady_clock::now();
++    assert(call(sys_lwcond_wait, main, cond_ea, 2000) == LWC_ETIMEDOUT);
++    assert(std::chrono::steady_clock::now() - start >= std::chrono::microseconds(2000));
++    assert(vm_read32(mutex_ea) == 1 && vm_read32(mutex_ea + LWM_RECUR) == 1);
++    unlock(main);
++    puts("PASS: owner errors, missing/nonwaiting targets, no pre-enqueue credit, microsecond timeout/relock");
++
++    for (bool held : {false, true}) {
++        park_hook = [&](uint32_t) {
++            if (held) lock(signaler);
++            assert(call(sys_lwcond_signal, signaler, cond_ea) == 0);
++            if (held) unlock(signaler);
++        };
++        lock(main); lock(main); lock(main);
++        assert(call(sys_lwcond_wait, main, cond_ea) == 0);
++        assert(vm_read32(mutex_ea) == 1 && vm_read32(mutex_ea + LWM_RECUR) == 3);
++        unlock(main); unlock(main); unlock(main);
++    }
++    park_hook = {};
++    puts("PASS: signal between semaphore release/park with and without ownership; recursion=3 preserved");
++
++    std::atomic<unsigned> completed {0};
++    std::vector<std::thread> threads;
++    for (unsigned id = 3; id < 9; ++id) threads.emplace_back([&, id] {
++        auto c = context(id); lock(c);
++        assert(call(sys_lwcond_wait, c, cond_ea) == 0);
++        assert(vm_read32(mutex_ea) == id); unlock(c); ++completed;
++    });
++    until([&] { return queued() == 6; });
++    assert(call(sys_lwcond_destroy, signaler, cond_ea) == LWC_EBUSY);
++    lock(signaler);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 7) == 0);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 7) == LWC_EPERM);
++    /* Destroy cannot retire a selected waiter blocked behind the signaler. */
++    assert(call(sys_lwcond_destroy, signaler, cond_ea) == LWC_EBUSY);
++    assert(queued() == 5); unlock(signaler);
++    until([&] { return completed == 1; });
++    assert(call(sys_lwcond_signal, signaler, cond_ea) == 0);
++    until([&] { return completed == 2; });
++    assert(queued() == 4);
++    assert(call(sys_lwcond_signal_all, signaler, cond_ea) == 0);
++    for (auto& t : threads) t.join();
++    assert(completed == 6 && queued() == 0);
++    puts("PASS: six waiters; one/all/target select exactly current nodes; destroy busy through relock");
++
++    /* Force timeout to complete while a different thread owns the mutex. */
++    std::atomic<uint32_t> result {0};
++    std::thread timed([&] { auto c = context(3); lock(c);
++        result = call(sys_lwcond_wait, c, cond_ea, 2000); unlock(c); });
++    until([&] { return queued() == 1; }); lock(signaler);
++    until([&] { return queued() == 0; });
++    assert(result == 0);  /* timeout must wait for the mutex before returning */
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 3) == LWC_EPERM);
++    unlock(signaler); timed.join(); assert(result == LWC_ETIMEDOUT);
++    puts("PASS: timeout removes target before relock, returns only after mutex reacquired");
++
++    /* Signals on either side of the timeout boundary must leave no credits. */
++    for (unsigned i = 0; i < 100; ++i) {
++        std::atomic<bool> done {false};
++        std::thread t([&] { auto c = context(3); lock(c);
++            auto r = call(sys_lwcond_wait, c, cond_ea, 500);
++            assert(r == 0 || r == LWC_ETIMEDOUT); unlock(c); done = true; });
++        until([&] { auto q = lwc_find(cond_ea); std::lock_guard<std::mutex> guard(q->lock); return q->active != 0 || done.load(); });
++        if (i & 1) std::this_thread::sleep_for(std::chrono::microseconds(600));
++        auto r = call(sys_lwcond_signal_to, signaler, cond_ea, 3);
++        assert(r == 0 || r == LWC_EPERM); t.join(); assert(queued() == 0);
++        lock(main); assert(call(sys_lwcond_wait, main, cond_ea, 1) == LWC_ETIMEDOUT); unlock(main);
++    }
++    puts("PASS: 100 timeout/signal races leave no stale target or signal credit");
++
++#ifndef _WIN32
++    /* Cancellation while parked must remove the node and unlock the queue. */
++    auto worker = [](void*) -> void* { auto c = context(4); lock(c);
++        call(sys_lwcond_wait, c, cond_ea); unlock(c); return nullptr; };
++    pthread_t thread; assert(pthread_create(&thread, nullptr, worker, nullptr) == 0);
++    until([&] { return queued() == 1; }); assert(pthread_cancel(thread) == 0);
++    void* status; assert(pthread_join(thread, &status) == 0); assert(status == PTHREAD_CANCELED);
++    assert(queued() == 0);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 4) == LWC_EPERM);
++    /* Cancellation during semaphore reacquisition must not poison s_lock. */
++    assert(pthread_create(&thread, nullptr, worker, nullptr) == 0);
++    until([&] { return queued() == 1; }); lock(signaler);
++    assert(call(sys_lwcond_signal_to, signaler, cond_ea, 4) == 0);
++    until([&] { auto q = lwc_find(cond_ea); std::lock_guard<std::mutex> guard(q->lock); return q->waiters.empty(); });
++    assert(pthread_cancel(thread) == 0);
++    assert(pthread_join(thread, &status) == 0); assert(status == PTHREAD_CANCELED);
++    unlock(signaler); lock(main); unlock(main);
++    puts("PASS: cancellation while parked and during relock removes node without poisoning either lock");
++#endif
++    auto old_id = vm_read32(cond_ea + 4); destroy(main);
++    assert(call(sys_lwcond_signal, signaler, cond_ea) == LWC_ESRCH);
++    assert(call(sys_lwcond_wait, main, cond_ea) == LWC_ESRCH);
++    fresh(main); assert(vm_read32(cond_ea + 4) != old_id);
++    auto new_id = vm_read32(cond_ea + 4); vm_write32(cond_ea + 4, old_id);
++    assert(call(sys_lwcond_signal, signaler, cond_ea) == LWC_ESRCH);
++    vm_write32(cond_ea + 4, new_id);
++    lock(main); assert(call(sys_lwcond_wait, main, cond_ea, 1) == LWC_ETIMEDOUT);
++    /* Cross-thread release intentionally remains supported by the lwmutex. */
++    std::thread release([&] { unlock(signaler); }); release.join();
++    lock(signaler); unlock(signaler); destroy(main);
++    puts("PASS: destroy/recreate rejects stale queue identity; cross-thread semaphore release");
++    puts("ALL LWCOND TESTS PASS");
 +}
 diff --git a/runtime/ppu/tests/test_runner_failures.py b/runtime/ppu/tests/test_runner_failures.py
 new file mode 100644
@@ -19683,7 +20766,7 @@ index 8d8e4aa..213a246 100644
                        ctx->gpr[0]._u32[0] & SPU_LS_MASK);
      if (__builtin_expect(g_spu_smc_watch != 0, 0))
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
-index 90f3221..c2792d8 100644
+index 90f3221..42d7a28 100644
 --- a/runtime/spu/spu_dma.h
 +++ b/runtime/spu/spu_dma.h
 @@ -16,6 +16,7 @@
@@ -19694,7 +20777,7 @@ index 90f3221..c2792d8 100644
  #include <stdint.h>
  #include <string.h>
  #include <stdlib.h>
-@@ -161,6 +162,47 @@ static inline int mfc_is_fence(uint32_t cmd)
+@@ -161,6 +162,50 @@ static inline int mfc_is_fence(uint32_t cmd)
      return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
  }
  
@@ -19724,16 +20807,19 @@ index 90f3221..c2792d8 100644
 +    static SPU_THREAD_LOCAL uint32_t last_ea, last_lsa, last_size, last_cmd, last_pc, repeats;
 +    static SPU_THREAD_LOCAL uint8_t last[128];
 +    if (!ps3_poll_enabled || !mfc_is_get(cmd) || size > sizeof last) {
-+        last_ctx = NULL; repeats = 0; return;
++        last_ctx = NULL; repeats = 0; ps3_poll_reset(); return;
 +    }
 +    if (last_ctx == spu && last_ea == ea && last_lsa == lsa && last_size == size &&
 +        last_cmd == cmd && last_pc == spu->pc && !memcmp(last, delivered, size)) {
 +        if (repeats < 40) repeats++;
 +        if (repeats >= 32) {
-+            ps3_poll_backoff(repeats, ea, delivered, size);
++            if (ps3_spu_poll_idle_graphics(spu->image_id))
++                ps3_poll_backoff_idle_graphics(repeats, ea, delivered, size);
++            else
++                ps3_poll_backoff(repeats, ea, delivered, size);
 +            mfc_copy(delivered, vm_base + ea, size);
 +        }
-+    } else repeats = 0;
++    } else { repeats = 0; ps3_poll_reset(); }
 +    last_ctx = spu; last_ea = ea; last_lsa = lsa; last_size = size;
 +    last_cmd = cmd; last_pc = spu->pc;
 +    memcpy(last, delivered, size);
@@ -19742,7 +20828,7 @@ index 90f3221..c2792d8 100644
  /*
   * Execute a single DMA transfer between local store and main memory.
   * Returns 0 on success, -1 on error.
-@@ -561,7 +603,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+@@ -561,7 +606,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                }
            } }
          /* GET: main memory -> local store */
@@ -19752,7 +20838,7 @@ index 90f3221..c2792d8 100644
          /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
           * dword = the completion-word EA arriving in a job buffer. */
          { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
-@@ -646,14 +689,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+@@ -646,14 +692,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              }
              if (span_reserved) {
                  spu_lockline_lock();
@@ -19769,7 +20855,7 @@ index 90f3221..c2792d8 100644
                  for (uint32_t a = a0; ; a += 128u) {
                      if (spu_coh_is_reserved(a)) {
                          spu_lockline_lock();
-@@ -664,6 +707,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+@@ -664,6 +710,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                  }
              }
          }
@@ -19778,7 +20864,7 @@ index 90f3221..c2792d8 100644
          /* Tell whoever is listening where this PUT landed.
           *
           * A title whose SPUs build the RSX command stream never tells libgcm
-@@ -1170,17 +1215,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+@@ -1170,17 +1218,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          }
      }
  
@@ -19807,7 +20893,7 @@ index 90f3221..c2792d8 100644
            if (++s_rep >= s_limit) {
                s_rep = 0;   /* re-arm: the chain may run this job again */
                extern void spu_halt(spu_context*);
-@@ -1191,7 +1236,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+@@ -1191,7 +1239,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                fflush(stderr);
                spu_halt(spu);
            }
@@ -21237,7 +22323,7 @@ index dbe84c4..d21a821 100644
  /* Syscall handlers */
  int64_t sys_fs_open(ppu_context* ctx);
 diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
-index fb3906a..d11d76a 100644
+index fb3906a..07ffda0 100644
 --- a/runtime/syscalls/sys_ppu_thread.c
 +++ b/runtime/syscalls/sys_ppu_thread.c
 @@ -2,6 +2,8 @@
@@ -21258,18 +22344,41 @@ index fb3906a..d11d76a 100644
  /* ---------------------------------------------------------------------------
   * Globals
   * -----------------------------------------------------------------------*/
-@@ -104,6 +108,10 @@ static void* ppu_host_thread_proc(void* param)
+@@ -94,6 +98,22 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
+     return t;
+ }
+ 
++/* Strict existence query for targeted synchronization signals. Unlike the
++ * priority-query compatibility fallback, an unknown id must remain ESRCH. */
++int ppu_thread_exists(uint64_t tid)
++{
++    table_lock();
++    int exists = find_thread(tid) != NULL;
++    table_unlock();
++    return exists;
++}
++
++/* Ports may classify guest PPU roles; the SDK preserves interactive QoS. */
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((weak))
++#endif
++int ps3_ppu_thread_interactive(const char* name) { (void)name; return 1; }
++
+ /* ---------------------------------------------------------------------------
+  * Host thread entry point
+  * -----------------------------------------------------------------------*/
+@@ -104,6 +124,10 @@ static void* ppu_host_thread_proc(void* param)
  #endif
  {
      ppu_thread_info* info = (ppu_thread_info*)param;
 +    table_lock();
 +    ps3_guest_worker_register(info->state != PPU_THREAD_STATE_DETACHED);
 +    table_unlock();
-+    ps3_poll_thread_start(info->name, 1);
++    ps3_poll_thread_start(info->name, ps3_ppu_thread_interactive(info->name));
  
  #ifdef _WIN32
      /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
-@@ -555,7 +563,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
+@@ -555,7 +579,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
  {
      uint64_t tid          = LV2_ARG_U64(ctx, 0);
      uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
@@ -21278,7 +22387,7 @@ index fb3906a..d11d76a 100644
  
      table_lock();
      ppu_thread_info* t = find_thread(tid);
-@@ -624,7 +632,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
+@@ -624,7 +648,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
       * Take the lock again afterwards for the teardown, which is what actually
       * needs it: nothing can claim this slot in between, because it is still
       * FINISHED rather than FREE until the line below. */
@@ -21287,7 +22396,7 @@ index fb3906a..d11d76a 100644
      table_lock();
      pthread_mutex_destroy(&t->finish_mutex);
      pthread_cond_destroy(&t->finish_cond);
-@@ -657,6 +665,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
+@@ -657,6 +681,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
          CloseHandle(t->host_thread);
          CloseHandle(t->finish_event);
  #else
@@ -21295,7 +22404,7 @@ index fb3906a..d11d76a 100644
          pthread_detach(t->host_thread);
          pthread_mutex_destroy(&t->finish_mutex);
          pthread_cond_destroy(&t->finish_cond);
-@@ -666,6 +675,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
+@@ -666,6 +691,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
          t->state = PPU_THREAD_STATE_DETACHED;
          t->joinable = 0;
  #ifndef _WIN32
@@ -21303,6 +22412,23 @@ index fb3906a..d11d76a 100644
          pthread_detach(t->host_thread);
  #endif
      }
+diff --git a/runtime/syscalls/sys_ppu_thread.h b/runtime/syscalls/sys_ppu_thread.h
+index a297bf5..f1f0f98 100644
+--- a/runtime/syscalls/sys_ppu_thread.h
++++ b/runtime/syscalls/sys_ppu_thread.h
+@@ -71,6 +71,12 @@ typedef struct ppu_thread_info {
+ 
+ } ppu_thread_info;
+ 
++/* Weak port QoS policy: 1 = interactive (default), 0 = default host QoS. */
++int ps3_ppu_thread_interactive(const char* name);
++
++/* Strict guest id lookup, including the registered main thread. */
++int ppu_thread_exists(uint64_t tid);
++
+ /* Global thread table */
+ extern ppu_thread_info g_ppu_threads[PPU_THREAD_MAX];
+ 
 diff --git a/runtime/syscalls/sys_semaphore.c b/runtime/syscalls/sys_semaphore.c
 index 19ecafc..74bc6e2 100644
 --- a/runtime/syscalls/sys_semaphore.c
