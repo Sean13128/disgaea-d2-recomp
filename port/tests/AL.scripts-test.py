@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-with tempfile.TemporaryDirectory(prefix='AL-scripts.', dir='/Volumes/Data/ai-tmp/codex') as tmp:
+with tempfile.TemporaryDirectory(prefix='AL-scripts.', dir=os.environ.get('D2_TEST_TMPDIR')) as tmp:
     work = Path(tmp)
     bin = work/'bin'; bin.mkdir()
     def executable(path, text):

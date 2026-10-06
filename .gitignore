@@ -4,6 +4,8 @@
 !/.gitignore
 !/OPERATIONS.md
 !/README.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
 !/patches/
 !/codex/
 /codex/*

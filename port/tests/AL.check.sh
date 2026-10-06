@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 build=${1:-port/build-al}
-scratch=$(mktemp -d /Volumes/Data/ai-tmp/codex/AL-check.XXXXXX)
+scratch=$(mktemp -d "${D2_TEST_TMPDIR:-${TMPDIR:-/tmp}}/AL-check.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 python3 port/tests/AL.scripts-test.py
 clang -std=gnu17 -fsanitize=address,undefined -g -I ps3recomp -I ps3recomp/include \
