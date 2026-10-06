@@ -1,5 +1,11 @@
 # Disgaea D2 — native macOS port
 
+A note from the human
+This project was built almost entirely by AI coding agents (Anthropic's Claude and OpenAI's Codex). I directed and tested it. My goal was simple: play my own copy of Disgaea D2 natively on my Mac, and maybe do some modding later.
+
+Performance: on an M4 Mac it holds about 60 fps in battles and while exploring. It's been through a few optimization passes, and more are planned, focused on lowering CPU use and heat rather than raising the frame rate.
+Do what you want with this, it's just for fun since everyone else is doing this stuff. Might try to get it on android. 
+
 Disgaea D2: A Brighter Darkness (PS3, BLUS31313), statically recompiled to native
 arm64 macOS using [ps3recomp](https://github.com/sp00nznet/ps3recomp) and Metal.
 No game data, decrypted executables, generated lifts, or saves are tracked.
