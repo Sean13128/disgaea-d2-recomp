@@ -75,7 +75,7 @@ index 4ef4dfa..015a95a 100644
      # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
      #
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index b51fb7c..256e9d1 100644
+index b51fb7c..b751471 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -20,6 +20,25 @@
@@ -104,15 +104,107 @@ index b51fb7c..256e9d1 100644
  
  /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
   * rather than including sys_event.h to avoid pulling PPU context/syscall
-@@ -163,6 +182,7 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+@@ -88,7 +107,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
+ /* Portable threading */
+ #ifdef _WIN32
+   #include <windows.h>
+-  typedef HANDLE thread_t;
++  typedef HANDLE audio_thread_t;
+   typedef CRITICAL_SECTION mutex_t;
+   #define mutex_init(m)    InitializeCriticalSection(m)
+   #define mutex_destroy(m) DeleteCriticalSection(m)
+@@ -98,7 +117,11 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
+   #include <pthread.h>
+   #include <unistd.h>
+   #include <time.h>
+-  typedef pthread_t thread_t;
++  #include <errno.h>
++  #ifdef __APPLE__
++    #include <mach/mach_time.h>
++  #endif
++  typedef pthread_t audio_thread_t;
+   typedef pthread_mutex_t mutex_t;
+   #define mutex_init(m)    pthread_mutex_init(m, NULL)
+   #define mutex_destroy(m) pthread_mutex_destroy(m)
+@@ -143,8 +166,8 @@ static u64            s_audio_start_us = 0;
+ 
+ /* Mixing thread */
+ static unsigned long long g_audio_dropped;   /* frames the device had no room for */
+-static volatile int  s_mix_thread_running = 0;
+-static thread_t      s_mix_thread;
++static _Atomic int   s_mix_thread_running = 0;
++static audio_thread_t s_mix_thread;
+ #ifndef _WIN32
+ /* Is s_mix_thread a thread that exists and has not been joined? The Win32
+  * branch asks that of the HANDLE itself, which it nulls after closing;
+@@ -162,7 +185,40 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+ 
  #if AUDIO_BACKEND_SDL2
  
++/* Queue mode is retained as a diagnostic rollback. Callback mode owns a
++ * bounded four-block ring; the callback only copies PCM and signals room. */
++static int s_sdl_room_poll = 1;
++static SDL_mutex* s_sdl_lock;
++static SDL_cond* s_sdl_room;
++static float s_sdl_pcm[CELL_AUDIO_BLOCK_SAMPLES * 4 * 2];
++static u32 s_sdl_read, s_sdl_queued;
++static u64 s_sdl_callbacks, s_sdl_requested, s_sdl_underrun;
  static SDL_AudioDeviceID s_sdl_audio_dev = 0;
++static u64 s_audio_clock_waits, s_audio_room_waits;
++
++static void audio_sdl_callback(void* unused, Uint8* stream, int len)
++{
++    (void)unused;
++    memset(stream, 0, (size_t)len);
++    SDL_LockMutex(s_sdl_lock);
++    u32 frames = (u32)len / (2 * sizeof(float));
++    s_sdl_callbacks++; s_sdl_requested += frames;
++    if (frames > s_sdl_queued) {
++        s_sdl_underrun += frames - s_sdl_queued;
++        frames = s_sdl_queued;
++    }
++    const u32 capacity = CELL_AUDIO_BLOCK_SAMPLES * 4;
++    u32 first = capacity - s_sdl_read;
++    if (first > frames) first = frames;
++    memcpy(stream, s_sdl_pcm + s_sdl_read * 2, first * 2 * sizeof(float));
++    memcpy(stream + first * 2 * sizeof(float), s_sdl_pcm,
++           (frames - first) * 2 * sizeof(float));
++    s_sdl_read = (s_sdl_read + frames) % capacity;
++    s_sdl_queued -= frames;
++    if (frames) SDL_CondSignal(s_sdl_room);
++    SDL_UnlockMutex(s_sdl_lock);
++}
 +static u32 s_sdl_prime_frames = CELL_AUDIO_BLOCK_SAMPLES * 2;
  
  static int audio_backend_init(void)
  {
-@@ -187,7 +207,14 @@ static int audio_backend_init(void)
+@@ -179,15 +235,40 @@ static int audio_backend_init(void)
+     want.format   = AUDIO_F32SYS;
+     want.channels = 2;
+     want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
+-    want.callback = NULL; /* We'll use SDL_QueueAudio */
++    const char* poll = getenv("PS3_AUDIO_ROOM_POLL");
++    s_sdl_room_poll = poll && !strcmp(poll, "1");
++    if (!s_sdl_room_poll) {
++        s_sdl_lock = SDL_CreateMutex();
++        s_sdl_room = SDL_CreateCond();
++        if (!s_sdl_lock || !s_sdl_room) {
++            if (s_sdl_lock) SDL_DestroyMutex(s_sdl_lock);
++            if (s_sdl_room) SDL_DestroyCond(s_sdl_room);
++            s_sdl_lock = NULL; s_sdl_room = NULL;
++            return -1;
++        }
++        s_sdl_read = s_sdl_queued = 0;
++        s_sdl_callbacks = s_sdl_requested = s_sdl_underrun = 0;
++    }
++    want.callback = s_sdl_room_poll ? NULL : audio_sdl_callback;
+ 
+     s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+     if (s_sdl_audio_dev == 0) {
+         printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
++        if (s_sdl_lock) SDL_DestroyMutex(s_sdl_lock);
++        if (s_sdl_room) SDL_DestroyCond(s_sdl_room);
++        s_sdl_lock = NULL; s_sdl_room = NULL;
          return -1;
      }
  
@@ -124,15 +216,46 @@ index b51fb7c..256e9d1 100644
      SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
 +    printf("[cellAudio] SDL output driver=%s rate=%d channels=%u format=0x%04X samples=%u\n",
 +           SDL_GetCurrentAudioDriver(), have.freq, have.channels, have.format, have.samples);
++    printf("[cellAudio] SDL room wait=%s\n", s_sdl_room_poll ? "poll" : "callback");
      return 0;
  }
  
-@@ -202,8 +229,11 @@ static void audio_backend_shutdown(void)
+@@ -197,13 +278,41 @@ static void audio_backend_shutdown(void)
+         SDL_CloseAudioDevice(s_sdl_audio_dev);
+         s_sdl_audio_dev = 0;
+     }
++    if (s_sdl_lock) SDL_DestroyMutex(s_sdl_lock);
++    if (s_sdl_room) SDL_DestroyCond(s_sdl_room);
++    s_sdl_lock = NULL; s_sdl_room = NULL;
++}
++
++/* Caller holds s_sdl_lock. Only the host queue advances here, never guest PCM. */
++static void audio_sdl_append(const float* samples, u32 frames)
++{
++    const u32 capacity = CELL_AUDIO_BLOCK_SAMPLES * 4;
++    if (frames > capacity - s_sdl_queued) {
++        g_audio_dropped += frames - (capacity - s_sdl_queued);
++        frames = capacity - s_sdl_queued;
++    }
++    const u32 write = (s_sdl_read + s_sdl_queued) % capacity;
++    u32 first = capacity - write;
++    if (first > frames) first = frames;
++    memcpy(s_sdl_pcm + write * 2, samples, first * 2 * sizeof(float));
++    memcpy(s_sdl_pcm, samples + first * 2, (frames - first) * 2 * sizeof(float));
++    s_sdl_queued += frames;
+ }
+ 
  static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
  {
      if (s_sdl_audio_dev) {
 -        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
 -                       num_samples * 2 * sizeof(float));
++        if (!s_sdl_room_poll) {
++            SDL_LockMutex(s_sdl_lock);
++            audio_sdl_append(stereo_samples, num_samples);
++            SDL_UnlockMutex(s_sdl_lock);
++            return;
++        }
 +        if (SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
 +                          num_samples * 2 * sizeof(float)) < 0) {
 +            static int warned;
@@ -141,33 +264,61 @@ index b51fb7c..256e9d1 100644
      }
  }
  
-@@ -215,16 +245,18 @@ static int audio_backend_room(void)
+@@ -211,18 +320,48 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+ static int audio_backend_room(void)
+ {
+     if (!s_sdl_audio_dev) return -1;
++    if (!s_sdl_room_poll) {
++        SDL_LockMutex(s_sdl_lock);
++        const int room = s_sdl_queued <= CELL_AUDIO_BLOCK_SAMPLES * 3;
++        SDL_UnlockMutex(s_sdl_lock);
++        return room ? CELL_AUDIO_BLOCK_SAMPLES : 0;
++    }
+     return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
             CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
  }
  
 -static void audio_backend_wait(void) { SDL_Delay(1); }
--
--static u32 audio_backend_queued_samples(void)
 +/* Refill an empty device with silence, never by advancing the guest ring.
 + * Two host callback periods leave time for the guest to render after a hitch. */
 +static u32 audio_backend_prime(void)
++{
++    static const float silence[CELL_AUDIO_BLOCK_SAMPLES * 4 * 2];
++    if (!s_sdl_audio_dev) return 0;
++    if (!s_sdl_room_poll) {
++        SDL_LockMutex(s_sdl_lock);
++        u32 frames = 0;
++        if (!s_sdl_queued) {
++            frames = s_sdl_prime_frames;
++            audio_sdl_append(silence, frames);
++        }
++        SDL_UnlockMutex(s_sdl_lock);
++        return frames;
++    }
++    if (SDL_GetQueuedAudioSize(s_sdl_audio_dev)) return 0;
++    audio_backend_submit(silence, s_sdl_prime_frames);
++    return s_sdl_prime_frames;
++}
+ 
+-static u32 audio_backend_queued_samples(void)
++static void audio_backend_wait(void)
  {
 -    if (s_sdl_audio_dev) {
 -        return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
--    }
++    s_audio_room_waits++;
++    if (s_sdl_room_poll) { SDL_Delay(1); return; }
++    SDL_LockMutex(s_sdl_lock);
++    /* Register/recheck with the same lock as consumption. The finite device
++     * watchdog also covers a removed/stalled device without a shutdown hang. */
++    while (s_mix_thread_running && s_sdl_queued > CELL_AUDIO_BLOCK_SAMPLES * 3) {
++        if (SDL_CondWaitTimeout(s_sdl_room, s_sdl_lock, 100) != 0) break;
+     }
 -    return 0;
-+    static const float silence[CELL_AUDIO_BLOCK_SAMPLES * 4 * 2];
-+    if (!s_sdl_audio_dev || SDL_GetQueuedAudioSize(s_sdl_audio_dev)) return 0;
-+    audio_backend_submit(silence, s_sdl_prime_frames);
-+    return s_sdl_prime_frames;
++    SDL_UnlockMutex(s_sdl_lock);
  }
  
-+static void audio_backend_wait(void) { SDL_Delay(1); }
-+
  #endif /* AUDIO_BACKEND_SDL2 */
- 
- #if AUDIO_BACKEND_WASAPI
-@@ -380,6 +412,19 @@ static int audio_backend_room(void)
+@@ -380,6 +519,19 @@ static int audio_backend_room(void)
      return (int)(s_wasapi_buf_frames - padding);
  }
  
@@ -187,7 +338,7 @@ index b51fb7c..256e9d1 100644
  /* Block until the device has consumed some of its buffer. */
  static void audio_backend_wait(void)
  {
-@@ -508,11 +553,10 @@ static void audio_mix_one_block(void)
+@@ -508,11 +660,10 @@ static void audio_mix_one_block(void)
  
      mutex_unlock(&s_audio_mutex);
  
@@ -203,7 +354,7 @@ index b51fb7c..256e9d1 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -525,6 +569,7 @@ static void audio_notify_event_queues(void)
+@@ -525,6 +676,7 @@ static void audio_notify_event_queues(void)
       * registered notify queue, so the game's audio loop (blocked on
       * sys_event_queue_receive) wakes once per block and writes the next one.
       * Resolve the queue by its ipc_key (set via cellAudioSetNotifyEventQueue). */
@@ -211,7 +362,7 @@ index b51fb7c..256e9d1 100644
      for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
          if (!s_notify_queues[i].in_use) continue;
          uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
-@@ -532,6 +577,50 @@ static void audio_notify_event_queues(void)
+@@ -532,6 +684,79 @@ static void audio_notify_event_queues(void)
              sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
                                         0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
      }
@@ -225,6 +376,11 @@ index b51fb7c..256e9d1 100644
 +/* Allow 1 ms of host wakeup jitter without slowing the 48 kHz clock. */
 +#define AUDIO_RENDER_NS (AUDIO_PERIOD_NS - 1000000ULL)
 +
++#ifdef __APPLE__
++static mach_timebase_info_data_t s_audio_timebase;
++static pthread_once_t s_audio_timebase_once = PTHREAD_ONCE_INIT;
++static void audio_timebase_init(void) { mach_timebase_info(&s_audio_timebase); }
++#endif
 +static u64 audio_now_ns(void)
 +{
 +#ifdef _WIN32
@@ -240,16 +396,40 @@ index b51fb7c..256e9d1 100644
 +#endif
 +}
 +
-+static void audio_clock_wait(u64 remaining)
++static void audio_clock_wait(u64 deadline)
 +{
++    const u64 now = audio_now_ns();
++    if (now >= deadline) return;
++    const u64 remaining = deadline - now;
++#if AUDIO_BACKEND_SDL2
++    s_audio_clock_waits++;
++#endif
 +#ifdef _WIN32
 +    /* Sleep(1) may round up to a whole timer quantum. Yield near the deadline. */
 +    if (remaining > 2000000ULL) Sleep(1);
 +    else SwitchToThread();
 +#else
-+    /* Short sleeps avoid macOS coalescing a whole audio-period sleep. */
-+    usleep((useconds_t)(remaining > 2000000ULL ? 1000 :
-+                       remaining > 200000ULL ? 200 : (remaining + 999) / 1000));
++    static int poll = -1;
++    if (poll < 0) { const char* e = getenv("PS3_AUDIO_CLOCK_POLL"); poll = e && !strcmp(e, "1"); }
++    if (poll) {
++        usleep((useconds_t)(remaining > 2000000ULL ? 1000 :
++                           remaining > 200000ULL ? 200 : (remaining + 999) / 1000));
++        return;
++    }
++#ifdef __APPLE__
++    /* Keep guest timestamps/ATRAC diagnostics in CLOCK_MONOTONIC. Convert
++     * the remaining interval into one absolute Mach deadline, rounded up. */
++    pthread_once(&s_audio_timebase_once, audio_timebase_init);
++    const u64 ticks = mach_absolute_time() +
++        remaining / s_audio_timebase.numer * s_audio_timebase.denom +
++        (remaining % s_audio_timebase.numer * s_audio_timebase.denom +
++         s_audio_timebase.numer - 1) / s_audio_timebase.numer;
++    while (mach_wait_until(ticks) == KERN_ABORTED) {}
++    pthread_testcancel();
++#else
++    const struct timespec end = {deadline / 1000000000ULL, deadline % 1000000000ULL};
++    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &end, NULL) == EINTR) {}
++#endif
 +#endif
 +}
 +
@@ -262,7 +442,7 @@ index b51fb7c..256e9d1 100644
  }
  
  #ifdef _WIN32
-@@ -540,28 +629,22 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -540,28 +765,22 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      (void)arg;
      printf("[cellAudio] Mixing thread started\n");
  
@@ -297,13 +477,13 @@ index b51fb7c..256e9d1 100644
 -                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
 -        }
 +        const u64 now = audio_now_ns();
-+        if (now < deadline) { audio_clock_wait(deadline - now); continue; }
++        if (now < deadline) { audio_clock_wait(deadline); continue; }
 +        audio_trace_recovery(blocks, now - deadline, 0);
 +        if (now - deadline > AUDIO_PERIOD_NS * 3) deadline = now;
          blocks++;
          /* Mix and submit one block */
          audio_mix_one_block();
-@@ -597,28 +680,90 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -597,28 +816,106 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
  
          /* Notify event queues */
          audio_notify_event_queues();
@@ -349,6 +529,22 @@ index b51fb7c..256e9d1 100644
 +        if (rate && now - last_ns >= 5000000000ULL) {
 +            fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%\n",
 +                    count * 1000000000.0 / (now - last_ns), 100.0 * silent / count);
++#if AUDIO_BACKEND_SDL2
++            fprintf(stderr, "[audio-waits] interval=%.3fs clock=%llu room=%llu\n",
++                    (now - last_ns) / 1e9, (unsigned long long)s_audio_clock_waits,
++                    (unsigned long long)s_audio_room_waits);
++            s_audio_clock_waits = s_audio_room_waits = 0;
++            if (!s_sdl_room_poll && s_sdl_lock) {
++                SDL_LockMutex(s_sdl_lock);
++                const u64 callbacks = s_sdl_callbacks, requested = s_sdl_requested, underrun = s_sdl_underrun;
++                const u32 queued = s_sdl_queued;
++                s_sdl_callbacks = s_sdl_requested = s_sdl_underrun = 0;
++                SDL_UnlockMutex(s_sdl_lock);
++                fprintf(stderr, "[audio-device] interval=%.3fs callbacks=%llu requested=%llu underrun=%llu queued=%u\n",
++                        (now - last_ns) / 1e9, (unsigned long long)callbacks,
++                        (unsigned long long)requested, (unsigned long long)underrun, queued);
++            }
++#endif
 +            count = silent = 0;
 +            last_ns = now;
 +        }
@@ -374,7 +570,7 @@ index b51fb7c..256e9d1 100644
 +        const int room = audio_backend_room();
 +        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
 +        const u64 now = audio_now_ns();
-+        if (now < deadline) { audio_clock_wait(deadline - now); continue; }
++        if (now < deadline) { audio_clock_wait(deadline); continue; }
 +        audio_trace_recovery(blocks, now - deadline, 0);
 +        if (now - deadline > AUDIO_PERIOD_NS * 3) deadline = now;
 +        blocks++;
@@ -401,7 +597,21 @@ index b51fb7c..256e9d1 100644
      }
  
      printf("[cellAudio] Mixing thread stopped\n");
-@@ -999,8 +1144,16 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
+@@ -650,6 +947,13 @@ static int audio_start_mix_thread(void)
+ static void audio_stop_mix_thread(void)
+ {
+     s_mix_thread_running = 0;
++#if AUDIO_BACKEND_SDL2
++    if (s_sdl_room) {
++        SDL_LockMutex(s_sdl_lock);
++        SDL_CondBroadcast(s_sdl_room);
++        SDL_UnlockMutex(s_sdl_lock);
++    }
++#endif
+ #ifdef _WIN32
+     if (s_mix_thread) {
+         WaitForSingleObject(s_mix_thread, 2000);
+@@ -999,8 +1303,16 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
      if (!s_audio_initialized)
          return CELL_AUDIO_ERROR_NOT_INIT;
  
@@ -497,6 +707,158 @@ index 0000000..86e51eb
 +    assert(events==3200 && p->read_index==3200);
 +    mutex_destroy(&s_audio_mutex); free(vm_base);
 +    puts("[AP audio gain] muted/zero start + live volume/mute/focus gain: 3200 guest blocks/events, output-only scaling: PASS");
++}
+diff --git a/libs/audio/tests/test_audio_wait.c b/libs/audio/tests/test_audio_wait.c
+new file mode 100644
+index 0000000..47bcc53
+--- /dev/null
++++ b/libs/audio/tests/test_audio_wait.c
+@@ -0,0 +1,146 @@
++/* Real cellAudio deadline and callback-room paths, no game/device required. */
++#include "../cellAudio.c"
++#include <assert.h>
++
++uint8_t* vm_base;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t a) { (void)a; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void guest_poll_notify(uint32_t a, uint32_t n) { (void)a; (void)n; }
++void cellAtracHostCheckStalls(uint64_t n, int running) { (void)n; (void)running; }
++
++static pthread_mutex_t producer_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t producer_cond = PTHREAD_COND_INITIALIZER;
++static unsigned pending, blocks, rendered, silent, injections;
++static int done;
++static u64 previous, shortest = UINT64_MAX;
++uint32_t sys_event_find_queue_by_key(uint64_t key) { (void)key; return 1; }
++int sys_event_queue_push_by_id(uint32_t q, uint64_t s, uint64_t a, uint64_t b, uint64_t c)
++{
++    (void)q; (void)s; (void)a; (void)b; (void)c;
++    const u64 now = audio_now_ns();
++    if (previous && now - previous < shortest) shortest = now - previous;
++    previous = now;
++    int nz = 0;
++    for (unsigned i = 0; i < 512; i++) nz |= s_mix_buffer[i] != 0;
++    if (++blocks > 16 && !nz) silent++;
++    pthread_mutex_lock(&producer_lock);
++    pending++;
++    pthread_cond_signal(&producer_cond);
++    pthread_mutex_unlock(&producer_lock);
++    if ((blocks == 200 && !injections) || (blocks == 400 && injections == 1)) {
++        usleep(injections++ ? 30000 : 2000000);
++    }
++    return 0;
++}
++static void* produce(void* unused)
++{
++    (void)unused;
++    for (;;) {
++        pthread_mutex_lock(&producer_lock);
++        while (!pending && !done) pthread_cond_wait(&producer_cond, &producer_lock);
++        if (done) { pthread_mutex_unlock(&producer_lock); return NULL; }
++        pending--;
++        pthread_mutex_unlock(&producer_lock);
++        usleep(2000); /* require the existing producer reserve */
++        pthread_mutex_lock(&s_audio_mutex);
++        const u32 slot = s_ports[0].read_index % 8;
++        for (unsigned i = 0; i < 512; i++) vm_write32(0x1000 + (slot * 512 + i) * 4, 0x3e800000);
++        rendered++;
++        pthread_mutex_unlock(&s_audio_mutex);
++    }
++}
++static _Atomic int device_running;
++static void* consume(void* unused)
++{
++    (void)unused;
++    float pcm[1024];
++    while (device_running) {
++        /* Device requests two guest blocks at once (W's alternating-silence case). */
++        usleep(10666);
++        audio_sdl_callback(NULL, (Uint8*)pcm, sizeof pcm);
++    }
++    return NULL;
++}
++static _Atomic int parked;
++static void* wait_room(void* unused)
++{
++    (void)unused;
++    parked = 1;
++    audio_backend_wait();
++    return NULL;
++}
++int main(void)
++{
++    s_sdl_room_poll = 0;
++    s_sdl_lock = SDL_CreateMutex(); s_sdl_room = SDL_CreateCond();
++    assert(s_sdl_lock && s_sdl_room);
++    s_sdl_audio_dev = 1; /* callback ring never calls SDL with this mock handle */
++    s_mix_thread_running = 1;
++    float in[2048], out[2048];
++    for (unsigned i = 0; i < 2048; i++) in[i] = (float)(i + 1);
++    audio_backend_submit(in, 768);
++    audio_sdl_callback(NULL, (Uint8*)out, 512 * 2 * sizeof(float));
++    assert(!memcmp(in, out, 512 * 2 * sizeof(float)));
++    audio_backend_submit(in, 512); /* wraps around the four-block ring */
++    audio_sdl_callback(NULL, (Uint8*)out, sizeof out);
++    assert(!memcmp(out, in + 1024, 256 * 2 * sizeof(float)));
++    assert(!memcmp(out + 512, in, 512 * 2 * sizeof(float)));
++    for (unsigned i = 1536; i < 2048; i++) assert(out[i] == 0);
++    assert(s_sdl_queued == 0);
++    audio_backend_submit(in, 1024);
++    assert(audio_backend_room() == 0);
++    pthread_t waiter;
++    assert(!pthread_create(&waiter, NULL, wait_room, NULL));
++    while (!parked) sched_yield();
++    usleep(3000);
++    const u64 start = audio_now_ns();
++    audio_sdl_callback(NULL, (Uint8*)out, 512 * 2 * sizeof(float));
++    pthread_join(waiter, NULL);
++    assert(audio_now_ns() - start < 50000000);
++    assert(s_audio_room_waits == 1 && audio_backend_room() == CELL_AUDIO_BLOCK_SAMPLES);
++    puts("audio callback: wrap, PCM order, zero-fill, notified room recheck PASS");
++    const u64 deadline = audio_now_ns() + 12000000;
++    audio_clock_wait(deadline);
++    assert(audio_now_ns() >= deadline);
++    assert(s_audio_clock_waits == 1);
++    puts("audio absolute deadline: one wait, no early return PASS");
++    /* Shutdown must wake a full-ring waiter even if the device stops. */
++    s_sdl_queued = 1024; parked = 0;
++    assert(!pthread_create(&waiter, NULL, wait_room, NULL));
++    while (!parked) sched_yield();
++    usleep(3000);
++    audio_stop_mix_thread();
++    pthread_join(waiter, NULL);
++    s_sdl_queued = s_sdl_read = 0;
++    vm_base = calloc(1, 0x10000); assert(vm_base);
++    mutex_init(&s_audio_mutex);
++    s_ports[0].in_use = s_ports[0].running = 1;
++    s_ports[0].param.nChannel = 2; s_ports[0].param.nBlock = 8; s_ports[0].param.level = 1;
++    s_ports[0].buffer = (float*)(vm_base + 0x1000); s_ports[0].read_idx_addr = 0x100;
++    s_notify_queues[0].in_use = 1; s_notify_queues[0].key = 1;
++    pthread_t producer, device;
++    device_running = 1;
++    assert(!pthread_create(&producer, NULL, produce, NULL));
++    assert(!pthread_create(&device, NULL, consume, NULL));
++    assert(!audio_start_mix_thread());
++    usleep(8500000);
++    audio_stop_mix_thread();
++    device_running = 0; pthread_join(device, NULL);
++    pthread_mutex_lock(&producer_lock);
++    done = 1; pthread_cond_signal(&producer_cond);
++    pthread_mutex_unlock(&producer_lock); pthread_join(producer, NULL);
++    printf("audio callback clock: blocks=%u rendered=%u silent=%.3f%% min-gap=%.3fms stalls=%u PASS\n",
++           blocks, rendered, 100.0 * silent / (blocks - 16), shortest / 1e6, injections);
++    assert(blocks > 900 && injections == 2);
++    assert((double)silent / (blocks - 16) < 0.01 && shortest >= AUDIO_RENDER_NS);
++    mutex_destroy(&s_audio_mutex);
++    SDL_DestroyCond(s_sdl_room); SDL_DestroyMutex(s_sdl_lock);
++    free(vm_base);
++    return 0;
 +}
 diff --git a/libs/codec/avc_decoder.cpp b/libs/codec/avc_decoder.cpp
 new file mode 100644
@@ -11992,7 +12354,7 @@ index 0000000..2e07a6b
 +    puts("[P-test] guest-pointer dialogs, deferred sysutil callback/results, error/progress, abort/no callback: PASS");
 +}
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index cdb0464..ae75111 100644
+index cdb0464..8290cd1 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -24,6 +24,8 @@ static u32 s_gcm_context_ea = 0;
@@ -12659,7 +13021,7 @@ index cdb0464..ae75111 100644
 +        if (ps3_poll_enabled) {
 +            /* Label equality waits may observe transient reference values. */
 +            if (wait_ea == GCM_CONTROL_GUEST_ADDR)
-+                ps3_poll_backoff_idle_graphics(40, wait_ea, &raw, sizeof(raw));
++                ps3_poll_backoff_idle_fixed(40, wait_ea, &raw, sizeof(raw));
 +            else
 +                ps3_poll_backoff(40, wait_ea, &raw, sizeof(raw));
 +        } else
@@ -13188,7 +13550,15 @@ index cdb0464..ae75111 100644
          u32 ctx = vm_read32(s_gcm_ctx_out_ea);
          u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
          u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
-@@ -2048,20 +2548,37 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2037,6 +2537,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
+                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
+                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
++                ps3_poll_notify(GCM_CONTROL_GUEST_ADDR, 4);
+                 s_fifo_getoff = io_begin;                          /* get */
+                 put = io_begin;
+                 static int n = 0;
+@@ -2048,20 +2549,37 @@ static void gcm_rsx_process_fifo_unlocked(void)
          }
      }
  
@@ -13236,7 +13606,7 @@ index cdb0464..ae75111 100644
  }
  
  /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
-@@ -2089,6 +2606,19 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+@@ -2089,6 +2607,19 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      u32 current = vm_read32(ctx_ea + 0x8);
      if (current <= begin) return;                       /* nothing to recycle */
  
@@ -13256,7 +13626,7 @@ index cdb0464..ae75111 100644
      if (getenv("CELLMARK_BLINKDBG"))
          printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
  
-@@ -2101,12 +2631,32 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+@@ -2101,12 +2632,33 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                  vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                  g_gcm_fifo_drained_ea);
  
@@ -13274,6 +13644,7 @@ index cdb0464..ae75111 100644
 +    if (io_begin != 0xFFFFFFFFu && io_current != 0xFFFFFFFFu) {
 +        atomic_thread_fence(memory_order_release);
 +        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_current);
++        ps3_poll_notify(GCM_CONTROL_GUEST_ADDR, 4);
 +        cellGcm_fifo_kick();
 +        if (trace)
 +            fprintf(stderr, "[gcm-recycle] event=kick phase=tail id=%u time_ns=%llu kicks=%llu drains=%llu\n",
@@ -13294,10 +13665,11 @@ index cdb0464..ae75111 100644
          vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
          /* The jump has to be in guest memory before `put` moves behind the
           * walker's `get`. Program order is not enough on arm64: the walker
-@@ -2114,20 +2664,39 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+@@ -2114,20 +2666,40 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
           * word at `current` before the jump lands there. */
          atomic_thread_fence(memory_order_release);
          vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
++        ps3_poll_notify(GCM_CONTROL_GUEST_ADDR, 4);
 +        cellGcm_fifo_kick();
 +        if (trace)
 +            fprintf(stderr, "[gcm-recycle] event=kick phase=jump id=%u time_ns=%llu kicks=%llu drains=%llu\n",
@@ -13342,7 +13714,7 @@ index cdb0464..ae75111 100644
  
      if (s_recdbg)
          fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
-@@ -2158,8 +2727,9 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
+@@ -2158,8 +2730,9 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
       * always in RSX local memory (location 0). */
      if (rsx_live_draw_enabled())
          rsx_live_draw_set_display_buffer(bufferId, 0, offset, pitch, width, height);
@@ -13354,7 +13726,7 @@ index cdb0464..ae75111 100644
  
      return CELL_OK;
  }
-@@ -2240,29 +2810,22 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+@@ -2240,29 +2813,22 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
          return CELL_GCM_ERROR_INVALID_VALUE;
  
  
@@ -13399,7 +13771,7 @@ index cdb0464..ae75111 100644
  
      return CELL_OK;
  }
-@@ -2287,20 +2850,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+@@ -2287,20 +2853,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
       * ring wraps, and the recycle above keys on them. */
      if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
      vm_write32(cur, GCM_FLIP_MARKER | bufferId);
@@ -13426,7 +13798,7 @@ index cdb0464..ae75111 100644
      vm_write32(ctx + 8, cur + 4);
      return 1;
  }
-@@ -2317,12 +2872,21 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
+@@ -2317,12 +2875,21 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
  /* NID: 0xD01B570F */
  s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
  {
@@ -13452,7 +13824,7 @@ index cdb0464..ae75111 100644
  
      return cellGcmSetFlipCommand(bufferId);
  }
-@@ -2338,21 +2902,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+@@ -2338,21 +2905,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
      if (!s_display_buffer_set[bufferId])
          return CELL_GCM_ERROR_INVALID_VALUE;
  
@@ -13475,7 +13847,7 @@ index cdb0464..ae75111 100644
  }
  
  /* NID: 0x1BFAB6EE */
-@@ -2764,12 +3314,14 @@ u32 cellGcmResolveIO(u32 offset)
+@@ -2764,12 +3317,14 @@ u32 cellGcmResolveIO(u32 offset)
   * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
   * table hit returned the empty command-buffer EA instead of VRAM). Callers
   * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
@@ -13492,7 +13864,7 @@ index cdb0464..ae75111 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -3028,11 +3580,60 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
+@@ -3028,11 +3583,61 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
      return cellGcmSetFlipCommand(bufferId);
  }
  
@@ -13506,6 +13878,7 @@ index cdb0464..ae75111 100644
 +    if (io == 0xFFFFFFFFu) return;
 +    atomic_thread_fence(memory_order_release);
 +    vm_write32(GCM_CONTROL_GUEST_ADDR, io);
++    ps3_poll_notify(GCM_CONTROL_GUEST_ADDR, 4);
 +    cellGcm_fifo_kick();
 +}
 +
@@ -13554,7 +13927,7 @@ index cdb0464..ae75111 100644
      return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
  }
  
-@@ -3070,8 +3671,15 @@ void cellGcmTerminate(void)
+@@ -3070,8 +3675,15 @@ void cellGcmTerminate(void)
      printf("[cellGcmSys] Terminate\n");
  
      s_gcm_initialized = 0;
@@ -13570,7 +13943,7 @@ index cdb0464..ae75111 100644
      s_debug_level = CELL_GCM_DEBUG_LEVEL0;
      s_vblank_count = 0;
      s_io_map_reserved = 0;
-@@ -3144,11 +3752,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+@@ -3144,11 +3756,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
      return CELL_OK;
  }
  
@@ -13586,7 +13959,7 @@ index cdb0464..ae75111 100644
  }
  
  /* Return tile info for a given index */
-@@ -3258,6 +3866,7 @@ s32 cellGcmSetFlipImmediate(u32 bufferId)
+@@ -3258,6 +3870,7 @@ s32 cellGcmSetFlipImmediate(u32 bufferId)
  void cellGcmSetFlipStatus(u32 status)
  {
      s_flip_status = status;
@@ -13594,7 +13967,7 @@ index cdb0464..ae75111 100644
  }
  
  /* Store graphics handler callback */
-@@ -3449,8 +4058,23 @@ void cellGcm_syscall_iounmap(u32 io, u32 size)
+@@ -3449,8 +4062,24 @@ void cellGcm_syscall_iounmap(u32 io, u32 size)
   * from a stale offset through whatever the driver has since overwritten. */
  void cellGcm_syscall_set_fifo(u32 put, u32 get)
  {
@@ -13609,6 +13982,7 @@ index cdb0464..ae75111 100644
 +        s_host_initialized = 1;
 +    }
      vm_write32(GCM_CONTROL_GUEST_ADDR + 0, put);
++    ps3_poll_notify(GCM_CONTROL_GUEST_ADDR, 4);
      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
      s_fifo_getoff  = get;
      s_fifo_calloff = 0;
@@ -16703,14 +17077,14 @@ index 704ccef..d567e3c 100644
      test_scissor();
 diff --git a/runtime/platform/guest_poll.c b/runtime/platform/guest_poll.c
 new file mode 100644
-index 0000000..5808319
+index 0000000..8329e60
 --- /dev/null
 +++ b/runtime/platform/guest_poll.c
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,422 @@
 +/* Polling is a scheduling hint, never a substitute for a guest read/DMA.
 + * Notifications cover PPU stores and SPU writes. HLE/direct mapped writes
-+ * need not notify: every wait is bounded (100 us normally, up to 1 ms for opted-in idle
-+ * graphics polls) and callers re-read.
++ * need not notify: every wait is bounded (100 us normally, up to 8 ms for opted-in idle
++ * graphics polls, with a short cooldown after a missed notification) and callers re-read.
 + * No guest reservation is created, consumed, or invalidated by a poll. */
 +#include "guest_poll.h"
 +#include "win32_compat.h"
@@ -16740,15 +17114,18 @@ index 0000000..5808319
 +} poll_bucket;
 +static poll_bucket s_buckets[POLL_BUCKETS];
 +static pthread_once_t s_init = PTHREAD_ONCE_INIT;
-+static unsigned s_idle_cap_us = 1000;
++static unsigned s_idle_cap_us = 8000;
++static int s_idle_tune = 1;
++#define POLL_COOLDOWN_SECONDS 1.0
 +static int s_stats;
 +typedef struct poll_thread {
 +    uint32_t ea, size;
 +    unsigned delay_us;
 +    uint8_t snapshot[128];
 +    char name[64];
-+    uint64_t timeouts, notified, calls;
-+    double stats_time;
++    uint64_t timeouts, notified, timeout_changed, notified_changed, calls;
++    double stats_time, cooldown_until;
++    uint64_t idle_timeouts, idle_notified, idle_timeout_changed, idle_notified_changed, cooldowns;
 +} poll_thread;
 +static _Thread_local poll_thread s_poll;
 +void ps3_poll_reset(void) { s_poll.size = 0; s_poll.delay_us = 100; }
@@ -16771,11 +17148,21 @@ index 0000000..5808319
 +        snprintf(s_poll.name, sizeof s_poll.name, "host");
 +#endif
 +    }
-+    fprintf(stderr, "[poll-stats] thread=\"%s\" tid=%llx interval=%.3fs timeouts=%llu notified=%llu current_us=%u cap_us=%u\n",
++    fprintf(stderr, "[poll-stats] thread=\"%s\" tid=%llx interval=%.3fs timeouts=%llu notified=%llu timeout_changed=%llu notified_changed=%llu idle_timeouts=%llu idle_notified=%llu idle_timeout_changed=%llu idle_notified_changed=%llu cooldowns=%llu idle_cap_us=%u current_us=%u cap_us=%u\n",
 +            s_poll.name, (unsigned long long)(uintptr_t)pthread_self(), elapsed,
 +            (unsigned long long)s_poll.timeouts,
-+            (unsigned long long)s_poll.notified, s_poll.delay_us, cap_us);
++            (unsigned long long)s_poll.notified,
++            (unsigned long long)s_poll.timeout_changed,
++            (unsigned long long)s_poll.notified_changed,
++            (unsigned long long)s_poll.idle_timeouts, (unsigned long long)s_poll.idle_notified,
++            (unsigned long long)s_poll.idle_timeout_changed, (unsigned long long)s_poll.idle_notified_changed,
++            (unsigned long long)s_poll.cooldowns,
++            s_idle_tune && now < s_poll.cooldown_until ? 100 : s_idle_cap_us,
++            s_poll.delay_us, cap_us);
 +    s_poll.timeouts = s_poll.notified = 0;
++    s_poll.timeout_changed = s_poll.notified_changed = 0;
++    s_poll.idle_timeouts = s_poll.idle_notified = 0;
++    s_poll.idle_timeout_changed = s_poll.idle_notified_changed = s_poll.cooldowns = 0;
 +    s_poll.stats_time = now;
 +}
 +static poll_bucket* poll_slot(uint32_t ea)
@@ -16786,11 +17173,14 @@ index 0000000..5808319
 +{
 +    const char* e = getenv("PS3_POLL_BACKOFF");
 +    ps3_poll_enabled = !(e && *e == '0');
++    e = getenv("PS3_POLL_IDLE_TUNE");
++    s_idle_tune = !(e && !strcmp(e, "0"));
++    if (!s_idle_tune) s_idle_cap_us = 1000;
 +    e = getenv("PS3_POLL_IDLE_CAP_US");
 +    if (e) {
 +        char* end;
 +        unsigned long cap = strtoul(e, &end, 10);
-+        if (*e && !*end && cap >= 100 && cap <= 1000) s_idle_cap_us = (unsigned)cap;
++        if (*e && !*end && cap >= 100 && cap <= 8000) s_idle_cap_us = (unsigned)cap;
 +    }
 +    e = getenv("PS3_POLL_STATS");
 +    s_stats = e && *e == '1';
@@ -16922,7 +17312,12 @@ index 0000000..5808319
 +    if (repeats < 40) { ps3_poll_reset(); sched_yield(); return; }
 +    /* Cross-line polls retain the existing yield/re-read fallback. */
 +    if (size > 128 - (ea & 127)) { ps3_poll_reset(); sched_yield(); return; }
-+    unsigned cap_us = idle ? s_idle_cap_us : 100;
++    /* idle 2 = fixed 1ms ladder, no cooldown: the RSX PUT watcher sees rare
++     * missed notifications on real Metal, and the cooldown made it wake more. */
++    unsigned cap_us = idle == 2 ? 1000 : idle ? s_idle_cap_us : 100;
++    if (idle == 1 && s_idle_tune && s_poll.cooldown_until && poll_now() < s_poll.cooldown_until)
++        cap_us = 100;
++    if (s_poll.delay_us > cap_us) s_poll.delay_us = cap_us;
 +    if (s_stats && !s_poll.stats_time) s_poll.stats_time = poll_now();
 +    if (!idle || s_poll.ea != ea || s_poll.size != size ||
 +        memcmp(s_poll.snapshot, value, size)) {
@@ -16951,11 +17346,27 @@ index 0000000..5808319
 +        if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
 +        rc = pthread_cond_timedwait(&b->changed, &b->lock, &deadline);
 +#endif
++        int changed = memcmp(vm_base + ea, value, size) != 0;
++        if (idle == 1 && changed && rc == ETIMEDOUT && s_idle_tune) {
++            /* Keep this per-thread penalty across snapshot/EA/caller resets.
++             * Otherwise the next sequence would immediately grow the cap. */
++            s_poll.cooldown_until = poll_now() + POLL_COOLDOWN_SECONDS;
++            s_poll.cooldowns++;
++            cap_us = 100;
++        }
 +        if (s_stats) {
++            if (idle) {
++                if (rc == ETIMEDOUT) s_poll.idle_timeouts++;
++                else if (!rc) s_poll.idle_notified++;
++                if (changed && rc == ETIMEDOUT) s_poll.idle_timeout_changed++;
++                else if (changed && !rc) s_poll.idle_notified_changed++;
++            }
++            if (changed && rc == ETIMEDOUT) s_poll.timeout_changed++;
++            else if (changed && !rc) s_poll.notified_changed++;
 +            if (rc == ETIMEDOUT) s_poll.timeouts++;
 +            else if (!rc) s_poll.notified++;
 +        }
-+        if (memcmp(vm_base + ea, value, size)) ps3_poll_reset();
++        if (changed) ps3_poll_reset();
 +        else if (rc == ETIMEDOUT && s_poll.delay_us < cap_us) {
 +            s_poll.delay_us *= 2;
 +            if (s_poll.delay_us > cap_us) s_poll.delay_us = cap_us;
@@ -16974,6 +17385,10 @@ index 0000000..5808319
 +void ps3_poll_backoff_idle_graphics(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
 +{
 +    poll_backoff(repeats, ea, value, size, 1);
++}
++void ps3_poll_backoff_idle_fixed(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{
++    poll_backoff(repeats, ea, value, size, 2);
 +}
 +void ps3_poll_notify_slow(uint32_t ea, uint32_t size)
 +{
@@ -17074,6 +17489,8 @@ index 0000000..5808319
 +void ps3_poll_reset(void) {}
 +void ps3_poll_backoff_idle_graphics(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
 +{ ps3_poll_backoff(repeats, ea, value, size); }
++void ps3_poll_backoff_idle_fixed(uint32_t repeats, uint32_t ea, const void* value, uint32_t size)
++{ ps3_poll_backoff(repeats, ea, value, size); }
 +void ps3_poll_thread_start(const char* name, int interactive) { (void)name; (void)interactive; }
 +void ps3_guest_worker_register(int joinable) { (void)joinable; }
 +void ps3_guest_workers_request_stop(void) {}
@@ -17088,10 +17505,10 @@ index 0000000..5808319
 +int ps3_spu_poll_idle_graphics(int image_id) { (void)image_id; return 0; }
 diff --git a/runtime/platform/guest_poll.h b/runtime/platform/guest_poll.h
 new file mode 100644
-index 0000000..0e13495
+index 0000000..9417a22
 --- /dev/null
 +++ b/runtime/platform/guest_poll.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,52 @@
 +/* Bounded host waits for unchanged guest-memory polls. */
 +#ifndef PS3_GUEST_POLL_H
 +#define PS3_GUEST_POLL_H
@@ -17101,8 +17518,12 @@ index 0000000..0e13495
 +#endif
 +extern int ps3_poll_enabled;
 +void ps3_poll_backoff(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
-+/* Opt-in bounded adaptive wait; cap override accepts 100..1000 microseconds. */
++/* Opt-in bounded adaptive wait; cap override accepts 100..8000 microseconds.
++ * A timeout discovering changed bytes forces a 100us cap for one second.
++ * PS3_POLL_IDLE_TUNE=0 restores the fixed 1ms ladder. */
 +void ps3_poll_backoff_idle_graphics(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
++/* Idle wait on a fixed 100 -> 1000 us ladder, without the missed-notify cooldown. */
++void ps3_poll_backoff_idle_fixed(uint32_t repeats, uint32_t ea, const void* value, uint32_t size);
 +void ps3_poll_reset(void);
 +int ps3_spu_poll_idle_graphics(int image_id);
 +#ifndef _WIN32
@@ -17142,7 +17563,7 @@ index 0000000..0e13495
 +#endif
 diff --git a/runtime/platform/tests/test_guest_poll.c b/runtime/platform/tests/test_guest_poll.c
 new file mode 100644
-index 0000000..8933ae0
+index 0000000..810fed1
 --- /dev/null
 +++ b/runtime/platform/tests/test_guest_poll.c
 @@ -0,0 +1,98 @@
@@ -17223,9 +17644,9 @@ index 0000000..8933ae0
 +        }
 +        double returned = now();
 +        pthread_join(writer, NULL);
-+        assert(returned - published < 0.006);
++        assert(returned - published < 0.013);
 +    }
-+    puts("idle poll: 40 notified/unnotified publications within 1ms cap + 5ms scheduling tolerance PASS");
++    puts("idle poll: 40 notified/unnotified publications within 8ms cap + 5ms scheduling tolerance PASS");
 +    /* Race publication against zero->one waiter registration, including
 +     * deliberately omitted notifications. The production 100us timeout must
 +     * cover a relaxed-filter miss; no unbounded condition wait is permitted. */
@@ -17246,10 +17667,10 @@ index 0000000..8933ae0
 +}
 diff --git a/runtime/platform/tests/test_guest_poll_filter.c b/runtime/platform/tests/test_guest_poll_filter.c
 new file mode 100644
-index 0000000..b5337c2
+index 0000000..06cd2b7
 --- /dev/null
 +++ b/runtime/platform/tests/test_guest_poll_filter.c
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,293 @@
 +/* Standalone: clang -O2 -std=gnu17 -pthread test_guest_poll_filter.c -o test_guest_poll_filter
 + * Include the implementation to observe registration without production hooks.
 + * Extend only this test's wait to 200ms, so a missed notification cannot hide
@@ -17264,6 +17685,8 @@ index 0000000..b5337c2
 +static atomic_uint idle_parked;
 +static atomic_uint broadcasts;
 +static int normal_timeout;
++static int forced_result = -1;
++static uint32_t* forced_write;
 +static int test_broadcast(pthread_cond_t* cond)
 +{
 +    atomic_fetch_add(&broadcasts, 1);
@@ -17272,6 +17695,10 @@ index 0000000..b5337c2
 +#ifdef __APPLE__
 +static int test_wait(pthread_cond_t* cond, pthread_mutex_t* lock, const struct timespec* unused)
 +{
++    if (forced_result >= 0) {
++        if (forced_write) __atomic_store_n(forced_write, 1, __ATOMIC_RELEASE);
++        return forced_result;
++    }
 +    if (normal_timeout) {
 +        if (unused->tv_nsec == 20000000) atomic_store(&idle_parked, 1);
 +        return pthread_cond_timedwait_relative_np(cond, lock, unused);
@@ -17283,6 +17710,10 @@ index 0000000..b5337c2
 +#else
 +static int test_wait(pthread_cond_t* cond, pthread_mutex_t* lock, const struct timespec* unused)
 +{
++    if (forced_result >= 0) {
++        if (forced_write) __atomic_store_n(forced_write, 1, __ATOMIC_RELEASE);
++        return forced_result;
++    }
 +    if (normal_timeout) {
 +        /* The idle notification test marks its final wait explicitly below. */
 +        return pthread_cond_timedwait(cond, lock, unused);
@@ -17332,6 +17763,7 @@ index 0000000..b5337c2
 +     * relying on sub-millisecond host scheduling. Production cap is 1ms. */
 +    for (unsigned i = 0; i < 8; i++) ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
 +    assert(s_poll.delay_us == 1000);
++    s_idle_cap_us = 20000; /* diagnostic only: production parser stops at 8000 */
 +    s_poll.delay_us = 20000;
 +#ifndef __APPLE__
 +    atomic_store(&idle_parked, 1);
@@ -17351,6 +17783,7 @@ index 0000000..b5337c2
 +}
 +static void adaptive_checks(uint32_t collision)
 +{
++    s_idle_cap_us = 1000;
 +    normal_timeout = 1;
 +    uint32_t zero = 0, one = 1;
 +    __atomic_store_n((uint32_t*)(memory + 128), 0, __ATOMIC_RELEASE);
@@ -17393,6 +17826,7 @@ index 0000000..b5337c2
 +    pthread_join(waiter, NULL);
 +    double latency = now() - start;
 +    assert(latency < 0.005); /* well before the test's 20ms wait */
++    s_idle_cap_us = 1000;
 +    printf("adaptive notified latency %.3fms (20ms diagnostic wait)\n", latency * 1000);
 +    /* Unnotified publication must return by production cap + 5ms tolerance. */
 +    memcpy(memory + 128, &zero, 4);
@@ -17432,6 +17866,50 @@ index 0000000..b5337c2
 +    assert(!pthread_mutex_trylock(&poll_slot(128)->lock));
 +    pthread_mutex_unlock(&poll_slot(128)->lock);
 +    puts("adaptive poll: timeout ladder, snapshot/EA/size/sequence reset, short callers, cross-line, collision, cancellation PASS");
++}
++/* Inject a store exactly at a timeout/notification return. This exercises
++ * the real post-wait recheck without relying on sub-ms scheduler races. */
++static void tuning_checks(void)
++{
++    uint32_t zero = 0;
++    s_idle_cap_us = 8000; s_idle_tune = 1; s_stats = 1;
++    s_poll.cooldown_until = 0; ps3_poll_reset();
++    memcpy(memory + 128, &zero, 4);
++    forced_result = ETIMEDOUT;
++    unsigned expected[] = {200, 400, 800, 1600, 3200, 6400, 8000, 8000};
++    for (unsigned i = 0; i < 8; i++) {
++        ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++        assert(s_poll.delay_us == expected[i]);
++    }
++    forced_write = (uint32_t*)(memory + 128);
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 100 && s_poll.cooldown_until > poll_now());
++    assert(s_poll.cooldowns == 1 && s_poll.idle_timeout_changed == 1);
++    forced_write = NULL;
++    memcpy(memory + 128, &zero, 4);
++    ps3_poll_reset(); /* sequence/snapshot resets must retain the penalty */
++    for (unsigned i = 0; i < 8; i++) ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 100);
++    s_poll.cooldown_until = poll_now() - 1;
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 200);
++    forced_result = 0; /* a signaled changed value is not a missed notify */
++    forced_write = (uint32_t*)(memory + 128);
++    ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 100 && s_poll.cooldown_until < poll_now());
++    assert(s_poll.cooldowns == 1 && s_poll.idle_notified_changed == 1);
++    forced_write = NULL; forced_result = ETIMEDOUT;
++    memcpy(memory + 128, &zero, 4);
++    for (unsigned i = 0; i < 8; i++) ps3_poll_backoff_idle_graphics(40, 128, &zero, 4);
++    assert(s_poll.delay_us == 8000);
++    /* Short/equality callers do not inherit the idle ladder or penalty. */
++    forced_write = (uint32_t*)(memory + 128);
++    ps3_poll_backoff(40, 128, &zero, 4);
++    assert(s_poll.cooldowns == 1 && s_poll.delay_us == 100);
++    forced_write = NULL; forced_result = -1;
++    s_poll.cooldown_until = 0; s_stats = 0;
++    ps3_poll_reset();
++    puts("self-tuning poll: 8ms ladder, missed-notify 100us cooldown, persistent reset, expiry, notified and short paths PASS");
 +}
 +int main(void)
 +{
@@ -17482,6 +17960,7 @@ index 0000000..b5337c2
 +    ps3_poll_backoff(40, 127, &zero, 4);
 +    assert(now() - start < 0.1);
 +    adaptive_checks(collision);
++    tuning_checks();
 +    puts("guest poll filter: empty global fast path, 1000 registrations, hash collision, crossing store, prior publication PASS");
 +    return 0;
 +}

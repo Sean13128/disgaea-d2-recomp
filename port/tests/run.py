@@ -90,6 +90,10 @@ elif name == 'AP-audio-gain':
 elif name == 'AP-audio-init':
     emit_ppu_header()
     cmd = [cxx, '-std=c++20', *flags, '-DD2_GAME_VERSION=140', source('AP.audio-init-test.cpp')]
+elif name == 'AZ-gcm-put':
+    cmd += [source('AZ.gcm-put-test.c'), *platform]
+elif name == 'AZ-audio-wait':
+    cmd += [sdk/'libs/audio/tests/test_audio_wait.c', f'-L{brew}/lib', '-lSDL2']
 elif name == 'audio-clock':
     cmd += [source('Z.audio-clock.c'), f'-L{brew}/lib', '-lSDL2']
 elif name == 'filesystem':

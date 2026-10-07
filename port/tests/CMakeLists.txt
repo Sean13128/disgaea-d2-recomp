@@ -159,3 +159,16 @@ if(CMAKE_CXX_COMPILER_LOADED)
     add_test(NAME d2.AY-qos COMMAND d2_ay_qos)
     set_tests_properties(d2.AY-qos PROPERTIES LABELS "asset-free;cpu" TIMEOUT 10)
 endif()
+
+if(NOT WIN32)
+    add_test(NAME d2.AZ-gcm-put
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
+            AZ-gcm-put --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/AZ-gcm-put")
+    set_tests_properties(d2.AZ-gcm-put PROPERTIES LABELS "asset-free;cpu" TIMEOUT 30
+        ENVIRONMENT "PS3_POLL_IDLE_TUNE=1;PS3_POLL_IDLE_CAP_US=8000")
+    add_test(NAME d2.AZ-audio-wait
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
+            AZ-audio-wait --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/AZ-audio-wait")
+    set_tests_properties(d2.AZ-audio-wait PROPERTIES LABELS "asset-free;cpu" TIMEOUT 30
+        ENVIRONMENT "PS3_AUDIO_CLOCK_POLL=0;PS3_AUDIO_ROOM_POLL=0")
+endif()
