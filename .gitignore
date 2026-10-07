@@ -7,6 +7,8 @@
 !/LICENSE
 !/THIRD_PARTY_NOTICES.md
 !/patches/
+# Individual worker SDK exports; the combined patch and SDK.lock stay tracked.
+/patches/*-runtime.diff
 !/codex/
 /codex/*
 !/codex/*.md

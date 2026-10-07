@@ -1,0 +1,150 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index b1020e6..c563a8e 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -765,27 +765,37 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
+ }
+ 
+ /* One full-span mutation check per cached texture per presented frame.
+- * Four independent FNV streams remove the multiply dependency across every
+- * eight bytes. This is an in-memory cache key, never a persisted content id. */
++ * Eight independent FNV streams hide the multiply dependency while scanning
++ * each 64-byte block. This is an in-memory cache key, never a persisted
++ * content id. */
+ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
+                                     int* readable)
+ {
+     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+     if (!src) { *readable = 0; return 0; }
+     u64 h0 = 1469598103934665603ull, h1 = h0 + 1, h2 = h0 + 2, h3 = h0 + 3;
++    u64 h4 = h0 + 4, h5 = h0 + 5, h6 = h0 + 6, h7 = h0 + 7;
+     u32 i = 0;
+-    for (; span - i >= 32; i += 32) {
+-        u64 words[4];
++    for (; span - i >= 64; i += 64) {
++        u64 words[8];
+         memcpy(words, src + i, sizeof(words));
+         h0 = (h0 ^ words[0]) * 1099511628211ull;
+         h1 = (h1 ^ words[1]) * 1099511628211ull;
+         h2 = (h2 ^ words[2]) * 1099511628211ull;
+         h3 = (h3 ^ words[3]) * 1099511628211ull;
++        h4 = (h4 ^ words[4]) * 1099511628211ull;
++        h5 = (h5 ^ words[5]) * 1099511628211ull;
++        h6 = (h6 ^ words[6]) * 1099511628211ull;
++        h7 = (h7 ^ words[7]) * 1099511628211ull;
+     }
+     u64 hash = h0;
+     hash = (hash ^ h1) * 1099511628211ull;
+     hash = (hash ^ h2) * 1099511628211ull;
+     hash = (hash ^ h3) * 1099511628211ull;
++    hash = (hash ^ h4) * 1099511628211ull;
++    hash = (hash ^ h5) * 1099511628211ull;
++    hash = (hash ^ h6) * 1099511628211ull;
++    hash = (hash ^ h7) * 1099511628211ull;
+     for (; span - i >= 8; i += 8) {
+         u64 word;
+         memcpy(&word, src + i, sizeof(word));
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index d567e3c..d766563 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -579,6 +579,91 @@ static void test_texture_cache(void)
+     engine_down();
+ }
+ 
++/* Exercise every guest byte, including cube alignment padding. A lower mip
++ * or a different face changing must retire and re-upload the whole resource;
++ * the content check still runs only once per frame. */
++static void texture_mutations(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch,
++                               int cube, u32 expected_span)
++{
++    engine_up();
++    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 1u);
++    m(M_TEX_UNIT + 0x04, 2u | ((u32)cube << 2) | (2u << 4) |
++                          (fmt << 8) | (levels << 16));
++    m(M_TEX_UNIT + 0x18, (w << 16) | h);
++    m(0x1840u, pitch);
++
++    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
++    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
++    const u32 faces = cube ? 6u : 1u;
++    const u32 span = cube
++        ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) * faces
++        : lv[n - 1].offset + lv[n - 1].tl.face_bytes;
++    CHECK(span == expected_span, "mutation fixture span=%u (expected %u)",
++          span, expected_span);
++    u8* data = vm_base + TEX_OFFSET + 1u;
++    for (u32 i = 0; i < span; i++) data[i] = (u8)(i * 131u + i / 31u);
++    draw_triangle();
++
++    int correct = stub.n_texture_create == 1 &&
++                  stub.n_texture_upload == (int)(faces * n);
++    for (u32 byte = 0; byte < span && correct; byte++) {
++        const u32 old = stub.bound_tex[0];
++        const int creates = stub.n_texture_create;
++        const int uploads = stub.n_texture_upload;
++        const int releases = stub.n_texture_release;
++        data[byte] ^= (u8)(1u << (byte % 8));
++        rsx_draw_engine_present();
++        draw_triangle();
++        correct = stub.n_texture_create == creates + 1 &&
++                  stub.n_texture_upload == uploads + (int)(faces * n) &&
++                  stub.n_texture_release == releases + 1 &&
++                  stub.bound_tex[0] != old && !stub.alive[old];
++
++        draw_triangle();
++        rsx_draw_engine_present();
++        draw_triangle();
++        correct = correct && stub.n_texture_create == creates + 1 &&
++                  stub.n_texture_upload == uploads + (int)(faces * n) &&
++                  stub.n_texture_release == releases + 1;
++
++        /* Restoring the byte is another mutation in the following frame. */
++        data[byte] ^= (u8)(1u << (byte % 8));
++        rsx_draw_engine_present();
++        draw_triangle();
++        correct = correct && stub.n_texture_create == creates + 2 &&
++                  stub.n_texture_upload == uploads + (int)(2u * faces * n) &&
++                  stub.n_texture_release == releases + 2;
++    }
++    CHECK(correct, "all %u byte mutations re-upload; unchanged data reuses "
++                   "texture (%u mips, %u faces, pitch=%u)", span, n, faces, pitch);
++
++    /* Unreadable full spans leave the existing upload intact. */
++    const int creates = stub.n_texture_create, uploads = stub.n_texture_upload;
++    const u32 handle = stub.bound_tex[0], saved_size = ppu_vm_size;
++    ppu_vm_size = TEX_OFFSET + span;
++    rsx_draw_engine_present();
++    draw_triangle();
++    CHECK(stub.n_texture_create == creates && stub.n_texture_upload == uploads &&
++          stub.bound_tex[0] == handle,
++          "an unreadable span keeps the cached texture");
++    ppu_vm_size = saved_size;
++    engine_down();
++}
++
++static void test_texture_mutations(void)
++{
++    printf("-- full-span texture mutations\n");
++    /* R8 spans with short word/stripe tails, pitched rows, and mip pyramids. */
++    texture_mutations(0xA1u, 17, 1, 1, 0, 0, 17);
++    texture_mutations(0xA1u, 33, 1, 1, 0, 0, 33);
++    texture_mutations(0xA1u, 65, 1, 1, 0, 0, 65);
++    texture_mutations(0xA1u, 7, 3, 1, 11, 0, 33);
++    texture_mutations(0xA1u, 8, 8, 4, 0, 0, 85);
++    texture_mutations(0x81u, 8, 8, 4, 0, 0, 85); /* swizzled */
++    texture_mutations(0xA1u, 8, 8, 4, 0, 1, 768);
++    texture_mutations(0x86u, 8, 8, 4, 0, 0, 56); /* BC1 */
++}
++
+ /* ---- 4. the pipeline key ------------------------------------------------- */
+ 
+ static void test_pipeline_key(void)
+@@ -1014,6 +1099,7 @@ int main(void)
+     test_surface_aliasing();
+     test_mrt_set();
+     test_texture_cache();
++    test_texture_mutations();
+     test_pipeline_key();
+     test_stencil_reset();
+     test_restart_expansion();

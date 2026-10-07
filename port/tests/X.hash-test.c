@@ -45,8 +45,8 @@ int main(void)
     for (u32 i = 0; i < ppu_vm_size; i++) vm_base[i] = (u8)(i * 131 + i / 31);
     rsx_draw_engine_set_guest_memory(reader, NULL);
     unsigned checked = 0;
-    for (u32 offset = 0; offset < 8; offset++) {
-        for (u32 span = 1; span <= 129; span++) {
+    for (u32 offset = 0; offset < 16; offset++) {
+        for (u32 span = 1; span <= 193; span++) {
             u64 hash = current_hash(offset, span);
             assert(hash == current_hash(offset, span));
             for (u32 byte = 0; byte < span; byte++) {
@@ -55,6 +55,25 @@ int main(void)
                 vm_base[offset + byte] ^= (u8)(1u << (byte % 8));
                 checked++;
             }
+        }
+    }
+    /* Full mip chain and all six aligned cube faces, including their padding.
+     * Check every byte rather than only the start/end of each face or level. */
+    const u32 spans[] = {
+        eng_texture_span(0xA1u, 8, 8, 4, 0, 0),
+        eng_texture_span(0xA1u, 8, 8, 4, 0, 1),
+        16387u
+    };
+    assert(spans[0] == 85 && spans[1] == 768);
+    for (u32 n = 0; n < sizeof(spans) / sizeof(spans[0]); n++) {
+        const u32 offset = 13, length = spans[n];
+        const u64 hash = current_hash(offset, length);
+        for (u32 byte = 0; byte < length; byte++) {
+            vm_base[offset + byte] ^= (u8)(1u << (byte % 8));
+            assert(hash != current_hash(offset, length));
+            vm_base[offset + byte] ^= (u8)(1u << (byte % 8));
+            assert(hash == current_hash(offset, length));
+            checked++;
         }
     }
     int readable = 1;

@@ -1,0 +1,75 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index b000a92..4254525 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1174,15 +1174,16 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
+ 
+ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
+ {
+-    printf("[cellPad] SetPortSetting(port=%u, setting=0x%X)\n",
+-           port_no, port_setting);
+-
+     if (!s_pad_initialized)
+         return CELL_PAD_ERROR_NOT_OPENED;
+ 
+     if (port_no >= CELL_PAD_MAX_PORT_NUM)
+         return CELL_PAD_ERROR_INVALID_PARAMETER;
+ 
++    /* Some titles (D2) reapply the same setting every frame; log changes only. */
++    if (s_port_setting[port_no] != port_setting)
++        printf("[cellPad] SetPortSetting(port=%u, setting=0x%X)\n",
++               port_no, port_setting);
+     s_port_setting[port_no] = port_setting;
+     return CELL_OK;
+ }
+diff --git a/libs/video/rsx_host_settings.h b/libs/video/rsx_host_settings.h
+index 636dfa1..e7654c4 100644
+--- a/libs/video/rsx_host_settings.h
++++ b/libs/video/rsx_host_settings.h
+@@ -12,6 +12,21 @@ static inline unsigned rsx_host_scale_extent(unsigned start, unsigned extent, un
+ {
+     return rsx_host_scale_edge(start + extent, half_units) - rsx_host_scale_edge(start, half_units);
+ }
++/* Frame cap on a fixed schedule. Measuring from the previous display instead
++ * dropped every frame that delivery jitter landed slightly early (60 guest fps
++ * showed ~50). A quarter-period of tolerance absorbs jitter, yet still skips
++ * alternate frames for a 30 cap over a 60 fps guest. cap 0 = uncapped. */
++static inline int rsx_host_cap_due(double now, unsigned cap, double next)
++{
++    return !cap || now >= next - 0.25 / cap;
++}
++/* After a displayed frame: keep the schedule, or (first frame, or a full
++ * period late) restart it from this frame. */
++static inline double rsx_host_cap_next(double now, unsigned cap, double next)
++{
++    double period = cap ? 1.0 / cap : 0;
++    return next && next + period > now ? next + period : now + period;
++}
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index d542042..dfc4d26 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -3682,14 +3682,17 @@ static void eng_present(void* user, u32 surface)
+     id<MTLTexture> src = eng_obj(surface);
+     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+     double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+-    static double last_display, fps_start;
++    static double next_display, fps_start;
+     static unsigned fps_frames, display_frames;
+     unsigned cap = host_config() >> 16;
+-    int display = src && (!cap || now - last_display >= 1.0 / cap - 0.0005);
++    int display = src && rsx_host_cap_due(now, cap, next_display);
+     s_eng_skip_display = !display && !s_headless;
+     s_eng_last_submission = eng_encode_and_commit(display ? src : nil);
+     ps3_host_frame_event(now, s_eng_last_submission != 0, s_eng_last_submission == 2 && !s_headless);
+-    if (s_eng_last_submission == 2 && !s_headless) { last_display = now; display_frames++; }
++    if (s_eng_last_submission == 2 && !s_headless) {
++        next_display = rsx_host_cap_next(now, cap, next_display);
++        display_frames++;
++    }
+     s_eng_skip_display = 0;
+     if (!fps_start) fps_start = now;
+     if (s_eng_last_submission) fps_frames++;

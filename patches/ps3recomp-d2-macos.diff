@@ -6933,7 +6933,7 @@ index 7ac5aac..724556d 100644
  s32 UTF8Len(const u8* utf8);
  /* Single codepoint length in UTF-16 */
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index f2b4c11..b000a92 100644
+index f2b4c11..4254525 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -16,6 +16,10 @@
@@ -7378,6 +7378,26 @@ index f2b4c11..b000a92 100644
  /* cellPadGetInfo (v1 API, NID 0x3AAAD464) — used by PSL1GHT's ioPadGetInfo.
   * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian):
   *   +0x00 u32 max_connect        +0x04 u32 now_connect   +0x08 u32 system_info
+@@ -993,15 +1174,16 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
+ 
+ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
+ {
+-    printf("[cellPad] SetPortSetting(port=%u, setting=0x%X)\n",
+-           port_no, port_setting);
+-
+     if (!s_pad_initialized)
+         return CELL_PAD_ERROR_NOT_OPENED;
+ 
+     if (port_no >= CELL_PAD_MAX_PORT_NUM)
+         return CELL_PAD_ERROR_INVALID_PARAMETER;
+ 
++    /* Some titles (D2) reapply the same setting every frame; log changes only. */
++    if (s_port_setting[port_no] != port_setting)
++        printf("[cellPad] SetPortSetting(port=%u, setting=0x%X)\n",
++               port_no, port_setting);
+     s_port_setting[port_no] = port_setting;
+     return CELL_OK;
+ }
 diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
 index 89c58ab..bf378e9 100644
 --- a/libs/input/cellPad.h
@@ -14508,7 +14528,7 @@ index d105230..33168b9 100644
      mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
      mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 5c50e4a..b1020e6 100644
+index 5c50e4a..c563a8e 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -135,6 +135,7 @@ static struct {
@@ -14598,7 +14618,7 @@ index 5c50e4a..b1020e6 100644
  }
  
  static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
-@@ -708,23 +764,34 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
+@@ -708,23 +764,44 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
      return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
  }
  
@@ -14606,8 +14626,9 @@ index 5c50e4a..b1020e6 100644
 - * the whole span is deliberately cheap: this is a mutation detector, not a
 - * content id (rsx_live_draw.c:2002-2026). */
 +/* One full-span mutation check per cached texture per presented frame.
-+ * Four independent FNV streams remove the multiply dependency across every
-+ * eight bytes. This is an in-memory cache key, never a persisted content id. */
++ * Eight independent FNV streams hide the multiply dependency while scanning
++ * each 64-byte block. This is an in-memory cache key, never a persisted
++ * content id. */
  static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                      int* readable)
  {
@@ -14615,20 +14636,29 @@ index 5c50e4a..b1020e6 100644
      if (!src) { *readable = 0; return 0; }
 -    u64 hash = 1469598103934665603ull;
 +    u64 h0 = 1469598103934665603ull, h1 = h0 + 1, h2 = h0 + 2, h3 = h0 + 3;
++    u64 h4 = h0 + 4, h5 = h0 + 5, h6 = h0 + 6, h7 = h0 + 7;
      u32 i = 0;
 -    for (; i + 8 <= span; i += 8) {
-+    for (; span - i >= 32; i += 32) {
-+        u64 words[4];
++    for (; span - i >= 64; i += 64) {
++        u64 words[8];
 +        memcpy(words, src + i, sizeof(words));
 +        h0 = (h0 ^ words[0]) * 1099511628211ull;
 +        h1 = (h1 ^ words[1]) * 1099511628211ull;
 +        h2 = (h2 ^ words[2]) * 1099511628211ull;
 +        h3 = (h3 ^ words[3]) * 1099511628211ull;
++        h4 = (h4 ^ words[4]) * 1099511628211ull;
++        h5 = (h5 ^ words[5]) * 1099511628211ull;
++        h6 = (h6 ^ words[6]) * 1099511628211ull;
++        h7 = (h7 ^ words[7]) * 1099511628211ull;
 +    }
 +    u64 hash = h0;
 +    hash = (hash ^ h1) * 1099511628211ull;
 +    hash = (hash ^ h2) * 1099511628211ull;
 +    hash = (hash ^ h3) * 1099511628211ull;
++    hash = (hash ^ h4) * 1099511628211ull;
++    hash = (hash ^ h5) * 1099511628211ull;
++    hash = (hash ^ h6) * 1099511628211ull;
++    hash = (hash ^ h7) * 1099511628211ull;
 +    for (; span - i >= 8; i += 8) {
          u64 word;
          memcpy(&word, src + i, sizeof(word));
@@ -14641,7 +14671,7 @@ index 5c50e4a..b1020e6 100644
      *readable = 1;
      return hash;
  }
-@@ -754,6 +821,13 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -754,6 +831,13 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
      const u8* src = eng_guest_ptr(NULL, location, offset, span);
      if (!src) return 0;
  
@@ -14655,7 +14685,7 @@ index 5c50e4a..b1020e6 100644
      const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                              w, h, nlv, faces, remap, fmt);
      if (!handle) return 0;
-@@ -934,6 +1008,32 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+@@ -934,6 +1018,32 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
      return vp_instrs && fp_size;
  }
  
@@ -14688,7 +14718,7 @@ index 5c50e4a..b1020e6 100644
  /* The layout the active vertex program actually reads. An uncertain analysis
   * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
  static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
-@@ -941,12 +1041,8 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
+@@ -941,12 +1051,8 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
      u32 mask = 0xFFFFu;
      const u8* uc = NULL;
      u32 instrs = 0;
@@ -14703,7 +14733,7 @@ index 5c50e4a..b1020e6 100644
      rsx_vertex_layout_plan_init(layout, mask);
  }
  
-@@ -1023,6 +1119,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1023,6 +1129,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
      const u32 cube_mask = eng_cube_mask();
      const u32 vtex_mask = eng_vtex_mask();
@@ -14722,7 +14752,7 @@ index 5c50e4a..b1020e6 100644
  
      memset(&g.fp_constants, 0, sizeof g.fp_constants);
      if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
-@@ -1038,13 +1146,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1038,13 +1156,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
          key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
      } else {
@@ -14739,7 +14769,7 @@ index 5c50e4a..b1020e6 100644
      }
      key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
      key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
-@@ -1074,6 +1184,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1074,6 +1194,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                            s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
          if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
@@ -14748,7 +14778,7 @@ index 5c50e4a..b1020e6 100644
          if (fi > 0 && rs->alpha_test_enable &&
              rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                               rs->alpha_func) < 0)
-@@ -1148,6 +1260,146 @@ static int dc_reserve_indices(u32 count)
+@@ -1148,6 +1270,146 @@ static int dc_reserve_indices(u32 count)
      return 1;
  }
  
@@ -14895,7 +14925,7 @@ index 5c50e4a..b1020e6 100644
  /* Turn this group's batches into a reference list, recording a CUT rather
   * than fetching a phantom vertex wherever the restart sentinel appears, then
   * collapse repeated references and fetch each unique vertex once.
-@@ -1216,12 +1468,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -1216,12 +1478,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
          dc.fetch_ok = 0;
          return;
      }
@@ -14911,7 +14941,7 @@ index 5c50e4a..b1020e6 100644
      }
      dc.n_verts = dc.n_refs;
  }
-@@ -1587,16 +1836,15 @@ static u32 eng_present_surface(u32 buffer_id)
+@@ -1587,16 +1846,15 @@ static u32 eng_present_surface(u32 buffer_id)
  {
      if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
          const eng_display_buffer* d = &g.display_buffers[buffer_id];
@@ -14931,7 +14961,7 @@ index 5c50e4a..b1020e6 100644
      if (!g.ready) return;
      const u32 target = eng_present_surface(buffer_id);
      if (target == ENG_INVALID) return;
-@@ -1623,6 +1871,101 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+@@ -1623,6 +1881,101 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
      eng_present(g.last_flip_buffer);
  }
  
@@ -15033,7 +15063,7 @@ index 5c50e4a..b1020e6 100644
  /* ---- public API ---------------------------------------------------------- */
  
  void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
-@@ -1635,6 +1978,11 @@ void rsx_draw_engine_set_default(int on)
+@@ -1635,6 +1988,11 @@ void rsx_draw_engine_set_default(int on)
      g.default_on = on;
  }
  
@@ -15045,7 +15075,7 @@ index 5c50e4a..b1020e6 100644
  int rsx_draw_engine_enabled(void)
  {
      static int cached = -1;
-@@ -1697,6 +2045,7 @@ void rsx_draw_engine_shutdown(void)
+@@ -1697,6 +2055,7 @@ void rsx_draw_engine_shutdown(void)
      if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
  
      rsx_draw_engine_set_guest_memory(NULL, NULL);
@@ -15053,7 +15083,7 @@ index 5c50e4a..b1020e6 100644
      free(dc.refs); free(dc.cuts); free(dc.verts);
      rsx_vertex_remap_destroy(&dc.ref_remap);
      memset(&dc, 0, sizeof dc);
-@@ -1709,6 +2058,18 @@ void rsx_draw_engine_shutdown(void)
+@@ -1709,6 +2068,18 @@ void rsx_draw_engine_shutdown(void)
  void rsx_draw_engine_method(u32 method, u32 arg)
  {
      if (!g.ready) return;
@@ -15122,10 +15152,10 @@ index fa8b57d..716fc98 100644
  void rsx_draw_engine_flush(void);
 diff --git a/libs/video/rsx_host_settings.h b/libs/video/rsx_host_settings.h
 new file mode 100644
-index 0000000..636dfa1
+index 0000000..e7654c4
 --- /dev/null
 +++ b/libs/video/rsx_host_settings.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,41 @@
 +/* Host-only settings. Guest registers, texture dimensions and vblank stay native. */
 +#ifndef PS3RECOMP_RSX_HOST_SETTINGS_H
 +#define PS3RECOMP_RSX_HOST_SETTINGS_H
@@ -15139,6 +15169,21 @@ index 0000000..636dfa1
 +static inline unsigned rsx_host_scale_extent(unsigned start, unsigned extent, unsigned half_units)
 +{
 +    return rsx_host_scale_edge(start + extent, half_units) - rsx_host_scale_edge(start, half_units);
++}
++/* Frame cap on a fixed schedule. Measuring from the previous display instead
++ * dropped every frame that delivery jitter landed slightly early (60 guest fps
++ * showed ~50). A quarter-period of tolerance absorbs jitter, yet still skips
++ * alternate frames for a 30 cap over a 60 fps guest. cap 0 = uncapped. */
++static inline int rsx_host_cap_due(double now, unsigned cap, double next)
++{
++    return !cap || now >= next - 0.25 / cap;
++}
++/* After a displayed frame: keep the schedule, or (first frame, or a full
++ * period late) restart it from this frame. */
++static inline double rsx_host_cap_next(double now, unsigned cap, double next)
++{
++    double period = cap ? 1.0 / cap : 0;
++    return next && next + period > now ? next + period : now + period;
 +}
 +#ifdef __cplusplus
 +extern "C" {
@@ -15172,7 +15217,7 @@ index aee795c..d767a85 100644
  /* --- test hooks ---------------------------------------------------------- */
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index d04b34e..d542042 100644
+index d04b34e..dfc4d26 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
 @@ -46,13 +46,16 @@
@@ -16132,7 +16177,7 @@ index d04b34e..d542042 100644
      FILE* f = fopen(path, "wb");
      if (f) {
          fprintf(f, "P6\n%zu %zu\n255\n", w, h);
-@@ -3114,13 +3573,132 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3114,13 +3573,135 @@ static void eng_dump_frame(id<MTLTexture> src)
      free(rgba);
  }
  
@@ -16248,14 +16293,17 @@ index d04b34e..d542042 100644
 -    eng_dump_frame(src);
 +    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 +    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
-+    static double last_display, fps_start;
++    static double next_display, fps_start;
 +    static unsigned fps_frames, display_frames;
 +    unsigned cap = host_config() >> 16;
-+    int display = src && (!cap || now - last_display >= 1.0 / cap - 0.0005);
++    int display = src && rsx_host_cap_due(now, cap, next_display);
 +    s_eng_skip_display = !display && !s_headless;
 +    s_eng_last_submission = eng_encode_and_commit(display ? src : nil);
 +    ps3_host_frame_event(now, s_eng_last_submission != 0, s_eng_last_submission == 2 && !s_headless);
-+    if (s_eng_last_submission == 2 && !s_headless) { last_display = now; display_frames++; }
++    if (s_eng_last_submission == 2 && !s_headless) {
++        next_display = rsx_host_cap_next(now, cap, next_display);
++        display_frames++;
++    }
 +    s_eng_skip_display = 0;
 +    if (!fps_start) fps_start = now;
 +    if (s_eng_last_submission) fps_frames++;
@@ -16268,7 +16316,7 @@ index d04b34e..d542042 100644
  }
  
  static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-@@ -3129,6 +3707,19 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -3129,6 +3710,19 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
      (void)user;
      id<MTLTexture> t = eng_obj(surface);
      if (!t || !out || !out_pitch || !w || !h) return;
@@ -16288,7 +16336,7 @@ index d04b34e..d542042 100644
      if (x + w > [t width] || y + h > [t height]) return;
      [t getBytes:out bytesPerRow:out_pitch
       fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
-@@ -3162,6 +3753,7 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -3162,6 +3756,7 @@ static const rsx_draw_backend s_engine_backend = {
      .draw                 = eng_draw,
      .clear_color          = eng_clear_color,
      .clear_depth_stencil  = eng_clear_depth_stencil,
@@ -16296,7 +16344,7 @@ index d04b34e..d542042 100644
      .present              = eng_present,
      .readback             = eng_readback,
  };
-@@ -3171,6 +3763,12 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -3171,6 +3766,12 @@ static const rsx_draw_backend s_engine_backend = {
  int rsx_metal_backend_init(u32 width, u32 height, const char* title)
  {
      @autoreleasepool {
@@ -16309,7 +16357,7 @@ index d04b34e..d542042 100644
          if (width)  s_width  = width;
          if (height) s_height = height;
  
-@@ -3238,16 +3836,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+@@ -3238,16 +3839,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
           * instead of the rsx_state vtable. The vtable stays registered only on
           * the path that uses it: the FIFO walker feeds both models, so leaving
           * both live would record every draw twice. */
@@ -16333,7 +16381,7 @@ index d04b34e..d542042 100644
          } else {
              rsx_set_backend(&s_backend_vtable);
          }
-@@ -3263,6 +3863,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+@@ -3263,6 +3866,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
  void rsx_metal_backend_shutdown(void)
  {
      @autoreleasepool {
@@ -16347,7 +16395,7 @@ index d04b34e..d542042 100644
          if (s_ready) rsx_set_backend(NULL);
          if (s_eng_active) rsx_draw_engine_shutdown();
          rsx_draw_engine_set_backend(NULL);
-@@ -3279,7 +3886,15 @@ void rsx_metal_backend_shutdown(void)
+@@ -3279,7 +3889,15 @@ void rsx_metal_backend_shutdown(void)
              s_inflight = nil;
          }
  #if !TARGET_OS_IPHONE
@@ -16364,7 +16412,7 @@ index d04b34e..d542042 100644
  #endif
          free(s_verts); s_verts = NULL;
          free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
-@@ -3339,10 +3954,9 @@ int rsx_metal_backend_pump_messages(void)
+@@ -3339,10 +3957,9 @@ int rsx_metal_backend_pump_messages(void)
  void rsx_metal_backend_present(void)
  {
      if (!s_ready) return;
@@ -16378,7 +16426,7 @@ index d04b34e..d542042 100644
      /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
      if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
      @autoreleasepool {
-@@ -3420,6 +4034,7 @@ void rsx_metal_backend_present(void)
+@@ -3420,6 +4037,7 @@ void rsx_metal_backend_present(void)
              encode_draw(enc, &rec->u.draw, &ps);
          }
          if (enc) [enc endEncoding];
@@ -16386,7 +16434,7 @@ index d04b34e..d542042 100644
  
          if (drawable) [cb presentDrawable:drawable];
  
-@@ -3436,6 +4051,8 @@ void rsx_metal_backend_present(void)
+@@ -3436,6 +4054,8 @@ void rsx_metal_backend_present(void)
              [cb commit];        /* no wait: the CPU goes on to the next frame */
          }
  
@@ -16395,7 +16443,7 @@ index d04b34e..d542042 100644
          if (s_dropped_records) {
              fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
                      s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
-@@ -3478,3 +4095,6 @@ u32 rsx_metal_backend_guest_draws(void)
+@@ -3478,3 +4098,6 @@ u32 rsx_metal_backend_guest_draws(void)
  {
      return s_eng_active ? rsx_draw_engine_guest_draws() : s_last_guest_draws;
  }
@@ -17003,7 +17051,7 @@ index 0000000..85b6b4f
 +    }
 +}
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 704ccef..d567e3c 100644
+index 704ccef..d766563 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
 @@ -84,6 +84,7 @@ typedef struct {
@@ -17027,7 +17075,99 @@ index 704ccef..d567e3c 100644
      return stub_handle();
  }
  
-@@ -640,6 +642,39 @@ static void test_pipeline_key(void)
+@@ -577,6 +579,91 @@ static void test_texture_cache(void)
+     engine_down();
+ }
+ 
++/* Exercise every guest byte, including cube alignment padding. A lower mip
++ * or a different face changing must retire and re-upload the whole resource;
++ * the content check still runs only once per frame. */
++static void texture_mutations(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch,
++                               int cube, u32 expected_span)
++{
++    engine_up();
++    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 1u);
++    m(M_TEX_UNIT + 0x04, 2u | ((u32)cube << 2) | (2u << 4) |
++                          (fmt << 8) | (levels << 16));
++    m(M_TEX_UNIT + 0x18, (w << 16) | h);
++    m(0x1840u, pitch);
++
++    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
++    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
++    const u32 faces = cube ? 6u : 1u;
++    const u32 span = cube
++        ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) * faces
++        : lv[n - 1].offset + lv[n - 1].tl.face_bytes;
++    CHECK(span == expected_span, "mutation fixture span=%u (expected %u)",
++          span, expected_span);
++    u8* data = vm_base + TEX_OFFSET + 1u;
++    for (u32 i = 0; i < span; i++) data[i] = (u8)(i * 131u + i / 31u);
++    draw_triangle();
++
++    int correct = stub.n_texture_create == 1 &&
++                  stub.n_texture_upload == (int)(faces * n);
++    for (u32 byte = 0; byte < span && correct; byte++) {
++        const u32 old = stub.bound_tex[0];
++        const int creates = stub.n_texture_create;
++        const int uploads = stub.n_texture_upload;
++        const int releases = stub.n_texture_release;
++        data[byte] ^= (u8)(1u << (byte % 8));
++        rsx_draw_engine_present();
++        draw_triangle();
++        correct = stub.n_texture_create == creates + 1 &&
++                  stub.n_texture_upload == uploads + (int)(faces * n) &&
++                  stub.n_texture_release == releases + 1 &&
++                  stub.bound_tex[0] != old && !stub.alive[old];
++
++        draw_triangle();
++        rsx_draw_engine_present();
++        draw_triangle();
++        correct = correct && stub.n_texture_create == creates + 1 &&
++                  stub.n_texture_upload == uploads + (int)(faces * n) &&
++                  stub.n_texture_release == releases + 1;
++
++        /* Restoring the byte is another mutation in the following frame. */
++        data[byte] ^= (u8)(1u << (byte % 8));
++        rsx_draw_engine_present();
++        draw_triangle();
++        correct = correct && stub.n_texture_create == creates + 2 &&
++                  stub.n_texture_upload == uploads + (int)(2u * faces * n) &&
++                  stub.n_texture_release == releases + 2;
++    }
++    CHECK(correct, "all %u byte mutations re-upload; unchanged data reuses "
++                   "texture (%u mips, %u faces, pitch=%u)", span, n, faces, pitch);
++
++    /* Unreadable full spans leave the existing upload intact. */
++    const int creates = stub.n_texture_create, uploads = stub.n_texture_upload;
++    const u32 handle = stub.bound_tex[0], saved_size = ppu_vm_size;
++    ppu_vm_size = TEX_OFFSET + span;
++    rsx_draw_engine_present();
++    draw_triangle();
++    CHECK(stub.n_texture_create == creates && stub.n_texture_upload == uploads &&
++          stub.bound_tex[0] == handle,
++          "an unreadable span keeps the cached texture");
++    ppu_vm_size = saved_size;
++    engine_down();
++}
++
++static void test_texture_mutations(void)
++{
++    printf("-- full-span texture mutations\n");
++    /* R8 spans with short word/stripe tails, pitched rows, and mip pyramids. */
++    texture_mutations(0xA1u, 17, 1, 1, 0, 0, 17);
++    texture_mutations(0xA1u, 33, 1, 1, 0, 0, 33);
++    texture_mutations(0xA1u, 65, 1, 1, 0, 0, 65);
++    texture_mutations(0xA1u, 7, 3, 1, 11, 0, 33);
++    texture_mutations(0xA1u, 8, 8, 4, 0, 0, 85);
++    texture_mutations(0x81u, 8, 8, 4, 0, 0, 85); /* swizzled */
++    texture_mutations(0xA1u, 8, 8, 4, 0, 1, 768);
++    texture_mutations(0x86u, 8, 8, 4, 0, 0, 56); /* BC1 */
++}
++
+ /* ---- 4. the pipeline key ------------------------------------------------- */
+ 
+ static void test_pipeline_key(void)
+@@ -640,6 +727,39 @@ static void test_pipeline_key(void)
      engine_down();
  }
  
@@ -17067,9 +17207,11 @@ index 704ccef..d567e3c 100644
  /* ---- 5. restart cuts and topology expansion ------------------------------ */
  
  static void test_restart_expansion(void)
-@@ -980,6 +1015,7 @@ int main(void)
+@@ -979,7 +1099,9 @@ int main(void)
+     test_surface_aliasing();
      test_mrt_set();
      test_texture_cache();
++    test_texture_mutations();
      test_pipeline_key();
 +    test_stencil_reset();
      test_restart_expansion();

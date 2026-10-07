@@ -156,8 +156,22 @@ static unsigned stencil_value(id<MTLTexture> depth)
     return *(unsigned char*)dst.contents;
 }
 
+/* Frame-cap pacing: 60 fps with +/-1 ms jitter shows every frame at a 60 cap,
+ * alternate frames at 30, all at 120; uncapped always shows. */
+static unsigned cap_shown(unsigned cap, double jitter)
+{
+    double next = 0; unsigned shown = 0;
+    for (int i = 1; i <= 600; i++) {
+        double now = i / 60.0 + ((i * 7) % 3 - 1) * jitter;
+        if (rsx_host_cap_due(now, cap, next)) { shown++; next = rsx_host_cap_next(now, cap, next); }
+    }
+    return shown;
+}
+
 int main(int argc, char** argv)
 {
+    assert(cap_shown(60, 0.001) == 600 && cap_shown(0, 0.001) == 600);
+    assert(cap_shown(120, 0.001) == 600 && cap_shown(30, 0.001) == 300);
     @autoreleasepool {
         s_dev = MTLCreateSystemDefaultDevice();
         if (!s_dev) { puts("[AG-metal] SKIP: no Metal device"); return 77; }
