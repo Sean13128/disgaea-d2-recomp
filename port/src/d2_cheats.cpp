@@ -648,6 +648,7 @@ extern "C" void d2_register_cheats(void)
         }
     } catch (const std::exception& e) { std::fprintf(stderr,"[D2 cheats] table error: %s\n",e.what()); }
 }
+extern "C" __attribute__((weak)) void d2_appearance_frame(void*,int);
 extern "C" __attribute__((weak)) void d2_items_frame(void*); // AT
 extern "C" void ps3_guest_frame_hook(ppu_context* ctx)
 {
@@ -663,6 +664,7 @@ extern "C" void ps3_guest_frame_hook(ppu_context* ctx)
     if (busy && !was_busy) generation++; // invalidate edits across save/load
     was_busy = busy;
     bool ready = resolved && !busy;
+    if (d2_appearance_frame) d2_appearance_frame(ctx,ready && profile.value("verified",false));
     // Test automation only ever runs against an AF-/AS- copy of the HDD.
     const char* test_hdd = std::getenv("PS3_HDD0_ROOT");
     bool copied_hdd = test_hdd && (std::strstr(test_hdd,"AF-") || std::strstr(test_hdd,"AS-"));

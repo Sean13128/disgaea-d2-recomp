@@ -8,6 +8,7 @@
 #include "cellAudio_host.h"
 
 /* Native Cheats menu/window (d2_cheats_ui.m); optional for standalone fixtures. */
+extern void d2_appearance_menu_install(NSMenu* game) __attribute__((weak_import));
 extern void d2_cheats_menu_install(NSMenu* main, NSWindow* game) __attribute__((weak_import));
 extern void d2_diagnostics_toggle(void) __attribute__((weak_import));
 extern int d2_diagnostics_visible(void) __attribute__((weak_import));
@@ -261,6 +262,7 @@ static void install_menu(void)
     NSMenuItem* flag = command(game, @"Flag Issue…", @"flag", [NSString stringWithCharacters:&f2 length:1]);
     flag.keyEquivalentModifierMask = 0;
     command(game, @"Diagnostics…", @"diagnostics", @"");
+    if (d2_appearance_menu_install) d2_appearance_menu_install(game);
     NSMenu* controls = submenu(menu, @"Controls");
     command(controls, @"Keyboard Mapping…", @"controls", @"");
     if (d2_cheats_menu_install) d2_cheats_menu_install(menu, s_window); /* top-level Cheats after Game */

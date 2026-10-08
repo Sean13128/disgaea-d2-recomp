@@ -1,3 +1,8 @@
+if(D2_APPEARANCE_IMPORTER)
+    target_sources(${PROJECT_NAME} PRIVATE src/d2_appearance_ui.m)
+    set_source_files_properties(src/d2_appearance_ui.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+endif()
+target_link_options(${PROJECT_NAME} PRIVATE "LINKER:-U,_d2_appearance_menu_install" "LINKER:-U,_d2_appearance_frame")
 # Keep the CLI runner intact; Finder launches a small AppKit path resolver.
 enable_language(OBJC)
 target_sources(${PROJECT_NAME} PRIVATE src/d2_settings.m src/d2_cheats_ui.m src/d2_diagnostics.m)

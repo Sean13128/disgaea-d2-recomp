@@ -99,6 +99,7 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 # The replacements live in d2_movie.cpp. Re-lifts trigger reconfiguration.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMP_SOURCES})
 include(src/d2_cheats_lift.cmake)
+include(src/d2_appearance_lift.cmake)
 foreach(source IN LISTS RECOMP_SOURCES)
     file(READ "${source}" text)
     set(changed FALSE)
@@ -121,6 +122,10 @@ foreach(source IN LISTS RECOMP_SOURCES)
     if(cheat_changed)
         set(changed TRUE)
     endif()
+    d2_appearance_patch("${text}" text appearance_changed)
+    if(appearance_changed)
+        set(changed TRUE)
+    endif()
     if(changed)
         get_filename_component(name "${source}" NAME)
         set(copy "${CMAKE_CURRENT_BINARY_DIR}/d2_${name}")
@@ -129,6 +134,14 @@ foreach(source IN LISTS RECOMP_SOURCES)
         list(APPEND RECOMP_SOURCES "${copy}")
     endif()
 endforeach()
+if(D2_APPEARANCE_WRAPPERS)
+    get_property(D2_APPEARANCE_FOUND GLOBAL PROPERTY D2_APPEARANCE_FOUND)
+    foreach(kind IN ITEMS unit_face unit_face_large unit_panel_face class_queued_face class_queued_face_alt ui_face_record ui_face_draw unit_list_face unit_list_face_alt unit_small_face unit_small_face_alt face_coordinates illustration select update write_body read_body record visual request category body_kind motion file_size allocate file_read load_update model_select texture_bind)
+        if(NOT kind IN_LIST D2_APPEARANCE_FOUND)
+            message(FATAL_ERROR "D2 appearance boundary '${kind}' missing from this lift")
+        endif()
+    endforeach()
+endif()
 get_property(D2_CHEAT_FOUND GLOBAL PROPERTY D2_CHEAT_FOUND)
 foreach(kind IN ITEMS exp sp shop damage)
     if(NOT kind IN_LIST D2_CHEAT_FOUND)
@@ -256,6 +269,9 @@ add_executable(${PROJECT_NAME}
     ${RECOMP_SOURCES}
     ${SPU_SOURCES}
 )
+if(D2_APPEARANCE_WRAPPERS)
+    target_sources(${PROJECT_NAME} PRIVATE src/d2_appearance_trace.cpp)
+endif()
 
 # Embed the asset-free, versioned editor schema so app bundles do not depend on cwd.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/d2_cheats.v1.json" D2_CHEATS_JSON)
@@ -263,6 +279,10 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_
 find_path(D2_JSON_INCLUDE_DIR nlohmann/json.hpp REQUIRED)
 configure_file(src/d2_cheats_data.h.in d2_cheats_data.h @ONLY)
 set_source_files_properties(src/d2_cheats.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${D2_JSON_INCLUDE_DIR}" COMPILE_DEFINITIONS "D2_CHEATS_VERSION=${D2_GAME_VERSION}")
+if(D2_APPEARANCE_IMPORTER)
+    set_source_files_properties(src/d2_appearance_trace.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${D2_JSON_INCLUDE_DIR}" COMPILE_DEFINITIONS D2_APPEARANCE_IMPORTER=1)
+endif()
 
 # The lifted SPU sources use bare #include "spu_context.h". Scope that include
 # directory (and their flags) to those TUs alone: adding it to the whole target

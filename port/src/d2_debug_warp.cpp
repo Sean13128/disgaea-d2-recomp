@@ -21,13 +21,24 @@ static constexpr uint32_t D2_TOC = 0x47DF98;
 static constexpr uint32_t GAME_TOC = 0x2DC0, GRAPHICS_TOC = 0x3820, CAMERA_TOC = 0x3794;
 static constexpr uint32_t SELECT_STAGE = 0x0002E2E4, RESET_MAP = 0x001EB69C, START_EVENT = 0x0008F0FC;
 static constexpr uint32_t MESSAGES_PENDING = 0x00033C48, DRAIN_MESSAGES = 0x00033CBC;
+static constexpr uint32_t SET_HUB_CHARACTER = 0x0002EBC8, REFRESH_HUB_CHARACTER = 0x00295EF8;
 #else
 static constexpr uint32_t D2_TOC = 0x3FDE60;
 static constexpr uint32_t GAME_TOC = 0x31D8, GRAPHICS_TOC = 0x3BE8, CAMERA_TOC = 0x3B54;
 static constexpr uint32_t SELECT_STAGE = 0x0002E3C4, RESET_MAP = 0x001E1B80, START_EVENT = 0x0008D8A4;
 static constexpr uint32_t MESSAGES_PENDING = 0x00033CF8, DRAIN_MESSAGES = 0x00033D6C;
 #endif
-static unsigned s_stage, s_hub_frame;
+static unsigned s_stage, s_hub_frame, s_hub_class, s_delay_seconds;
+static std::chrono::steady_clock::time_point s_warp_at;
+static auto warp_now()
+{
+#ifdef D2_WARP_TEST
+    extern uint64_t d2_warp_test_milliseconds();
+    return std::chrono::steady_clock::time_point{}+std::chrono::milliseconds(d2_warp_test_milliseconds());
+#else
+    return std::chrono::steady_clock::now();
+#endif
+}
 static bool s_done, s_draining;
 
 static uint64_t call(uint32_t code, uint64_t a = 0, uint64_t b = 0)
@@ -45,8 +56,8 @@ static void pad_probe(ppu_context* ctx)
     uint32_t game = vm_read32(toc - GAME_TOC);
     if (!game) return;
     unsigned frame = ppu_boot_frames_presented();
-    static auto next = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
+    static auto next = warp_now();
+    auto now = warp_now();
     if (now >= next) {
         std::fprintf(stderr, "[D2-warp] frame=%u selected=%u\n",
             frame, vm_read16(game + 0x1507F4));
@@ -63,7 +74,7 @@ static void pad_probe(ppu_context* ctx)
             vm_read8(game + 0x15080B), vm_read8(game + 0x15080C),
             fade[0], fade[1], fade[2], fade[3], vm_read32(graphics + 0x23E74C));
     }
-    if (!s_stage || s_done || vm_read16(game + 0xD3BBA) / 100 != 300) return;
+    if ((!s_stage && !s_hub_class) || s_done || vm_read16(game + 0xD3BBA) / 100 != 300) return;
     if (!s_hub_frame) s_hub_frame = frame;
     // Leave six seconds for the save-load dialogue to finish before starting
     // a new event. The host check dismisses that dialogue at wall time 14s.
@@ -77,6 +88,32 @@ static void pad_probe(ppu_context* ctx)
             return;
         }
     }
+#if D2_GAME_VERSION == 140
+    if (s_hub_class) {
+        // Use the game's leader setter and normal menu-exit actor rebuild,
+        // on the PPU thread, after ordinary hub announcements finish.
+        if (call(MESSAGES_PENDING)) return;
+        unsigned count=vm_read16(game+0x1507EC),identity=0,matches=0;
+        if (count<1 || count>128) return;
+        for (unsigned i=0;i<count;++i) {
+            uint32_t unit=game+0x598+i*0x1A60;
+            if (vm_read16(unit+0x1158)!=s_hub_class) continue;
+            identity=vm_read16(unit+0x1202);++matches;
+        }
+        s_done=true;
+        if (matches!=1 || !identity || identity>=32768) {
+            std::fprintf(stderr,"[D2-hub] character selection rejected: class=%u matches=%u identity=%u\n",s_hub_class,matches,identity);
+            return;
+        }
+        call(SET_HUB_CHARACTER,identity);
+        call(REFRESH_HUB_CHARACTER);
+        std::fprintf(stderr,"[D2-hub] selected class=%u identity=%u map=%u through native setter/refresh; RAM only\n",
+            s_hub_class,identity,vm_read16(game+0xD3BBA));
+        if(s_stage) {s_hub_class=0;s_done=false;}
+        return;
+    }
+#endif
+    if(s_delay_seconds && now<s_warp_at) return;
     // Hub announcements own sprites in the hub animation pack. The normal
     // interaction path requests their destruction (140: 001C4C20); jumping straight
     // to event 11 leaves those sprites pointing into the freed pack. Let the
@@ -120,7 +157,28 @@ static void pad_probe(ppu_context* ctx)
 extern "C" void d2_register_debug_warp(void)
 {
     const char* stage = std::getenv("D2_WARP_STAGE");
-    if (!stage && !std::getenv("D2_WARP_TRACE")) return;
+    const char* hub = std::getenv("D2_HUB_CHARACTER");
+    const char* delay = std::getenv("D2_WARP_DELAY_SECONDS");
+    if(delay) {
+        char* end;unsigned long value=std::strtoul(delay,&end,10);
+        if(D2_GAME_VERSION!=140 || !stage || !*delay || *end || value<1 || value>600) {
+            std::fprintf(stderr,"[D2-warp] invalid delayed transition configuration\n");return;
+        }
+        s_delay_seconds=unsigned(value);s_warp_at=warp_now()+std::chrono::seconds(value);
+    }
+    if (!stage && !hub && !std::getenv("D2_WARP_TRACE")) return;
+    if (hub) {
+#if D2_GAME_VERSION == 140
+        char* end;
+        unsigned long value=std::strtoul(hub,&end,10);
+        if ((stage && !s_delay_seconds) || !*hub || *end || !value || value>=32768) {
+            std::fprintf(stderr,"[D2-hub] invalid or conflicting D2_HUB_CHARACTER\n");return;
+        }
+        s_hub_class=unsigned(value);
+#else
+        std::fprintf(stderr,"[D2-hub] character selection requires the1.40 research build\n");return;
+#endif
+    }
     if (stage) {
         char* end;
         unsigned long value = std::strtoul(stage, &end, 10);
@@ -130,6 +188,7 @@ extern "C" void d2_register_debug_warp(void)
         }
         s_stage = value < 100 ? 100 + (unsigned)value : (unsigned)value;
     }
+    if(s_delay_seconds) std::fprintf(stderr,"[D2-warp] delayed transition after %u seconds; hub selection runs first\n",s_delay_seconds);
     ps3_hle_register_ctx(0x8B72CDA1, "cellPadGetData/D2 warp", pad_probe);
     std::fprintf(stderr, "[D2-warp] armed stage=%u (1=101; packed chapter*100+map)\n", s_stage);
 }
