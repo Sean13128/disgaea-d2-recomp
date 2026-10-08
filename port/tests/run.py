@@ -180,6 +180,8 @@ elif name == 'metal-overlay':
     run_args = ['--metal']
 elif name == 'AS-ui':
     cmd += ['-fobjc-arc', '-I', ROOT/'port/src', source('AS.ui-test.m'), '-framework', 'AppKit', '-Wl,-U,_d2_item_editor_show']
+elif name == 'AT-innocent-menu':
+    cmd += ['-fobjc-arc', source('AT.innocent-menu-test.m'), '-framework', 'AppKit']
 elif name == 'hotkey':
     cmd += ['-fobjc-arc', source('AF.hotkey-test.m'), sdk/'libs/input/cellPad.c', sdk/'libs/input/pad_macos.m']
     cmd += ['-framework', 'AppKit', '-framework', 'Foundation', f'-L{brew}/lib', '-lSDL2']

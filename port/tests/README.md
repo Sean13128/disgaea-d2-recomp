@@ -56,3 +56,15 @@ switches, disjoint seek/prefetch ranges, looping EOF queries, and warnings.
 `codex/AP.atrac-check.py <scratch-directory>` repeats streaming checks with the
 three real BGM files read from the dump (ASan/UBSan; outside asset-free CTest).
 `bash codex/AP.host-check.sh` checks CoreAudio on copied saves.
+
+Item Editor Innocent limits: `d2.AT-innocent-menu` exercises the actual AppKit
+picker, category separators, selection IDs, and immediate stored/effective max
+refresh after type and Subdued changes. HABIT.dat record +0 is the **stored**
+cap, not necessarily the value shown in the game's menus. In the 1.40 lift,
+`func_00032648` (`ppu_recomp_000.cpp:40665–40697`) clamps to that cap and then
+doubles the effective value when subdued, except cap-1 types, which stay at 1.
+`func_00061270` (`ppu_recomp_001.cpp:43873–43952`) also combines against the
+undoubled stored cap. Keep `d2_item_validate` enforcing the stored limit.
+The UI's Max column is per Innocent, not an aggregate cap across equipment.
+Tests cover stored/effective pairs 9999/19998, 50/100, 150/300, 250/500,
+950/1900, and the 1/1 exception, without reading game assets or saves.

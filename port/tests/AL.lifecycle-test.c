@@ -31,7 +31,10 @@ static void* poller(void* arg)
 static void* joiner(void* arg)
 {
     ps3_guest_worker_register(1);
-    ps3_poll_thread_start("AL guest join owner", 0); ready++;
+    ps3_poll_thread_start("AL guest join owner", 0);
+    /* Like sys_ppu_thread_join, join only a registered target; an unregistered one stays joinable for shutdown. */
+    while (ready != 6) usleep(1000);
+    ready++;
     ps3_guest_worker_join(*(pthread_t*)arg);
     return NULL;
 }

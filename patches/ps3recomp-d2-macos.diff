@@ -6933,7 +6933,7 @@ index 7ac5aac..724556d 100644
  s32 UTF8Len(const u8* utf8);
  /* Single codepoint length in UTF-16 */
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index f2b4c11..4254525 100644
+index f2b4c11..268b3e6 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -16,6 +16,10 @@
@@ -7114,7 +7114,7 @@ index f2b4c11..4254525 100644
      /* A real pad streams reports at roughly this rate whether or not anything
       * changed, and libpad buffers them; a fresh sweep is a fresh report for
       * every port. cellPadGetData hands each one out exactly once. */
-@@ -437,10 +481,50 @@ static void pad_poll_backend(void)
+@@ -437,10 +481,63 @@ static void pad_poll_backend(void)
  #if PAD_BACKEND_XINPUT
      pad_poll_xinput();
  #elif PAD_BACKEND_SDL2
@@ -7150,6 +7150,19 @@ index f2b4c11..4254525 100644
 +    ReleaseSRWLockExclusive(&s_host_lock);
 +}
 +
++#ifdef __APPLE__
++/* Guest threads must never wait on the main thread: editor UI work or a
++ * modal AppKit loop there froze the game (and its music) for seconds. One
++ * sweep is queued at a time; readers use the previous sweep until it lands.
++ * Shutdown runs on the same serial main queue and clears s_sdl_inited. */
++static atomic_int s_sweep_queued;
++static void pad_poll_backend_sweep(void)
++{
++    pad_poll_backend_update();
++    atomic_store(&s_sweep_queued, 0);
++}
++#endif
++
 +static void pad_poll_backend(void)
 +{
 +    /* Only one thread schedules the next host sweep. */
@@ -7159,13 +7172,13 @@ index f2b4c11..4254525 100644
 +    if (last && now - last < PAD_POLL_INTERVAL_MS) return;
 +    if (!atomic_compare_exchange_strong(&s_last_ms, &last, now)) return;
 +#ifdef __APPLE__
-+    pad_macos_run_main(pad_poll_backend_update);
++    if (!atomic_exchange(&s_sweep_queued, 1)) pad_macos_post_main(pad_poll_backend_sweep);
 +#else
 +    pad_poll_backend_update();
  #endif
  }
  
-@@ -466,8 +550,16 @@ s32 cellPadInit(u32 max_connect)
+@@ -466,8 +563,16 @@ s32 cellPadInit(u32 max_connect)
      s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
      memset(s_port_setting, 0, sizeof(s_port_setting));
      memset(s_host_state, 0, sizeof(s_host_state));
@@ -7182,7 +7195,7 @@ index f2b4c11..4254525 100644
  
      /* Do an initial poll to detect connected controllers */
      pad_poll_backend();
-@@ -482,7 +574,11 @@ s32 cellPadEnd(void)
+@@ -482,7 +587,11 @@ s32 cellPadEnd(void)
      if (!s_pad_initialized)
          return CELL_PAD_ERROR_NOT_OPENED;
  
@@ -7194,7 +7207,7 @@ index f2b4c11..4254525 100644
  
      s_pad_initialized = 0;
      s_max_connect = 0;
-@@ -502,23 +598,9 @@ void cellPad_poll(void)
+@@ -502,23 +611,9 @@ void cellPad_poll(void)
   * were fixed.) These used to be redeclared here with a 64-bit address
   * parameter, which conflicts with the header now that it is included. */
  
@@ -7220,7 +7233,7 @@ index f2b4c11..4254525 100644
      /* YDKJ_INJECT_PAD: the game's wait loop polls the pad (cellPadSetActDirect /
       * GetData) -- if it's parked on a "press button" prompt after loading, no
       * host input means it waits forever. Inject a real button PULSE (CROSS+START+
-@@ -618,7 +700,7 @@ skip_inject: ;
+@@ -618,7 +713,7 @@ skip_inject: ;
       * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
       * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
      { static int s_sc = -1;
@@ -7229,7 +7242,7 @@ index f2b4c11..4254525 100644
        static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
        if (s_sc < 0) {
            s_sc = 0;
-@@ -626,7 +708,7 @@ skip_inject: ;
+@@ -626,7 +721,7 @@ skip_inject: ;
            if (e && *e) {
                s_sc = 1; t0 = GetTickCount64();
                const char* p = e;
@@ -7238,7 +7251,7 @@ index f2b4c11..4254525 100644
                    double t = strtod(p, (char**)&p);
                    if (*p == ':') p++;
                    unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
-@@ -644,14 +726,19 @@ skip_inject: ;
+@@ -644,14 +739,19 @@ skip_inject: ;
             * happens. Fire on the first poll at or after the event time and
             * hold it for a fixed number of polls, which is what a real press
             * looks like regardless of poll rate. */
@@ -7263,7 +7276,7 @@ index f2b4c11..4254525 100644
                    if (!said[i]) { said[i] = 1;
                        printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
                }
-@@ -797,6 +884,81 @@ skip_inject: ;
+@@ -797,6 +897,81 @@ skip_inject: ;
      }  /* end connected block */
  
  emit:
@@ -7345,7 +7358,7 @@ index f2b4c11..4254525 100644
      /* A non-zero len means "here is a CHANGE packet" -- the constant is literally
       * named CELL_PAD_LEN_CHANGE_DEFAULT. Hardware reports len = 0 once the port
       * has nothing new, and titles DRAIN on that: The Simpsons Arcade Game's
-@@ -829,6 +991,16 @@ emit:
+@@ -829,6 +1004,16 @@ emit:
              else                        s_data_fresh[port_no] = 0;
          }
      }
@@ -7362,7 +7375,7 @@ index f2b4c11..4254525 100644
      {
          unsigned int ea = (unsigned int)(uintptr_t)data_guest;
          vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
-@@ -838,6 +1010,15 @@ emit:
+@@ -838,6 +1023,15 @@ emit:
      return CELL_OK;
  }
  
@@ -7378,7 +7391,7 @@ index f2b4c11..4254525 100644
  /* cellPadGetInfo (v1 API, NID 0x3AAAD464) — used by PSL1GHT's ioPadGetInfo.
   * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian):
   *   +0x00 u32 max_connect        +0x04 u32 now_connect   +0x08 u32 system_info
-@@ -993,15 +1174,16 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
+@@ -993,15 +1187,16 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
  
  s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
  {
@@ -7417,10 +7430,10 @@ index 89c58ab..bf378e9 100644
  s32 cellPadGetInfo2(CellPadInfo2* info);
 diff --git a/libs/input/pad_macos.h b/libs/input/pad_macos.h
 new file mode 100644
-index 0000000..b65c874
+index 0000000..a2ee445
 --- /dev/null
 +++ b/libs/input/pad_macos.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,18 @@
 +#ifndef PS3RECOMP_PAD_MACOS_H
 +#define PS3RECOMP_PAD_MACOS_H
 +#include <stdint.h>
@@ -7431,6 +7444,8 @@ index 0000000..b65c874
 +void pad_macos_attach_window(void* window);
 +int pad_macos_process_event(void* event);
 +void pad_macos_run_main(void (*fn)(void));
++/* Queue fn on the main thread without waiting (runs inline on main). */
++void pad_macos_post_main(void (*fn)(void));
 +int pad_macos_keyboard_enabled(void);
 +uint16_t pad_macos_buttons(void);
 +#ifdef __cplusplus
@@ -7439,10 +7454,10 @@ index 0000000..b65c874
 +#endif
 diff --git a/libs/input/pad_macos.m b/libs/input/pad_macos.m
 new file mode 100644
-index 0000000..b7e925b
+index 0000000..bd134bd
 --- /dev/null
 +++ b/libs/input/pad_macos.m
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,116 @@
 +/* Native keyboard input for a Metal window without an SDL video subsystem. */
 +#import <AppKit/AppKit.h>
 +#include "pad_macos.h"
@@ -7476,6 +7491,12 @@ index 0000000..b7e925b
 +{
 +    if ([NSThread isMainThread]) fn();
 +    else dispatch_sync(dispatch_get_main_queue(), ^{ fn(); });
++}
++
++void pad_macos_post_main(void (*fn)(void))
++{
++    if ([NSThread isMainThread]) fn();
++    else dispatch_async(dispatch_get_main_queue(), ^{ fn(); });
 +}
 +
 +static void release_keys(void)
@@ -15217,7 +15238,7 @@ index aee795c..d767a85 100644
  /* --- test hooks ---------------------------------------------------------- */
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index d04b34e..dfc4d26 100644
+index d04b34e..fbe4fee 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
 @@ -46,13 +46,16 @@
@@ -15237,7 +15258,7 @@ index d04b34e..dfc4d26 100644
  #include "rsx_metal_backend.h"
  #include "rsx_vertex_fetch.h"
  #include "rsx_primitives.h"
-@@ -63,15 +66,45 @@
+@@ -63,17 +66,47 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
@@ -15281,8 +15302,11 @@ index d04b34e..dfc4d26 100644
  static NSWindow*           s_window;
 +static id                  s_menu_monitor;
  static int                 s_headless;
- static int                 s_closed;
+-static int                 s_closed;
++static _Atomic int         s_closed;
  static int                 s_ready;
+ static u32                 s_width  = 1280;
+ static u32                 s_height = 720;
 @@ -360,7 +393,12 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
      u32 w = state->surface_clip_w, h = state->surface_clip_h;
      if (!w || !h || (w == s_width && h == s_height)) return;
@@ -16412,7 +16436,29 @@ index d04b34e..dfc4d26 100644
  #endif
          free(s_verts); s_verts = NULL;
          free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
-@@ -3339,10 +3957,9 @@ int rsx_metal_backend_pump_messages(void)
+@@ -3326,11 +3944,16 @@ int rsx_metal_backend_pump_messages(void)
+ #if !TARGET_OS_IPHONE
+     if ([NSThread isMainThread])
+         return pump_messages_impl();
+-    __block int result = 0;
+-    dispatch_sync(dispatch_get_main_queue(), ^{
+-        result = pump_messages_impl();
+-    });
+-    return result;
++    /* Never wait for the main thread: UI work there (item editor table
++     * reloads, menus, modal panels) stalled every frame behind it. Keep one
++     * pump queued; a close is seen on the following call. */
++    static atomic_int queued;
++    if (!atomic_exchange(&queued, 1))
++        dispatch_async(dispatch_get_main_queue(), ^{
++            pump_messages_impl();
++            atomic_store(&queued, 0);
++        });
++    return s_closed ? -1 : 0;
+ #else
+     return pump_messages_impl();
+ #endif
+@@ -3339,10 +3962,9 @@ int rsx_metal_backend_pump_messages(void)
  void rsx_metal_backend_present(void)
  {
      if (!s_ready) return;
@@ -16426,7 +16472,7 @@ index d04b34e..dfc4d26 100644
      /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
      if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
      @autoreleasepool {
-@@ -3420,6 +4037,7 @@ void rsx_metal_backend_present(void)
+@@ -3420,6 +4042,7 @@ void rsx_metal_backend_present(void)
              encode_draw(enc, &rec->u.draw, &ps);
          }
          if (enc) [enc endEncoding];
@@ -16434,7 +16480,7 @@ index d04b34e..dfc4d26 100644
  
          if (drawable) [cb presentDrawable:drawable];
  
-@@ -3436,6 +4054,8 @@ void rsx_metal_backend_present(void)
+@@ -3436,6 +4059,8 @@ void rsx_metal_backend_present(void)
              [cb commit];        /* no wait: the CPU goes on to the next frame */
          }
  
@@ -16443,7 +16489,7 @@ index d04b34e..dfc4d26 100644
          if (s_dropped_records) {
              fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
                      s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
-@@ -3478,3 +4098,6 @@ u32 rsx_metal_backend_guest_draws(void)
+@@ -3478,3 +4103,6 @@ u32 rsx_metal_backend_guest_draws(void)
  {
      return s_eng_active ? rsx_draw_engine_guest_draws() : s_last_guest_draws;
  }

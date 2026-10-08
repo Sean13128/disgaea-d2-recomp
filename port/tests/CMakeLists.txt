@@ -46,7 +46,7 @@ foreach(test IN LISTS D2_CPU_TESTS)
     set_tests_properties(d2.${test} PROPERTIES LABELS "asset-free;cpu" TIMEOUT 120)
 endforeach()
 if(APPLE)
-    foreach(test IN ITEMS metal metal-overlay hotkey AS-ui)
+    foreach(test IN ITEMS metal metal-overlay hotkey AS-ui AT-innocent-menu)
         add_test(NAME d2.${test}
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
                 "${test}" --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/${test}")
@@ -55,7 +55,7 @@ if(APPLE)
 endif()
 
 if(APPLE)
-    set_tests_properties(d2.hotkey d2.AS-ui PROPERTIES LABELS "asset-free;host-ui")
+    set_tests_properties(d2.hotkey d2.AS-ui d2.AT-innocent-menu PROPERTIES LABELS "asset-free;host-ui")
 endif()
 
 # Failure fixtures supplied by newer SDK exports; the pinned baseline predates them.

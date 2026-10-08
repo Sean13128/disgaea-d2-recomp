@@ -13,6 +13,22 @@
 static const char* kStat[] = {"HP", "SP", "ATK", "DEF", "INT", "RES", "HIT", "SPD"};
 static NSString* grade_name(unsigned g) { return g == 2 ? @"Legendary" : g == 1 ? @"Rare" : @"Common"; }
 static NSString* str(const char* s) { NSString* v = s ? [NSString stringWithUTF8String:s] : nil; return v ?: @""; }
+/* Effect families in HABIT.dat; keep the catalog's order and real type IDs.
+ * Unrecognized types stay visible in their own group. */
+static unsigned innocent_group(unsigned id)
+{
+    if (id >= 1 && id <= 8) return 1;       // single-stat bonuses
+    if (id >= 11 && id <= 17) return 2;     // dual-stat bonuses
+    if (id >= 21 && id <= 25) return 3;     // status-inflicting attacks
+    if (id == 26) return 4;                // critical hits (Professional)
+    if (id >= 41 && id <= 45) return 5;     // status resistance
+    if (id >= 46 && id <= 48) return 6;     // elemental resistance
+    if (id >= 60 && id <= 65) return 7;     // rewards and growth
+    if (id >= 131 && id <= 134) return 8;   // Item World bosses
+    if (id >= 201 && id <= 227) return 9;   // unique special effects
+    if (id >= 250 && id <= 256) return 10;  // special shop / DLC effects
+    return 0;
+}
 static NSString* grouped(long long v)
 {
     return [NSNumberFormatter localizedStringFromNumber:@(v) numberStyle:NSNumberFormatterDecimalStyle];
@@ -246,7 +262,7 @@ static NSTextField* label(NSString* text, CGFloat size, BOOL bold)
     NSGridView* statGrid = [NSGridView gridViewWithViews:statRows];
     statGrid.rowSpacing = 6; statGrid.columnSpacing = 14;
 
-    NSMutableArray* innRows = [NSMutableArray arrayWithObject:@[label(@"Slot", 12, YES), label(@"Innocent (specialist)", 12, YES), label(@"Level", 12, YES), label(@"", 12, YES), label(@"Max", 12, YES)]];
+    NSMutableArray* innRows = [NSMutableArray arrayWithObject:@[label(@"Slot", 12, YES), label(@"Innocent (specialist)", 12, YES), label(@"Level (stored)", 12, YES), label(@"", 12, YES), label(@"Max: stored / effective", 12, YES)]];
     for (unsigned k = 0; k < D2_ITEMS_INNOCENTS; ++k) {
         NSPopUpButton* type = [NSPopUpButton new]; type.target = self; type.action = @selector(changed:);
         [type.widthAnchor constraintEqualToConstant:230].active = YES;
@@ -349,8 +365,30 @@ static NSTextField* label(NSString* text, CGFloat size, BOOL bold)
     [p removeAllItems];
     [p addItemWithTitle:@"— empty —"]; p.lastItem.tag = 0;
     for (unsigned i = 0; i < s_cat->innocent_count; ++i) {
+        if (i && innocent_group(s_cat->innocents[i].id) != innocent_group(s_cat->innocents[i - 1].id))
+            [p.menu addItem:[NSMenuItem separatorItem]];
         [p addItemWithTitle:[NSString stringWithFormat:@"%@  (%u)", str(s_cat->innocents[i].name), s_cat->innocents[i].id]];
         p.lastItem.tag = s_cat->innocents[i].id;
+    }
+}
+- (void)updateInnocentLimits
+{
+    for (NSUInteger k = 0; k < self.innocentTypes.count; ++k) {
+        unsigned type = (unsigned)self.innocentTypes[k].selectedItem.tag;
+        const D2CatalogInnocent* info = [self innocent:type];
+        NSTextField* hint = self.innocentMax[k];
+        if (!type || !info) {
+            hint.stringValue = type ? @"Unknown" : @"";
+            hint.toolTip = type ? @"This type has no verified game-table limit." : nil;
+            continue;
+        }
+        unsigned stored = info->max_level ? info->max_level : 1;
+        // Game func_00032648: clamp stored level to HABIT cap, then double
+        // its effective value when subdued, except fixed-level (cap == 1) types.
+        unsigned effective = stored;
+        if (self.innocentSubdued[k].state == NSControlStateValueOn && stored != 1) effective *= 2;
+        hint.stringValue = [NSString stringWithFormat:@"%@ / %@", grouped(stored), grouped(effective)];
+        hint.toolTip = @"Left: maximum stored level entered here (from the game's table). Right: maximum effective level used by the game. Subdued doubles the effect, not the stored limit; fixed-level 1 Innocents stay at 1.";
     }
 }
 - (void)showDetail:(const D2ItemsEntry*)e
@@ -360,6 +398,7 @@ static NSTextField* label(NSString* text, CGFloat size, BOOL bold)
         self.innocentTypes[k].enabled = self.innocentLevels[k].enabled = self.innocentSubdued[k].enabled = e != NULL;
     }
     if (!e) {
+        for (NSTextField* hint in self.innocentMax) { hint.stringValue = @""; hint.toolTip = nil; }
         self.title.stringValue = s_snap && s_snap->count ? @"Select an item" : @"No item selected";
         self.subtitle.stringValue = self.details.stringValue = @""; self.bigIcon.image = nil; return;
     }
@@ -387,11 +426,10 @@ static NSTextField* label(NSString* text, CGFloat size, BOOL bold)
         } else if (!n->type) [p selectItemWithTag:0];
         self.innocentLevels[k].stringValue = n->type ? [@(n->level) stringValue] : @"";
         self.innocentSubdued[k].state = n->subdued ? NSControlStateValueOn : NSControlStateValueOff;
-        const D2CatalogInnocent* info = [self innocent:n->type];
-        self.innocentMax[k].stringValue = info ? [NSString stringWithFormat:@"max %@", grouped(info->max_level)] : @"";
         BOOL inSlots = k < it->slots;
         p.enabled = self.innocentLevels[k].enabled = self.innocentSubdued[k].enabled = inSlots || n->type;
     }
+    [self updateInnocentLimits];
 }
 
 /* ------------------------------------------------------------ actions */
@@ -401,7 +439,7 @@ static NSTextField* label(NSString* text, CGFloat size, BOOL bold)
     if (n.object == self.pickerSearch) { [self rebuildPicker]; return; }
     self.dirty = YES;
 }
-- (void)changed:(id)sender { (void)sender; self.dirty = YES; }
+- (void)changed:(id)sender { (void)sender; self.dirty = YES; [self updateInnocentLimits]; }
 - (void)filterChanged:(id)sender { (void)sender; [self rebuildRows]; }
 - (void)revert:(id)sender { (void)sender; self.dirty = NO; [self showDetail:[self selected]]; }
 - (void)fail:(NSString*)text { NSBeep(); self.status.stringValue = text; }
