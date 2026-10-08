@@ -9,6 +9,9 @@
 
 /* Native Cheats menu/window (d2_cheats_ui.m); optional for standalone fixtures. */
 extern void d2_cheats_menu_install(NSMenu* main, NSWindow* game) __attribute__((weak_import));
+extern void d2_diagnostics_toggle(void) __attribute__((weak_import));
+extern int d2_diagnostics_visible(void) __attribute__((weak_import));
+extern void d2_diagnostics_close(void) __attribute__((weak_import));
 /* Standalone settings fixtures need no issue recorder. The port overrides these. */
 void __attribute__((weak)) d2_flags_init(void) {}
 void __attribute__((weak)) d2_flags_configure(double scale, unsigned cap) { (void)scale; (void)cap; }
@@ -257,6 +260,7 @@ static void install_menu(void)
     unichar f2 = NSF2FunctionKey;
     NSMenuItem* flag = command(game, @"Flag Issue…", @"flag", [NSString stringWithCharacters:&f2 length:1]);
     flag.keyEquivalentModifierMask = 0;
+    command(game, @"Diagnostics…", @"diagnostics", @"");
     NSMenu* controls = submenu(menu, @"Controls");
     command(controls, @"Keyboard Mapping…", @"controls", @"");
     if (d2_cheats_menu_install) d2_cheats_menu_install(menu, s_window); /* top-level Cheats after Game */
@@ -287,6 +291,10 @@ static void toggle_borderless(void)
         BOOL checked = value == NSNull.null ? [s_settings[key] boolValue] : [s_settings[key] isEqual:value];
         item.state = checked ? NSControlStateValueOn : NSControlStateValueOff;
     } else if ([item.representedObject isEqual:@"borderless"]) item.state = s_borderless;
+    else if ([item.representedObject isEqual:@"diagnostics"]) {
+        item.state = d2_diagnostics_visible && d2_diagnostics_visible() ? NSControlStateValueOn : NSControlStateValueOff;
+        return d2_diagnostics_toggle != NULL;
+    }
     return YES;
 }
 - (void)change:(NSMenuItem*)item
@@ -322,6 +330,7 @@ static void toggle_borderless(void)
     } else if ([name isEqual:@"controls"]) {
         message(@"Keyboard Mapping", @"Arrows: D-pad / left stick\nZ: Cross   X / Esc / Backspace: Circle\nA: Square   S: Triangle\nQ / W: L1 / R1   1 / 2: L2 / R2\nSpace: Start   Shift: Select\nReturn: Cross + Start\n\nClick the game window to focus. A connected gamepad takes precedence.");
     } else if ([name isEqual:@"flag"]) d2_flags_request();
+    else if ([name isEqual:@"diagnostics"]) { if (d2_diagnostics_toggle) d2_diagnostics_toggle(); }
     else if ([name isEqual:@"saves"]) open_save_folder();
     else if ([name isEqual:@"log"]) {
         char file[PATH_MAX] = {0}; const char* env = getenv("D2_LOG_PATH");
@@ -437,7 +446,10 @@ void ps3_host_window_created(void* window)
     if (s_observers) for (id observer in s_observers) [NSNotificationCenter.defaultCenter removeObserver:observer];
     s_window = (__bridge NSWindow*)window;
     d2_flags_attach_window(window);
-    if (!s_window) { d2_settings_flush(); s_fps = nil; s_observers = nil; return; }
+    if (!s_window) {
+        if (d2_diagnostics_close) d2_diagnostics_close();
+        d2_settings_flush(); s_fps = nil; s_observers = nil; return;
+    }
     if ([s_settings[@"remember_window"] boolValue]) {
         NSRect frame = [s_window frameRectForContentRect:NSMakeRect(0, 0,
             [s_settings[@"window_width"] doubleValue], [s_settings[@"window_height"] doubleValue])];

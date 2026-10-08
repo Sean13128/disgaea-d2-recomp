@@ -55,6 +55,13 @@ if(APPLE)
 endif()
 
 if(APPLE)
+    foreach(test IN ITEMS DI-collector DI-ui DI-integration)
+        add_test(NAME d2.${test}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"
+                "${test}" --sdk "${PS3RECOMP_DIR}" --work "${CMAKE_CURRENT_BINARY_DIR}/${test}")
+        set_tests_properties(d2.${test} PROPERTIES LABELS "asset-free;cpu" TIMEOUT 120)
+    endforeach()
+    set_tests_properties(d2.DI-ui d2.DI-integration PROPERTIES LABELS "asset-free;host-ui")
     set_tests_properties(d2.hotkey d2.AS-ui d2.AT-innocent-menu PROPERTIES LABELS "asset-free;host-ui")
 endif()
 

@@ -59,6 +59,13 @@ if name == 'repro-guards':
     sys.exit(subprocess.run([sys.executable, source('repro-test.py'), '--sdk', sdk, '--work', work], env=env).returncode)
 elif name == 'AN-summary':
     sys.exit(subprocess.run([sys.executable, source('AN.summary-test.py')], cwd=work, env=env).returncode)
+elif name == 'DI-ui':
+    (work/'d2_launcher_paths.h').write_text('#define D2_PROJECT_ROOT "/nonexistent/diagnostics-fixture"\n')
+    cmd += ['-fobjc-arc', source('DI.ui-test.m'), '-I', sdk/'libs/audio', '-framework', 'AppKit', '-Wl,-U,_d2_cheats_menu_install']
+elif name == 'DI-integration':
+    cmd += ['-fobjc-arc', source('DI.integration-test.m'), '-framework', 'AppKit']
+elif name == 'DI-collector':
+    cmd += ['-fobjc-arc', source('DI.collector-test.m'), '-framework', 'AppKit', '-Wl,-U,_d2_flags_diagnostics_snapshot']
 elif name == 'AN-flags':
     cmd += ['-fobjc-arc', source('AN.flags-test.m'), '-framework', 'AppKit']
     run_args = [work]

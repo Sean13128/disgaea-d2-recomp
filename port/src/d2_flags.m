@@ -45,35 +45,54 @@ void ps3_host_frame_event(double now, int guest, int display)
     pthread_mutex_unlock(&s_frames_lock);
 }
 
-static NSDictionary* frame_stats(double now)
+static NSDictionary* frame_stats_snapshot(double now, BOOL diagnostics)
 {
     unsigned g1 = 0, d1 = 0, g10 = 0, d10 = 0;
-    double worst = 0, display_worst = 0;
+    double worst = 0, display_worst = 0, guest_latest = 0, display_latest = 0;
     double last_guest = 0, last_display = 0;
     pthread_mutex_lock(&s_frames_lock);
-    for (unsigned j = 0; j < MIN(s_frame_count, 4096); j++) {
+    unsigned count = MIN(s_frame_count, 4096);
+    double oldest = count ? s_frames[(s_frame_count - count) % 4096].time : 0;
+    for (unsigned j = 0; j < count; j++) {
         unsigned i = (s_frame_count - 1 - j) % 4096;
         double age = now - s_frames[i].time;
         if (age < 0) continue;
-        if (!last_guest && s_frames[i].guest) last_guest = s_frames[i].time;
-        if (!last_display && s_frames[i].display) last_display = s_frames[i].time;
+        if (!last_guest && s_frames[i].guest) { last_guest = s_frames[i].time; guest_latest = s_frames[i].guest_ms; }
+        if (!last_display && s_frames[i].display) { last_display = s_frames[i].time; display_latest = s_frames[i].display_ms; }
         if (age >= 10) continue;
         g10 += s_frames[i].guest; d10 += s_frames[i].display;
         if (age < 1) { g1 += s_frames[i].guest; d1 += s_frames[i].display; }
         worst = MAX(worst, s_frames[i].guest_ms);
         display_worst = MAX(display_worst, s_frames[i].display_ms);
     }
-    // Include a currently stalled frame, even when no new flips arrive.
+    // Diagnostics retains the active age even after that stream leaves the ring.
+    // F2's existing record semantics stay unchanged.
+    if (diagnostics) { last_guest = s_last_guest; last_display = s_last_display; }
     if (last_guest) worst = MAX(worst, (now - last_guest) * 1000);
     if (last_display) display_worst = MAX(display_worst, (now - last_display) * 1000);
     BOOL available = s_frame_count != 0;
     pthread_mutex_unlock(&s_frames_lock);
     double one = MAX(0.001, MIN(1, now - s_launch)), ten = MAX(0.001, MIN(10, now - s_launch));
-    return @{ @"guest_fps_1s": @(g1 / one), @"display_fps_1s": @(d1 / one),
+    NSDictionary* rates = @{ @"guest_fps_1s": @(g1 / one), @"display_fps_1s": @(d1 / one),
         @"guest_fps_10s": @(g10 / ten), @"display_fps_10s": @(d10 / ten),
         @"worst_frame_ms_10s": @(worst), @"worst_display_frame_ms_10s": @(display_worst),
         @"window_1s": @(one), @"window_10s": @(ten), @"frame_metrics_available": @(available) };
+    if (!diagnostics) return rates;
+    NSMutableDictionary* result = [rates mutableCopy];
+    [result addEntriesFromDictionary:@{
+        @"guest_frame_status": last_guest ? @"available" : @"unavailable",
+        @"display_frame_status": last_display ? @"available" : @"unavailable",
+        @"guest_latest_interval_ms": guest_latest > 0 ? @(guest_latest) : NSNull.null,
+        @"display_latest_interval_ms": display_latest > 0 ? @(display_latest) : NSNull.null,
+        @"guest_active_interval_ms": last_guest ? @(MAX(0, now - last_guest) * 1000) : NSNull.null,
+        @"display_active_interval_ms": last_display ? @(MAX(0, now - last_display) * 1000) : NSNull.null,
+        @"frame_ring_count": @(count),
+        @"frame_window_1s_complete": @(count < 4096 || oldest <= now - one),
+        @"frame_window_10s_complete": @(count < 4096 || oldest <= now - ten) }];
+    return result;
 }
+
+static NSDictionary* frame_stats(double now) { return frame_stats_snapshot(now, NO); }
 
 static NSString* flags_folder(void)
 {
@@ -158,6 +177,55 @@ static NSArray* cpu_rates(NSDictionary* current, NSDictionary* previous)
         return [b[@"cpu_percent"] compare:a[@"cpu_percent"]];
     }];
     return rates;
+}
+
+/* Called only on the flags queue. New threads retain explicit unknown CPU
+ * rather than disappearing from cpu_rates' intersection. Mach IDs are host IDs. */
+static NSDictionary* diagnostics_cpu(double now)
+{
+    NSDictionary* current = s_cpu_history.lastObject;
+    NSDictionary* previous = s_cpu_history.count > 1 ? s_cpu_history[s_cpu_history.count - 2] : nil;
+    double elapsed = previous ? [current[@"time"] doubleValue] - [previous[@"time"] doubleValue] : 0;
+    double age = current ? now - [current[@"time"] doubleValue] : 0;
+    BOOL available = [current[@"available"] boolValue] && isfinite(age) && age >= 0 && age <= 3;
+    BOOL pair = available && [previous[@"available"] boolValue] && isfinite(elapsed) && elapsed > 0;
+    NSString* status = !current ? @"warmup" : !available ? @"unavailable" : pair ? @"available" : @"warmup";
+    NSMutableDictionary* measured = [NSMutableDictionary new];
+    if (pair) for (NSDictionary* row in cpu_rates(current, previous)) measured[row[@"id"]] = row;
+    NSMutableArray* rows = [NSMutableArray new];
+    for (NSNumber* identity in [current[@"threads"] allKeys]) {
+        NSDictionary* entry = current[@"threads"][identity], *old = previous[@"threads"][identity];
+        NSDictionary* rate = measured[identity];
+        double seconds = [entry[@"seconds"] doubleValue], oldSeconds = [old[@"seconds"] doubleValue];
+        BOOL unknown = !isfinite(seconds) || (old && (!isfinite(oldSeconds) || seconds < oldSeconds));
+        NSString* rowStatus = !available ? @"unavailable" : unknown ? @"unknown" : rate ? @"available" : @"warmup";
+        [rows addObject:@{ @"id": identity, @"name": entry[@"name"] ?: @"unnamed",
+            @"cpu_status": rowStatus,
+            @"cpu_percent": [rowStatus isEqual:@"available"] ? rate[@"cpu_percent"] : NSNull.null }];
+    }
+    [rows sortUsingComparator:^NSComparisonResult(NSDictionary* a, NSDictionary* b) { return [a[@"id"] compare:b[@"id"]]; }];
+    return @{ @"cpu_status": status,
+        @"cpu_window_seconds": @(pair ? elapsed : 0), @"cpu_sample_age_seconds": current ? @(age) : NSNull.null,
+        @"threads": rows };
+}
+
+/* Diagnostics shares the existing serial cache, without another sampler. */
+void d2_flags_diagnostics_snapshot(void (^completion)(NSDictionary*))
+{
+    dispatch_queue_t queue = s_flags_queue;
+    if (!queue) {
+        // No cache yet: do not read initialization-owned fields on a fallback queue.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            completion(@{ @"cpu_status": @"unavailable", @"threads": @[] });
+        });
+        return;
+    }
+    dispatch_async(queue, ^{ @autoreleasepool {
+        double now = monotonic();
+        NSMutableDictionary* value = [frame_stats_snapshot(now, YES) mutableCopy];
+        [value addEntriesFromDictionary:diagnostics_cpu(now)];
+        completion([value copy]);
+    } });
 }
 
 @interface D2FlagNotes : NSObject <NSTextFieldDelegate>
