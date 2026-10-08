@@ -88,6 +88,7 @@
         "save_file": -18104,
         "save_metadata": -18112,
         "item_table": -30308,
+        "skill_table": -32260,
         "class_table": -32368,
         "inventory_table": -30380
       },
@@ -186,6 +187,7 @@
         "save_file": -17312,
         "save_metadata": -17320,
         "item_table": -30188,
+        "skill_table": -32256,
         "class_table": -32360,
         "inventory_table": -30260
       },

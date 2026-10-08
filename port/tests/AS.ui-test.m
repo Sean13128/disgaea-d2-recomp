@@ -2,6 +2,7 @@
 #include "../src/d2_cheats_ui.m"
 #include <assert.h>
 #include <string.h>
+#include <objc/runtime.h>
 
 static D2CheatsSnapshot fake;
 static char last_call[64], last_key[32];
@@ -44,6 +45,30 @@ static NSMenuItem* find(NSMenu* m, NSString* title)
 static void activate(NSMenu* m, NSString* title)
 {
     [m update]; [m performActionForItemAtIndex:[m indexOfItem:find(m, title)]];
+}
+static NSButton* find_button(NSView* view, NSString* title)
+{
+    if ([view isKindOfClass:NSButton.class] && [[(NSButton*)view title] isEqual:title]) return (NSButton*)view;
+    for (NSView* child in view.subviews) { NSButton* found = find_button(child, title); if (found) return found; }
+    return nil;
+}
+static NSModalResponse skill_id_modal(id alert, SEL selector)
+{
+    (void)selector;
+    assert([[alert messageText] containsString:@"Triple Strike"]);
+    NSTextField* input = [alert accessoryView];
+    assert([input.stringValue isEqual:@"10"]);
+    input.stringValue = @"1001";
+    fake.generation = 42; // a refresh while the dialog is open cannot retarget the edit
+    return NSAlertFirstButtonReturn;
+}
+static NSString* dialog_input;
+static NSModalResponse dialog_response;
+static NSModalResponse skill_id_choice(id alert, SEL selector)
+{
+    (void)selector;
+    [(NSTextField*)[alert accessoryView] setStringValue:dialog_input];
+    return dialog_response;
 }
 int main(void)
 {
@@ -104,6 +129,37 @@ int main(void)
         mana.stringValue = @"7"; [mana sendAction:mana.action to:mana.target];
         assert(!strcmp(last_call, "character") && last_a == 0 && last_value == 7);
         assert(s_ui.skills.numberOfRows == 1);
+        // The primary skill column is a name, not an editable numeric ID.
+        NSTableColumn* skill = [s_ui.skills tableColumnWithIdentifier:@"skill_name"];
+        assert(skill && [skill.title isEqual:@"Skill"] && !skill.editable);
+        snprintf(fake.skills[0].name, sizeof fake.skills[0].name, "Triple Strike");
+        [s_ui refresh];
+        assert(([[s_ui tableView:s_ui.skills objectValueForTableColumn:skill row:0] isEqual:@"Triple Strike"]));
+        NSButton* editID = find_button([s_ui.unitTabs tabViewItemAtIndex:1].view, @"Edit Skill ID…");
+        assert(editID && !editID.enabled);
+        [s_ui.skills selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+        [s_ui refresh]; assert(editID.enabled);
+        Method modal = class_getInstanceMethod(NSAlert.class, @selector(runModal));
+        IMP original = method_setImplementation(modal, (IMP)skill_id_modal);
+        before = calls; [editID performClick:nil];
+        method_setImplementation(modal, original);
+        assert(calls == before + 1 && !strcmp(last_key, "skill_id") && last_a == 0 && last_b == 0 && last_value == 1001 && last_gen == 41);
+        fake.generation = 41; [s_ui refresh];
+        original = method_setImplementation(modal, (IMP)skill_id_choice);
+        before = calls;
+        dialog_input = @"1001"; dialog_response = NSAlertSecondButtonReturn; [editID performClick:nil];
+        dialog_response = NSAlertFirstButtonReturn;
+        for (NSString* value in @[@"0", @"32768", @"not an ID", @"10"]) { dialog_input = value; [editID performClick:nil]; }
+        assert(calls == before); // cancellation, invalid and unchanged IDs do not queue
+        fake.ready = 0; [s_ui refresh]; [editID performClick:nil]; assert(!editID.enabled && calls == before);
+        fake.ready = 1; [s_ui refresh];
+        method_setImplementation(modal, original);
+        fake.skills[0].name[0] = 0; [s_ui refresh];
+        assert(([[s_ui tableView:s_ui.skills objectValueForTableColumn:skill row:0] isEqual:@"Unknown skill (ID 10)"]));
+        fake.skills[0].name[0] = (char)0xFF; fake.skills[0].name[1] = 0; [s_ui refresh];
+        assert(([[s_ui tableView:s_ui.skills objectValueForTableColumn:skill row:0] isEqual:@"Unknown skill (ID 10)"]));
+        snprintf(fake.skills[0].name, sizeof fake.skills[0].name, "Triple Strike"); [s_ui refresh];
+        assert(![s_ui tableView:s_ui.skills shouldEditTableColumn:skill row:0]);
         [s_ui tableView:s_ui.skills setObjectValue:@"12" forTableColumn:[s_ui.skills tableColumnWithIdentifier:@"skill_level"] row:0];
         assert(!strcmp(last_call, "skill") && !strcmp(last_key, "skill_level") && last_b == 0 && last_value == 12);
         before = calls;

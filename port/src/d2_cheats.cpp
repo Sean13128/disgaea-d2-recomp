@@ -23,6 +23,7 @@ extern "C" __attribute__((weak)) int d2_flags_key_event(unsigned, int, int) { re
 #include <string>
 #include <vector>
 #include <tuple>
+#include <unordered_map>
 
 extern "C" uint64_t cellGcmGetVBlankCount(void);
 extern "C" uint64_t ppu_guest_call_ct(uint32_t, uint32_t, uint64_t, uint64_t,
@@ -340,6 +341,38 @@ bool skill_field(const std::string& key, unsigned skill, Field& out)
     else return false;
     return true;
 }
+// PPU only. magic.dat is immutable after load; refresh the cache if its backing
+// allocation/count changes. Guest tables may live above the save RAM range.
+const std::unordered_map<unsigned, std::string>& skill_names()
+{
+    static std::unordered_map<unsigned, std::string> names;
+    static uint32_t cached_table, cached_records;
+    static unsigned cached_count;
+    uint32_t table = slot("skill_table");
+    auto table_ram = [](uint64_t a, uint64_t n) {
+        return a >= 0x10000 && a < 0x100000000ull && n <= 0x100000000ull - a;
+    };
+    unsigned count = table_ram(table, 8) ? vm_read16(table) : 0;
+    uint32_t records = count ? vm_read32(table + 4) : 0;
+    if (!count || count > 4096 || !table_ram(records, uint64_t(count) * 0x128)) {
+        names.clear(); cached_table = cached_records = cached_count = 0;
+        return names;
+    }
+    if (cached_table == table && cached_records == records && cached_count == count) return names;
+    names.clear();
+    // 1.40 func_0034F9C0 / 1.00 func_0033FC90: ID at +0, stride 0x128.
+    // func_00033064 / func_00033118 joins +0x9E and +0xCE unless identical.
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t record = records + i * 0x128;
+        unsigned id = vm_read16(record);
+        if (!id) continue;
+        std::string first = name(record + 0x9E), second = name(record + 0xCE);
+        if (first != second) first += second;
+        if (!first.empty()) names.emplace(id, std::move(first));
+    }
+    cached_table = table; cached_records = records; cached_count = count;
+    return names;
+}
 int enqueue(Action a)
 {
     std::lock_guard<std::mutex> hold(bridge_lock);
@@ -443,8 +476,12 @@ void publish(bool ready)
             const auto& raw = catalog().raw[D2_CHEATS_CHARACTER];
             for (size_t i = 0; i < raw.size(); ++i) s.character[i] = read(c + raw[i]["offset"].get<uint32_t>(), raw[i]["size"]);
             s.skill_count = std::min(unsigned(vm_read8(c + 0x117B)), unsigned(D2_CHEATS_MAX_SKILLS));
-            for (unsigned i = 0; i < s.skill_count; ++i)
-                s.skills[i] = {vm_read16(c + 0xB6C + i * 2), vm_read8(c + 0xE6C + i), vm_read8(c + 0xD6C + i), vm_read32(c + 0x76C + i * 4)};
+            const auto& names = skill_names();
+            for (unsigned i = 0; i < s.skill_count; ++i) {
+                s.skills[i] = {vm_read16(c + 0xB6C + i * 2), vm_read8(c + 0xE6C + i), vm_read8(c + 0xD6C + i), vm_read32(c + 0x76C + i * 4), {}};
+                auto found = names.find(s.skills[i].id);
+                if (found != names.end()) std::snprintf(s.skills[i].name, sizeof s.skills[i].name, "%s", found->second.c_str());
+            }
             for (unsigned i = 0; i < D2_CHEATS_EQUIP_SLOTS; ++i) read_item(c + 0x10 + i * 0x190, i, s.equipment[i]);
         }
         s.inventory_count = vm_read16(root + 0x13EE08);

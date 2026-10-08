@@ -60,7 +60,11 @@ typedef struct D2CheatsItem {
     uint64_t values[D2_CHEATS_MAX_FIELDS]; /* item field order */
 } D2CheatsItem;
 
-typedef struct D2CheatsSkill { unsigned id, level, boost; uint64_t exp; } D2CheatsSkill;
+typedef struct D2CheatsSkill {
+    unsigned id, level, boost;
+    uint64_t exp;
+    char name[97]; /* UTF-8, copied on PPU; empty means unknown/unloaded. */
+} D2CheatsSkill;
 
 typedef struct D2CheatsSnapshot {
     uint64_t serial;      /* increments on every publish; 0 = nothing published yet */

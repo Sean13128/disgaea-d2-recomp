@@ -6,11 +6,13 @@ static std::vector<uint8_t> memory(8 * 1024 * 1024);
 static unsigned window_toggles;
 extern "C" void d2_cheats_window_toggle(void) { window_toggles++; }
 extern "C" void d2_items_frame(void*) {}
-extern "C" uint8_t vm_read8(uint64_t a) { return memory.at(a); }
+// Model the sys_memory region used by game tables without reserving 4 GiB.
+static uint64_t mock_index(uint64_t a) { return a >= 0x45600000 && a < 0x45610000 ? a - 0x45600000 + 0x600000 : a; }
+extern "C" uint8_t vm_read8(uint64_t a) { return memory.at(mock_index(a)); }
 extern "C" uint16_t vm_read16(uint64_t a) { return (uint16_t(vm_read8(a)) << 8) | vm_read8(a+1); }
 extern "C" uint32_t vm_read32(uint64_t a) { return (uint32_t(vm_read16(a)) << 16) | vm_read16(a+2); }
 extern "C" uint64_t vm_read64(uint64_t a) { return (uint64_t(vm_read32(a)) << 32) | vm_read32(a+4); }
-extern "C" void vm_write8(uint64_t a,uint8_t v) { memory.at(a) = v; }
+extern "C" void vm_write8(uint64_t a,uint8_t v) { memory.at(mock_index(a)) = v; }
 extern "C" void vm_write16(uint64_t a,uint16_t v) { vm_write8(a,v>>8); vm_write8(a+1,v); }
 extern "C" void vm_write32(uint64_t a,uint32_t v) { vm_write16(a,v>>16); vm_write16(a+2,v); }
 extern "C" void vm_write64(uint64_t a,uint64_t v) { vm_write32(a,v>>32); vm_write32(a+4,v); }
@@ -65,9 +67,40 @@ static void bridge_tests(const char* work)
     assert(vm_read64(root+0x568)==12345 && status.find("disabled")!=std::string::npos);
     // Selected unit detail: skills and equipment.
     uint32_t c = character(0); vm_write8(c+0x117B,1); vm_write16(c+0xB6C,10);
+    // magic.dat: header {be16 count, padding, be32 records}, stride 0x128.
+    // IDs are not row indices. Two 48-byte name fields are joined when different.
+    uint32_t skills = 0x600000, records = 0x45600100;
+    vm_write32(toc - (D2_CHEATS_VERSION == 140 ? 0x7E00 : 0x7E04), skills);
+    vm_write16(skills,2); vm_write32(skills+4,records);
+    vm_write16(records,1001); vm_write16(records+0x128,10);
+    for (unsigned i=0;i<5;++i) vm_write8(records + 0x9E + i,"Fire"[i]);
+    for (unsigned i=0;i<5;++i) vm_write8(records + 0xCE + i,"Fire"[i]);
+    for (unsigned i=0;i<14;++i) vm_write8(records + 0x128 + 0x9E + i,"Triple Strike"[i]);
+    for (unsigned i=0;i<14;++i) vm_write8(records + 0x128 + 0xCE + i,"Triple Strike"[i]);
     for (unsigned i=0;i<5;++i) vm_write8(c+0x10+0x190+0xF1+i,"Sword"[i]); vm_write16(c+0x10+0x190+0xB8,1);
     d2_cheats_select_unit(0); service(true); d2_cheats_snapshot(&snap);
     assert(snap.unit==0 && snap.skill_count==1 && snap.skills[0].id==10 && snap.character[mana]==77);
+    assert(!std::strcmp(snap.skills[0].name,"Triple Strike"));
+    vm_write16(c+0xB6C,9999); publish(true); d2_cheats_snapshot(&snap);
+    assert(snap.skills[0].id==9999 && !*snap.skills[0].name); // unknown ID remains intact
+    vm_write16(c+0xB6C,10);
+    vm_write16(skills,0); publish(true); d2_cheats_snapshot(&snap); assert(!*snap.skills[0].name);
+    vm_write16(skills,2); publish(true); d2_cheats_snapshot(&snap); assert(!std::strcmp(snap.skills[0].name,"Triple Strike"));
+    vm_write16(skills,4097); publish(true); d2_cheats_snapshot(&snap); assert(!*snap.skills[0].name);
+    vm_write16(skills,2); vm_write32(skills+4,0xFFFFFFF0); publish(true); d2_cheats_snapshot(&snap); assert(!*snap.skills[0].name);
+    vm_write32(skills+4,records); publish(true); d2_cheats_snapshot(&snap); assert(!std::strcmp(snap.skills[0].name,"Triple Strike"));
+    // Allocation changes invalidate the cache, including distinct split names.
+    uint32_t moved = records + 0x400;
+    vm_write16(moved,10);
+    for (unsigned i=0;i<6;++i) vm_write8(moved + 0x9E + i,"Mega "[i]);
+    for (unsigned i=0;i<5;++i) vm_write8(moved + 0xCE + i,"Fire"[i]);
+    vm_write32(skills+4,moved); publish(true); d2_cheats_snapshot(&snap);
+    assert(!std::strcmp(snap.skills[0].name,"Mega Fire"));
+    // Full 48-byte fields are bounded; no terminator in the record is required.
+    for (unsigned i=0;i<48;++i) { vm_write8(moved + 0x9E + i,'A'); vm_write8(moved + 0xCE + i,'B'); }
+    vm_write16(skills,1); publish(true); d2_cheats_snapshot(&snap);
+    assert(std::strlen(snap.skills[0].name)==96 && snap.skills[0].name[47]=='A' && snap.skills[0].name[48]=='B');
+    vm_write16(skills,2); vm_write32(skills+4,records); publish(true); d2_cheats_snapshot(&snap);
     assert(snap.equipment[1].id==1 && !std::strcmp(snap.equipment[1].name,"Sword") && !snap.equipment[0].id);
     assert(!d2_cheats_set_skill(0,0,"skill_level",7,snap.generation) && !d2_cheats_set_skill(0,0,"skill_boost",99,snap.generation));
     assert(!d2_cheats_set_equipment(0,1,"stat_2",42,snap.generation)); service(true);

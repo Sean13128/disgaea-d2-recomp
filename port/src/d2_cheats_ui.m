@@ -144,6 +144,7 @@ static BOOL parse_value(NSString* text, uint64_t minimum, uint64_t maximum, NSSt
 @property(nonatomic, strong) D2FieldGrid* equipment;
 @property(nonatomic, strong) NSTableView* roster;
 @property(nonatomic, strong) NSTableView* skills;
+@property(nonatomic, strong) NSButton* editSkillID;
 @property(nonatomic, strong) NSPopUpButton* equipSlot;
 @property(nonatomic, strong) NSPopUpButton* multiplier;
 @property(nonatomic, strong) NSMutableDictionary<NSString*, NSButton*>* toggles;
@@ -266,13 +267,16 @@ static NSTableView* table(NSArray<NSTableColumn*>* columns, id owner)
     stats.label = @"Stats"; stats.view = [[NSView alloc] initWithFrame:(NSRect){NSZeroPoint, inner}];
     [stats.view addSubview:scroller(grid_document(@[self.character.grid, note]), stats.view.bounds)];
     [self.unitTabs addTabViewItem:stats];
-    self.skills = table(@[column(@"slot", @"#", 34, NO), column(@"skill_id", @"Skill ID", 100, YES),
-        column(@"skill_level", @"Level", 80, YES), column(@"skill_exp", @"EXP", 140, YES), column(@"skill_boost", @"Boost", 80, YES)], self);
+    self.skills = table(@[column(@"slot", @"#", 34, NO), column(@"skill_name", @"Skill", 210, NO),
+        column(@"skill_level", @"Level", 60, YES), column(@"skill_exp", @"EXP", 100, YES), column(@"skill_boost", @"Boost", 60, YES)], self);
     NSTabViewItem* skills = [NSTabViewItem new];
     skills.label = @"Skills"; skills.view = [[NSView alloc] initWithFrame:(NSRect){NSZeroPoint, inner}];
-    NSScrollView* ss = scroller(self.skills, NSMakeRect(6, 40, inner.width - 12, inner.height - 46)); ss.borderType = NSBezelBorder;
+    NSScrollView* ss = scroller(self.skills, NSMakeRect(6, 68, inner.width - 12, inner.height - 74)); ss.borderType = NSBezelBorder;
     [skills.view addSubview:ss];
-    NSTextField* sn = [NSTextField wrappingLabelWithString:@"Double-click a cell to edit. Skill IDs must already exist in the loaded roster; duplicates are rejected."];
+    self.editSkillID = [NSButton buttonWithTitle:@"Edit Skill ID…" target:self action:@selector(editSkillID:)];
+    self.editSkillID.frame = NSMakeRect(6, 38, 145, 26);
+    [skills.view addSubview:self.editSkillID];
+    NSTextField* sn = [NSTextField wrappingLabelWithString:@"Double-click Level, EXP or Boost to edit. Select a skill to edit its ID; IDs must exist in the loaded roster, and duplicates are rejected."];
     sn.textColor = NSColor.secondaryLabelColor; sn.frame = NSMakeRect(6, 2, inner.width - 12, 34);
     [skills.view addSubview:sn];
     [self.unitTabs addTabViewItem:skills];
@@ -403,6 +407,7 @@ static NSTableView* table(NSArray<NSTableColumn*>* columns, id owner)
         s_snap.party[unit].level, s_snap.party[unit].class_id] : s_snap.party_count ? @"Loading unit…" : @"No party loaded";
     [self.character update:detail ? s_snap.character : NULL enabled:can];
     if (self.skills.editedRow < 0) [self.skills reloadData];
+    self.editSkillID.enabled = can && detail && self.skills.selectedRow >= 0 && self.skills.selectedRow < (NSInteger)s_snap.skill_count;
     NSInteger slot = self.equipSlot.indexOfSelectedItem;
     for (int i = 0; i < D2_CHEATS_EQUIP_SLOTS; ++i) {
         const D2CheatsItem* item = &s_snap.equipment[i];
@@ -449,6 +454,10 @@ static NSTableView* table(NSArray<NSTableColumn*>* columns, id owner)
     if (row >= (NSInteger)s_snap.skill_count) return nil;
     const D2CheatsSkill* s = &s_snap.skills[row];
     if ([k isEqual:@"slot"]) return @(row + 1);
+    if ([k isEqual:@"skill_name"]) {
+        NSString* name = [NSString stringWithUTF8String:s->name];
+        return name.length ? name : [NSString stringWithFormat:@"Unknown skill (ID %u)", s->id];
+    }
     if ([k isEqual:@"skill_id"]) return @(s->id);
     if ([k isEqual:@"skill_level"]) return @(s->level);
     if ([k isEqual:@"skill_exp"]) return @(s->exp);
@@ -470,6 +479,31 @@ static NSTableView* table(NSArray<NSTableColumn*>* columns, id owner)
 - (void)tableViewSelectionDidChange:(NSNotification*)note
 {
     if (note.object == self.roster) { d2_cheats_select_unit((int)self.roster.selectedRow); [self.skills reloadData]; [self refresh]; }
+    if (note.object == self.skills) self.editSkillID.enabled = editable() && s_snap.unit >= 0 && s_snap.unit == self.roster.selectedRow &&
+        self.skills.selectedRow >= 0 && self.skills.selectedRow < (NSInteger)s_snap.skill_count;
+}
+- (void)editSkillID:(id)sender
+{
+    (void)sender;
+    NSInteger row = self.skills.selectedRow;
+    if (!editable() || s_snap.unit < 0 || s_snap.unit != self.roster.selectedRow || row < 0 || row >= (NSInteger)s_snap.skill_count) return;
+    // Keep the original target/generation across modal run-loop refreshes.
+    unsigned unit = (unsigned)s_snap.unit, skill = (unsigned)row, oldID = s_snap.skills[row].id;
+    uint64_t generation = s_snap.generation;
+    NSTableColumn* column = [self.skills tableColumnWithIdentifier:@"skill_name"];
+    NSString* name = [self tableView:self.skills objectValueForTableColumn:column row:row];
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = [NSString stringWithFormat:@"Edit skill ID for %@?", name];
+    alert.informativeText = @"Use an ID already present in the loaded roster (1–32767). Duplicate skills are rejected by the game-thread bridge.";
+    NSTextField* input = [NSTextField textFieldWithString:[@(oldID) stringValue]];
+    input.frame = NSMakeRect(0, 0, 240, 24); input.accessibilityLabel = @"Skill ID";
+    alert.accessoryView = input;
+    [alert addButtonWithTitle:@"Apply"]; [alert addButtonWithTitle:@"Cancel"];
+    [alert.window makeFirstResponder:input];
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    uint64_t value;
+    if (!parse_value(input.stringValue, 1, 32767, @"Skill ID", &value) || value == oldID) return;
+    if (d2_cheats_set_skill(unit, skill, "skill_id", value, generation)) ui_error(@"Edit could not be queued.");
 }
 /* Actions shared by the window and the menu bar. */
 - (void)toggle:(id)sender
