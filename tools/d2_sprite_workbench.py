@@ -460,7 +460,8 @@ class Workbench:
             return dict(profile=str(output/'stage.json'),name=selection['name'],character=selection['d2_name'],class_id=selection['d2'],review=review,
                         body=report['body'],face=self.image(Image.open(evidence.parent/'face.png')) if (evidence.parent/'face.png').is_file() else None,
                         illustration=self.image(Image.open(evidence.parent/'illustration.png')) if (evidence.parent/'illustration.png').is_file() else None,
-                        selected=report['selected'],costume_id=report['costume_id'],log=str(log))
+                        selected=report['selected'],costume_id=report['costume_id'],log=str(log),
+                        color_slot=report.get('color_slot'),color_note=report.get('color_note'))
         return self.submit('import','Import '+selection['name']+' → '+selection['d2_name'],build)
 
 

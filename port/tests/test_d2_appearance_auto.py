@@ -35,6 +35,9 @@ def synth(resource, tables, size=(64, 64), art=()):
 
     art: (x, y, w, h) boxes filled with palette index 1 (opaque red).
     """
+    # Like retail files, the sheet table repeats the page size the renderer scales by.
+    tables = dict(tables)
+    tables.setdefault('sheet_refs', [(0, 0, size[0], size[1], 2064, 4096)])
     rows = [tables.get(name, []) for name in
             ('tags', 'tracks', 'keys', 'palette_refs', 'sheet_refs', 'rects', 'transforms', 'anchors', 'tints', 'extra')]
     values = [resource]+[len(r) for r in rows]+[0]
@@ -225,6 +228,22 @@ class AutoPipelineTests(unittest.TestCase):
             self.assertLessEqual(x+e['image'].width,w-1)
             self.assertLessEqual(y+e['image'].height,h-1)
 
+    def test_frames_on_a_foreign_canvas_share_one_placement_correction(self):
+        from d2_rpg_autobuild import steady_mismatched
+        # Taller canvas, same width: a cape changes the outline every frame,
+        # yet the body must not wander sideways.
+        entries = [dict(block='own', pose_used='wait_back/wait0%d' % (n+1), flip_x=True, quarter_turns=0,
+                        image=Image.new('RGBA', (170, 200)), reference_size=[170, 180], offset=(-31, -37),
+                        stand=stand, row={})
+                   for n, stand in enumerate(((-3, -11), (7, -10), (13, -10), (9, -10), (12, -10)))]
+        other = dict(block='own', pose_used='back/damage', flip_x=True, quarter_turns=0,
+                     image=Image.new('RGBA', (90, 60)), reference_size=[80, 60], offset=(4, 5), stand=(6, -2), row={})
+        steady_mismatched(entries+[other])
+        self.assertEqual({e['offset'] for e in entries}, {(-31, -47)})
+        self.assertEqual(entries[0]['row']['canvas_shift'], [0, -10])
+        self.assertEqual(other['offset'], (10, 5))
+        self.assertNotIn('stand', other)
+
     def test_growth_without_room_or_on_scaled_groups_is_skipped(self):
         t = self.template()
         own = [dict(e) for e in t['entries']]
@@ -244,8 +263,105 @@ class AutoPipelineTests(unittest.TestCase):
         self.assertIn('scaled', scaled['skipped'][0]['reason'])
         # Shared rectangles of other animations are never reused as free space.
         reserved = [(0, 0, 0, 0, 0, 0, 64, 64, 0)]
-        full = cells.plan(self.donor, 30, [dict(e) for e in t['entries']], {1: (2, 2, 2, 2)}, reserved, sizes)
+        full = cells.plan(self.donor, 30, [dict(e) for e in t['entries']], {1: (2, 2, 2, 2)}, reserved, sizes,
+                          taller_pages=False)
         self.assertEqual(full['moves'], {})
+        # With taller pages the cell goes into new rows below, still clear of the shared area.
+        below = cells.plan(self.donor, 30, [dict(e) for e in t['entries']], {1: (2, 2, 2, 2)}, reserved, sizes)
+        self.assertEqual(below['page_resize'], {0: [64, 128]})
+        self.assertGreaterEqual(below['moves'][1]['destination'][1], 64)
+
+    def test_pinned_pivots_grow_right_and_down_and_groups_may_span_pages(self):
+        t = self.template()
+        tables = {k: list(v) for k, v in self.tables.items()}
+        # Rectangle 3 is now also drawn scaled about rectangle 1's pivot; rectangle 4 lives on a
+        # second, narrow page and shares pivot 4 with rectangle 5; rectangle 6 stands alone.
+        tables['rects'] += [(1, 0, 0, 0, 0, 0, 10, 12, 0), (0, 0, 0, 0, 40, 20, 8, 8, 0), (0, 0, 0, 0, 50, 40, 8, 8, 0)]
+        tables['transforms'] += [(0, -20, 0, 1, 50, 100, 0, 0), (0, 0, 0, 4, 100, 100, 0, 0),
+                                 (0, 0, 0, 4, 100, 100, 0, 0), (0, 0, 0, 5, 100, 100, 0, 0)]
+        tables['anchors'] += [(4, 4), (4, 4)]
+        tables['keys'] += [(24, 0, 3, 4, 0, 0), (0, 0, 4, 5, 0, 0), (0, 0, 5, 6, 0, 0), (0, 0, 6, 7, 0, 0)]
+        donor = synth(30, tables, art=[(8, 10, 12, 16)])
+        own = [dict(e) for e in t['entries']]+[
+            dict(block='own', rectangle_index=3, page=0, destination=[4, 36, 20, 24], match='exact'),
+            dict(block='own', rectangle_index=4, page=1, destination=[0, 0, 10, 12], match='exact'),
+            dict(block='own', rectangle_index=5, page=0, destination=[40, 20, 8, 8], match='exact'),
+            dict(block='own', rectangle_index=6, page=0, destination=[50, 40, 8, 8], match='exact')]
+        sizes = {0: (64, 64), 1: (16, 64)}
+        # The shared pivot cannot move, but room to the right and below needs no pivot change.
+        pinned = cells.plan(donor, 30, own, {1: (2, 0, 3, 2)}, [], sizes)
+        self.assertEqual(pinned['moves'][1]['margin'], [0, 0])
+        self.assertEqual(pinned['moves'][1]['destination'][2:], [23, 26])
+        self.assertEqual(set(pinned['moves']), {1})
+        self.assertEqual(pinned['anchor_edits'], {})
+        self.assertEqual((pinned['pinned'][0]['rectangles'], pinned['pinned'][0]['still_short']), ([1], [1]))
+        left_only = cells.plan(donor, 30, own, {1: (2, 0, 0, 0)}, [], sizes)
+        self.assertEqual(left_only['moves'], {})
+        self.assertFalse(cells.plan(donor, 30, own, {1: (0, 0, 3, 2)}, [], sizes, symmetric=True)['moves'])
+        # One pivot, two pages: both cells gain the same margin.
+        both = cells.plan(donor, 30, own, {5: (2, 1, 0, 0)}, [], sizes)
+        self.assertEqual(both['anchor_edits'], {4: [2, 1]})
+        self.assertEqual((both['moves'][4]['destination'][2:], both['moves'][5]['destination'][2:]), ([12, 13], [10, 9]))
+        self.assertEqual(both['skipped'], [])
+        # The narrow page cannot hold its cell: that group stays, an independent one still grows.
+        narrow = cells.plan(donor, 30, own, {5: (8, 0, 0, 0), 6: (1, 1, 1, 1)}, [], sizes)
+        self.assertEqual(set(narrow['moves']), {6})
+        self.assertIn('spans several pages', narrow['skipped'][0]['reason'])
+        self.assertEqual(narrow['skipped'][0]['rectangles'], [4, 5])
+
+    def test_page_grows_taller_so_enlarged_cells_keep_native_size(self):
+        from d2_character_export import anm_pages
+        from d2_rpg_palette import encode_images
+        t = self.template()
+        own = [dict(e) for e in t['entries']]
+        sizes = {0: (64, 64)}
+        # 20x24 cell needing 40 px above and below cannot fit a 64 px page; the page doubles.
+        tall = cells.plan(self.donor, 30, own, {1: (2, 40, 2, 40)}, [], sizes)
+        self.assertEqual(tall['page_resize'], {0: [64, 128]})
+        self.assertEqual(tall['moves'][1]['margin'], [2, 40])
+        x, y, w, h = tall['moves'][1]['destination']
+        self.assertEqual((w, h), (24, 104))
+        self.assertTrue(0 <= x and x+w <= 64 and 0 <= y and y+h <= 128)
+        self.assertFalse(any('margin_factor' in s for s in tall['skipped']))
+        # Without taller pages the old behaviour remains: a smaller margin, reported.
+        limited = cells.plan(self.donor, 30, own, {1: (2, 40, 2, 40)}, [], sizes, taller_pages=False)
+        self.assertEqual(limited['page_resize'], {})
+        self.assertLess(limited['skipped'][-1]['margin_factor'], 1)
+        grown = cells.apply(self.donor, 30, tall)
+        self.assertEqual(len(grown), len(self.donor)+64*64)
+        before, after = anm_pages(self.donor, include_rgba=False)[0], anm_pages(grown, include_rgba=False)[0]
+        self.assertEqual((after['width'], after['height']), (64, 128))
+        self.assertEqual(bytes(after['indices'][:64*64]), bytes(before['indices']))
+        self.assertEqual(bytes(after['indices'][64*64:]), bytes(64*64))
+        self.assertEqual(after['colors'], before['colors'])
+        self.assertEqual(cells.own_tables(grown, 30)['rects'][1][4:8], (x, y, w, h))
+        self.assertEqual(cells.own_tables(grown, 30)['transforms'], cells.own_tables(self.donor, 30)['transforms'])
+        # The renderer scales texture coordinates by the sheet table's size, so it must follow.
+        sheet = parse_anm(grown)['blocks'][0]['tables']['sheet_refs']
+        self.assertEqual(struct.unpack_from('>6H', grown, sheet['offset']), (0, 0, 64, 128, 2064, 4096))
+        stale = bytearray(self.donor)
+        struct.pack_into('>H', stale, parse_anm(self.donor)['blocks'][0]['tables']['sheet_refs']['offset']+6, 32)
+        with self.assertRaisesRegex(ValueError, 'Sheet table size'):
+            cells.resize_pages(bytes(stale), {0: 128})
+        for bad in ({0: 100}, {0: 32}, {0: 4096}, {1: 128}, {0: '128'}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                cells.resize_pages(self.donor, bad)
+        self.assertEqual(cells.resize_pages(self.donor, {}), self.donor)
+        # End to end: a costume frame taller than the page is painted whole, at native scale.
+        giant = block_image((30, 100), (9, 4, 21, 96), (0, 0, 255, 255))
+        root = sprite_dir(self.root/'giant', {'wait_front/wait01': (giant, (0.5, 0.5))})
+        donor, images, report, residual, growth = compose(self.donor, t, catalog(root), self.common)
+        self.assertEqual(growth['taller_pages'], {'0': [64, 128]})
+        self.assertEqual(images[0].size, (64, 128))
+        row = next(r for r in report if r['rectangle_index'] == 1 and r['block'] == 'own')
+        self.assertEqual((row['clipped_pixels'], row.get('frame_fit')), (0, None))
+        cx, cy, cw, ch = growth['enlarged']['1']['destination']
+        blues = sum(1 for p in images[0].crop((cx, cy, cx+cw, cy+ch)).get_flattened_data() if p == (0, 0, 255, 255))
+        self.assertEqual(blues, 12*92)
+        expanded, packed, _ = encode_images(donor, images, 1)
+        page = pages_of(expanded)[0]
+        self.assertEqual((page['width'], page['height']), (64, 128))
+        self.assertEqual(parse_anm(expanded)['blocks'][0]['resource_id'], 30)
 
     def test_build_writes_checked_outputs_from_an_archive(self):
         t = self.template()
@@ -343,6 +459,35 @@ class AutoPipelineTests(unittest.TestCase):
 
 
 class OneCommandHelperTests(unittest.TestCase):
+    def test_new_costume_gets_the_next_free_choose_color_slot(self):
+        from d2_appearance_add import assign_color_slot
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as tmp:
+            stage = Path(tmp)/'stage.json'
+
+            def costume(cls, name, resource):
+                return dict(class_id=cls, selector=1, new_resource=resource, visual_class_id=resource,
+                            selection_mode='renderer-only', costume_id=name)
+            costumes = [costume(10, 'santa', 900), costume(10, 'thunder', 901), costume(320, 'future', 902)]
+            data = dict(mode='isolated-runtime-experiment', appearances=[costumes[0], costumes[2]], costumes=costumes)
+            stage.write_text(json.dumps(data))
+            before = stage.read_bytes()
+            # A profile that does not use Choose Color is left exactly as it was.
+            self.assertEqual(assign_color_slot(stage, 10, 'thunder'), (None, None))
+            self.assertEqual(stage.read_bytes(), before)
+            stage.write_text(json.dumps(dict(data, color_slots=[dict(class_id=10, color=1, costume_id='santa')])))
+            self.assertEqual(assign_color_slot(stage, 10, 'thunder'), (2, None))
+            slots = json.loads(stage.read_text())['color_slots']
+            self.assertEqual([(s['class_id'], s['color'], s['costume_id']) for s in slots],
+                             [(10, 1, 'santa'), (10, 2, 'thunder'), (320, 1, 'future')])
+            # A fifth costume cannot be assigned: reported, nothing written.
+            many = costumes+[costume(10, 'extra-%d' % i, 910+i) for i in range(3)]
+            stage.write_text(json.dumps(dict(data, costumes=many, color_slots=slots)))
+            before = stage.read_bytes()
+            slot, note = assign_color_slot(stage, 10, 'extra-2')
+            self.assertIsNone(slot)
+            self.assertIn('more than four', note)
+            self.assertEqual(stage.read_bytes(), before)
+
     def test_free_ids_skip_classes_files_and_registered_costumes(self):
         from d2_appearance_add import free_resource
         facts = dict(classes={900, 960}, anm_names={'anm00901.lzs', 'anm00903.dat'},

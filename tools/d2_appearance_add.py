@@ -273,6 +273,28 @@ def resolve_add(args):
     return args
 
 
+def assign_color_slot(stage, class_id, costume_id):
+    """Next free Extra color for a costume in a profile that uses Choose Color.
+
+    Returns (color, note). Profiles without color slots are left alone;
+    existing assignments keep their numbers; when the character already has
+    four costumes nothing is written and the note says so.
+    """
+    stage = Path(stage)
+    data = json.loads(stage.read_text())
+    if not data.get('color_slots'):
+        return None, None
+    from d2_appearance_colors import slots_for
+    try:
+        slots = slots_for(data)[0]
+    except ValueError as error:
+        return None, 'Not assigned to a Choose Color slot: %s' % error
+    data['color_slots'] = slots
+    stage.write_text(json.dumps(data, indent=2)+'\n')
+    return next((slot['color'] for slot in slots
+                 if slot['class_id'] == class_id and slot['costume_id'] == costume_id), None), None
+
+
 def add(args):
     args = resolve_add(args)
     from d2_appearance_choice import select
@@ -428,6 +450,10 @@ def add(args):
             shutil.copy2(work/'illustration/preview.png', evidence/'illustration.png')
         if args.select:
             select(output/'stage.json', True, args.class_id, args.costume_id)
+        # A profile that already selects costumes through Choose Color would
+        # never show an unassigned costume: give the new one the next free
+        # Extra color (existing assignments keep their numbers).
+        color_slot, color_note = assign_color_slot(output/'stage.json', args.class_id, args.costume_id)
         summary = dict(profile=str(output/'stage.json'), class_id=args.class_id, character=facts['name'],
                        costume_id=args.costume_id, display_name=args.display_name, rpg_character=args.rpg_character,
                        body=dict(resource=resource, counts=body['counts'], painted=body['painted'],
@@ -437,6 +463,7 @@ def add(args):
                                  enlarged_cells=len((body['cell_growth'] or {}).get('enlarged', {})),
                                  exact_decoder_match=check['matches']),
                        steps=steps, face_note=face_note, selected=bool(args.select),
+                       color_slot=color_slot, color_note=color_note,
                        # Choices a costume recipe needs to rebuild this costume elsewhere.
                        options=dict(story_character=args.story_character if illustration_source else None,
                                     rpg_reference=args.rpg_reference, grow=args.grow,

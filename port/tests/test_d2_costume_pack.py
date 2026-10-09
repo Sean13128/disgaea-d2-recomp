@@ -42,6 +42,11 @@ def anm(resource=30, art=((8, 10, 12, 16),), **changes):
     return unlzs(raw) if raw.startswith(b'dat\0') else raw
 
 
+def packs_table_start(raw):
+    meta_end, _, textures, palettes = struct.unpack_from('>4I', raw)
+    return meta_end+16-(textures+palettes)*16
+
+
 def face_png(size=(96, 96), fmt='PNG'):
     buffer = io.BytesIO()
     Image.new('RGBA', size, (200, 30, 30, 255)).save(buffer, format=fmt)
@@ -77,6 +82,24 @@ class StructureTests(unittest.TestCase):
         self.reject(anm(rects=[TABLES['rects'][0], (0, 0, 0, 0, 4, 4, 20, 24, 151), TABLES['rects'][2]]),
                     'outside its texture page|sprite cell')
         self.reject(anm(rects=TABLES['rects']+[(0, 0, 0, 0, 0, 0, 4, 4, 0)]), 'animation tables|texture layout')  # extra row
+        # A page made taller by the importer is the reader's layout plus empty rows.
+        import d2_anm_cells
+        tall = d2_anm_cells.resize_pages(self.donor, {0: 128})
+        packs.structure_check(self.donor, tall, 30)
+        low = d2_anm_cells.resize_pages(anm(rects=[TABLES['rects'][0], (0, 0, 0, 0, 4, 70, 20, 50, 150), TABLES['rects'][2]]), {0: 128})
+        packs.structure_check(self.donor, low, 30)                                  # cell placed in the new rows
+        self.reject(d2_anm_cells.resize_pages(anm(tags=[(0, 0), (6007, 1)]), {0: 128}), 'animation data')
+        self.reject(d2_anm_cells.resize_pages(anm(rects=[TABLES['rects'][0], (0, 0, 0, 0, 4, 100, 20, 50, 150), TABLES['rects'][2]]), {0: 128}),
+                    'outside its texture page')
+        shorter = bytearray(tall); struct.pack_into('>H', shorter, packs_table_start(tall)+6, 100)
+        self.reject(bytes(shorter))
+        # A taller page whose sheet table still claims the old height would draw garbage: refused.
+        from d2_anm import parse_anm
+        stale = bytearray(tall)
+        struct.pack_into('>H', stale, parse_anm(tall)['blocks'][0]['tables']['sheet_refs']['offset']+6, 64)
+        self.reject(bytes(stale), 'animation data')
+        with self.assertRaises(RecipeError):
+            packs.structure_check(tall, self.donor, 30)                              # a shorter page than the reader's
         for junk in (b'', b'not an animation', self.donor[:200], self.donor+b'\0'):
             self.reject(junk)
         # A second resource block cannot ride along.

@@ -69,13 +69,31 @@ def structure_check(donor, body, donor_id):
         raise RecipeError('Pack body is not a valid animation file: %s' % error) from None
     if len(a['blocks']) != 1 or len(b['blocks']) != 1 or b['blocks'][0]['resource_id'] != donor_id:
         raise RecipeError('Pack body was not built for this character')
-    for key in ('textures', 'palettes', 'texture_table_start', 'payload_start', 'page_sizes'):
+    for key in ('textures', 'palettes', 'texture_table_start', 'payload_start'):
         if a[key] != b[key]:
             raise RecipeError('Pack body has a different texture layout than this game\'s character')
+    # Pages keep their width; a costume may only make a page taller (as the
+    # importer does when enlarged idle frames need room).
+    mine = {p['texture']: (p['width'], p['height']) for p in a['page_sizes']}
+    pages = {p['texture']: (p['width'], p['height']) for p in b['page_sizes']}
+    taller = {}
+    for texture, (width, height) in pages.items():
+        if texture not in mine or mine[texture][0] != width or height < mine[texture][1]:
+            raise RecipeError('Pack body has a different texture layout than this game\'s character')
+        if height != mine[texture][1]:
+            taller[texture] = height
+    if taller:
+        # The importer's own page growth applied to the reader's body is the
+        # reference: headers and the sheet table must then match exactly.
+        import d2_anm_cells
+        try:
+            donor = d2_anm_cells.resize_pages(donor, taller)
+        except ValueError as error:
+            raise RecipeError('Pack body has an unsupported texture page size: %s' % error) from None
+        a = parse_anm(donor)
     x, y = a['blocks'][0], b['blocks'][0]
     if x['bytes'] != y['bytes'] or x['header_u16'] != y['header_u16'] or donor[:x['offset']] != body[:y['offset']]:
         raise RecipeError('Pack body has different animation tables than this game\'s character')
-    pages = {p['texture']: (p['width'], p['height']) for p in a['page_sizes']}
     for name, table in x['tables'].items():
         other = y['tables'][name]
         if (table['offset'], table['count'], table['stride']) != (other['offset'], other['count'], other['stride']):
@@ -110,7 +128,8 @@ def structure_check(donor, body, donor_id):
     for index, used in enumerate(covered):
         if not used and index >= 6 and donor[base+index] != body[base+index]:
             raise RecipeError('Pack body changes animation data outside the sprite tables')
-    if donor[a['texture_table_start']:a['payload_start']] != body[b['texture_table_start']:b['payload_start']]:
+    if len(donor) != len(body) or \
+            donor[a['texture_table_start']:a['payload_start']] != body[b['texture_table_start']:b['payload_start']]:
         raise RecipeError('Pack body has different texture headers than this game\'s character')
 
 

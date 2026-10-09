@@ -25,6 +25,7 @@ import d2_anm_cells as cells
 
 RANK = dict(clear=1, fallback=2, exact=3)
 PART = re.compile(r'_hand(\d\d)?$')
+FRAME = re.compile(r'\d+$')
 
 
 def resolve_pose(pose, sprites):
@@ -94,6 +95,29 @@ def fit_overflow(entries):
             e.update(image=fitted, offset=(x, y))
 
 
+def steady_mismatched(entries):
+    """One placement correction for all frames of an animation on a foreign canvas.
+
+    Standing every frame on its own opaque outline makes the figure wander as a
+    cape or weapon changes shape. Frames of one animation share a canvas, so
+    they share one correction: none along an axis whose canvas length matches
+    the reference, otherwise the median of what the frames ask for.
+    """
+    groups = collections.defaultdict(list)
+    for e in entries:
+        if 'stand' in e:
+            groups[(e['block'], FRAME.sub('', e['pose_used']), e['flip_x'], e['quarter_turns'],
+                    e['image'].size, tuple(e['reference_size']))].append(e)
+    for key, members in groups.items():
+        size, reference = key[4], key[5]
+        shift = [0 if size[axis] == reference[axis] else sorted(e['stand'][axis] for e in members)[len(members)//2]
+                 for axis in (0, 1)]
+        for e in members:
+            e['offset'] = (e['offset'][0]+shift[0], e['offset'][1]+shift[1])
+            e['row']['canvas_shift'] = shift
+            del e['stand']
+
+
 def compose(donor, template, sprites, common=None, grow=True):
     """RGBA pages with every templated rectangle repainted from the costume.
 
@@ -136,14 +160,14 @@ def compose(donor, template, sprites, common=None, grow=True):
             continue
         image, pivot = orient(sprites[pose]['image'], sprites[pose]['pivot'], e['flip_x'], e['quarter_turns'])
         px, py = round(e['pivot'][0]-pivot[0]), round(e['pivot'][1]-pivot[1])
-        if list(image.size) != e.get('reference_size', list(image.size)):
-            # Different canvas than the reference character's pose:
-            # stand the art on the reference's opaque bottom/centre.
-            sb, rb = mask(image).getbbox(), e['reference_bounds']
-            px = round((rb[0]+rb[2])/2-(sb[0]+sb[2])/2)
-            py = rb[3]-sb[3]
-            row['canvas_mismatch'] = True
         e.update(image=image, offset=(px, py), pose_used=pose, source_pivot=pivot)
+        if list(image.size) != e.get('reference_size', list(image.size)):
+            # Different canvas than the reference character's pose: the art
+            # stands on the reference's opaque bottom/centre instead.
+            sb, rb = mask(image).getbbox(), e['reference_bounds']
+            e['stand'] = (round((rb[0]+rb[2])/2-(sb[0]+sb[2])/2)-px, rb[3]-sb[3]-py)
+            row['canvas_mismatch'] = True
+    steady_mismatched(entries)
     growth = None
     if grow and common is not None:
         needs, content = {}, {}
@@ -163,6 +187,12 @@ def compose(donor, template, sprites, common=None, grow=True):
                                 symmetric=(grow == 'symmetric'), content=content)
     if growth and growth['moves']:
         donor = cells.apply(donor, template['body_id'], growth)
+        # A page made taller gains transparent rows below its original art.
+        for page, (width, height) in (growth.get('page_resize') or {}).items():
+            for store, mode, fill in ((images, 'RGBA', (0, 0, 0, 0)), (original, 'L', 0), (covered, 'L', 0)):
+                taller = Image.new(mode, (width, height), fill)
+                taller.paste(store[page], (0, 0))
+                store[page] = taller
         kept = []
         for e in entries:
             if e['block'] == 'own' and e['rectangle_index'] in growth['hidden']:
@@ -225,7 +255,9 @@ def compose(donor, template, sprites, common=None, grow=True):
     if growth:
         growth_report = dict(enlarged={str(r): m for r, m in growth['moves'].items()}, hidden_parts=growth['hidden'],
                              symmetric=growth.get('symmetric'), shared_cells=growth.get('shared_cells', 0),
+                             taller_pages={str(p): size for p, size in (growth.get('page_resize') or {}).items()},
                              skipped=growth['skipped'],
+                             right_down_only=growth.get('pinned', []),
                              pivot_edits={str(a): m for a, m in growth.get('anchor_edits', {}).items()},
                              key_edits=len(growth.get('key_edits', [])))
     return donor, images, report, residual, growth_report
