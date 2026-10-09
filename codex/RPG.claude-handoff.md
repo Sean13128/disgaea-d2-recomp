@@ -2,7 +2,7 @@
 
 ## Native-size idle frames, steady idle, Choose Color slot for new costumes — 2026-10-09 afternoon (Claude)
 
-Owner playtest of a new import (Thunderlord Laharl, RPG 99): the costume did not appear, and the idle figure was smaller and shifted a few pixels with the cloak. Three causes, three fixes, plus a fourth found while checking the other costumes. **Nothing below is committed or pushed.**
+Owner playtest of a new import (Thunderlord Laharl, RPG 99): the costume did not appear, and the idle figure was smaller and shifted a few pixels with the cloak. Three causes, three fixes, plus a fourth found while checking the other costumes. Committed and pushed on the owner's word as `cd2b38d` (2026-10-09 14:30 CDT).
 
 1. **Not visible.** A profile extended from a Choose Color profile keeps `color_slots`, and classes with slots ignore the class-wide selection, so a new costume without a slot can never be shown. `d2_appearance_add.assign_color_slot` now gives a new costume the class's next free Extra color (1–4) when the profile has slots; the summary and `added.json` carry `color_slot` / `color_note`, and the workbench queue shows "Choose Color: pick Extra color N …". Profiles without slots are untouched.
 2. **Shrunk idle frames.** After the whole-figure idle fix the own 512×512 sheet could not hold ten full idle frames, so Codex's `fit_overflow` scaled them (Thunderlord 0.67–0.83, Dark Santa 0.86, Pleinair 0.72, Etna 0.83–0.90) and clamped them to the cell, which also made them wander. `d2_anm_cells.plan` now retries with the sheet 2× and 4× taller (`MAX_PAGE_HEIGHT` 2048) before shrinking margins; `resize_pages` rewrites the texture header, payload offsets and payload size. **Finding:** each `sheet_refs` row is `(index×4, base, width, height, 2064, 4096)` and the renderer scales texture coordinates by that height; a taller texture with the old row renders as garbage (first test), so the row is patched too. `d2_costume_pack.structure_check` accepts a pack body whose sheets are taller than the donor's only when headers, sheet table and all non-geometry tables equal the donor resized the same way.
@@ -22,7 +22,7 @@ Cleanup the owner approved ("those can go"), moved to the macOS Trash on the Dat
 
 Pack round trip with taller sheets: the eight-costume pack imported into a scratch profile gave byte-identical bodies, illustrations, face bank, character tables and slots. The workbench server was restarted so imports from the page use the new builder.
 
-Open: commit and push of everything in this section (owner's word needed); the tracked starter recipe still lists six costumes.
+Open: the tracked starter recipe still lists six costumes; Fuka's idle not yet seen in game.
 
 ## Published — 2026-10-09 (Claude, on the owner's instruction)
 
