@@ -115,9 +115,31 @@
 !/tools/*.sh
 !/tools/*.py
 !/tools/requirements-lifts.txt
+!/tools/requirements-rpg.txt
 
 !/codex/AO.host-check.sh
 
 !/codex/AP.host-check.sh
 !/codex/AS.host-check.sh
 !/codex/AP.atrac-check.py
+
+# One-command costume helper and its shipped pose data (appearance importer).
+!/tools/costume
+!/tools/data/
+
+# Local sprite workbench frontend and launcher (no game assets).
+!/tools/sprite-workbench
+!/tools/sprite_workbench/
+!/tools/sprite_workbench/*.html
+!/tools/sprite_workbench/*.css
+!/tools/sprite_workbench/*.js
+!/Sprite Workbench.command
+
+# Shareable costume recipes: text only, no artwork or game data.
+!/costume-recipes/
+/costume-recipes/*
+!/costume-recipes/*.d2costume.json
+!/costume-recipes/README.md
+
+# Costume packs contain game artwork: never tracked.
+/costume-packs/

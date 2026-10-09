@@ -50,7 +50,7 @@ class TransitionTests(unittest.TestCase):
     def test_sequence_deadline_messages_thread_gate_and_conflicting_configuration(self):
         compiler=shutil.which('clang++') or shutil.which('c++')
         if not compiler:self.skipTest('Existing C++ compiler unavailable')
-        with tempfile.TemporaryDirectory(prefix='d2-transition-',dir='/Volumes/Data/ai-tmp/codex') as tmp:
+        with tempfile.TemporaryDirectory(prefix='d2-transition-',dir=os.path.realpath(tempfile.gettempdir())) as tmp:
             p=Path(tmp)
             (p/'ppu_recomp.h').write_text(HEADER+'\ninline void vm_write8(uint64_t a,unsigned v){assert(a<sizeof(memory));memory[a]=v;}\n')
             shutil.copyfile(Path(__file__).parents[1]/'src/d2_debug_warp.cpp',p/'warp.cpp')

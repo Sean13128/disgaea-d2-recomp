@@ -1,4 +1,5 @@
 """Named-pose reuse recomputes bounds and requires a fresh review."""
+import os
 import copy
 import json
 from pathlib import Path
@@ -18,7 +19,7 @@ from test_d2_asset_pack import archive
 
 class RetargetTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='d2-retarget-',dir='/Volumes/Data/ai-tmp/codex');self.addCleanup(self.tmp.cleanup)
+        self.tmp=tempfile.TemporaryDirectory(prefix='d2-retarget-',dir=os.path.realpath(tempfile.gettempdir()));self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.raw=donor_fixture()
         self.old=self.root/'old.png';Image.new('RGBA',(2,2),(255,0,0,255)).save(self.old)
         self.new=self.root/'new.png';image=Image.new('RGBA',(6,6));image.paste((0,255,0,255),(1,2,3,5));image.save(self.new)

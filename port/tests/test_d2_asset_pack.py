@@ -1,4 +1,5 @@
 """Asset-free regression tests for D2 compression and overlay archive builds."""
+import os
 import io
 from pathlib import Path
 import random
@@ -57,7 +58,7 @@ class CompressionTests(unittest.TestCase):
 
 class ArchiveTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix='d2-pack-test-',dir='/Volumes/Data/ai-tmp/codex')
+        self.temp=tempfile.TemporaryDirectory(prefix='d2-pack-test-',dir=os.path.realpath(tempfile.gettempdir()))
         self.root=Path(self.temp.name)
         self.source=self.root/'source.dat'
         self.original=archive([('first.dat',b'one',0x12345678),('second.dat',b'two',0xabcdef01)])

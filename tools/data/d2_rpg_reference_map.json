@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "purpose": "RPG battle-character ID of the same character, standard outfit, for each D2 class. Used once per class to derive its pose template. Pairs were checked offline by pixel alignment against the D2 body (count of pixel-identical poses). Classes not listed need --rpg-reference.",
+  "classes": {
+    "10": {"name": "Laharl", "rpg_character": 1, "exact_poses": 109},
+    "30": {"name": "Etna", "rpg_character": 6, "exact_poses": 112},
+    "50": {"name": "Flonne", "rpg_character": 7, "exact_poses": 115},
+    "60": {"name": "Pure Flonne", "rpg_character": 33, "exact_poses": 114},
+    "70": {"name": "Sicily", "rpg_character": 21, "exact_poses": 106},
+    "80": {"name": "Xenolith", "rpg_character": 31, "exact_poses": 109},
+    "100": {"name": "Barbara", "rpg_character": 15, "exact_poses": 113},
+    "140": {"name": "Virunga", "rpg_character": 64, "exact_poses": 113},
+    "150": {"name": "Lanzarote", "rpg_character": 1013, "exact_poses": 113},
+    "210": {"name": "Asagi", "rpg_character": 43, "exact_poses": 93},
+    "220": {"name": "Axel", "rpg_character": 11, "exact_poses": 111},
+    "230": {"name": "Valvatorez", "rpg_character": 3, "exact_poses": 100},
+    "240": {"name": "Fenrich", "rpg_character": 12, "exact_poses": 108},
+    "250": {"name": "Artina", "rpg_character": 36, "exact_poses": 113},
+    "260": {"name": "Emizel", "rpg_character": 14, "exact_poses": 104},
+    "270": {"name": "Petta", "rpg_character": 132, "exact_poses": 116},
+    "320": {"name": "Pleinair", "rpg_character": 51, "exact_poses": 109},
+    "340": {"name": "Fuka", "rpg_character": 9, "exact_poses": 109},
+    "120": {"name": "Rainier", "rpg_character": 21002, "exact_poses": 25, "note": "Own layout, fewer shared poses"},
+    "330": {"name": "Hoggmeiser", "rpg_character": 21004, "exact_poses": 26, "note": "Own layout, fewer shared poses"}
+  },
+  "not_supported_yet": {
+    "400 Adell, 410 Rozalin, 430 Mao, 440 Raspberyl, 450 Salvatore, 460 Zetta, 350 Desco, 200 Porkmeister": "No pixel-identical poses against the RPG art in ANM_HI.dat; active archive or art revision unresolved",
+    "520 Overlord Priere, 530 Priere, 540 Eclair": "ANM palette header variant not decoded",
+    "Generic classes (1010+) and monsters (2010+)": "Two-body donors and non-unique face banks are not handled by the staging tools"
+  }
+}

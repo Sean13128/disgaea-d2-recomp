@@ -1,0 +1,22 @@
+#!/bin/zsh
+# costume — short front door for tools/d2_appearance_add.py (private profiles only).
+#
+#   tools/costume find --name laharl                 look up RPG character IDs
+#   tools/costume find --name laharl --story         look up Status-art IDs
+#   tools/costume add --character Laharl --rpg-character 54 --display-name "Dark Santa Laharl" --select
+#   tools/costume list                               costumes in the current private profile
+#   tools/costume choose --character Laharl --costume-id original
+#   tools/costume play                               play the private profile
+#   tools/costume export                             write a costume recipe (no artwork; fine for Git)
+#   tools/costume export --with-art                  write a costume pack with the artwork (private sharing)
+#   tools/costume import FILE                        add a pack, or rebuild a recipe, into your profile
+#
+# See codex/RPG.costumes.md for the full guide.
+cd "${0:A:h:h}" || exit 1
+if [ ! -x .venv-rpg/bin/python ]; then
+  echo "One-time setup needed:  python3 -m venv .venv-rpg && .venv-rpg/bin/python -m pip install -r tools/requirements-rpg.txt" >&2
+  exit 1
+fi
+# macOS temp folders sit behind a symlink, which the path guards refuse; use a plain one.
+mkdir -p work/tmp && export TMPDIR="$PWD/work/tmp"
+exec .venv-rpg/bin/python tools/d2_appearance_add.py "$@"

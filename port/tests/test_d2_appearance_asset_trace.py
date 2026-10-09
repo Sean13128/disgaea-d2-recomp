@@ -1,4 +1,5 @@
 """Resource loading is distinguished from binding and visible acceptance."""
+import os
 import json
 from pathlib import Path
 import sys
@@ -50,7 +51,7 @@ class AssetTraceTests(unittest.TestCase):
         self.assertEqual(summarize('[D2 appearance] request resource=99997',99997)['resource'],99997)
 
     def test_run_requires_recorded_or_explicit_filter(self):
-        with tempfile.TemporaryDirectory(prefix='d2-asset-trace-',dir='/Volumes/Data/ai-tmp/codex') as tmp:
+        with tempfile.TemporaryDirectory(prefix='d2-asset-trace-',dir=os.path.realpath(tempfile.gettempdir())) as tmp:
             root=Path(tmp);(root/'runtime.log').write_text(LOG)
             with self.assertRaisesRegex(ValueError,'explicit resource'):inspect(root)
             self.assertIsNone(inspect(root,10030)['process_result'])

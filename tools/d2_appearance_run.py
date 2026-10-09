@@ -64,7 +64,7 @@ def parse_live_sequence(sequence,duration,scene):
     return events
 
 
-def run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fresh_cache=False,pad_events=None,scene='battle',hub_character=None,live_sequence=None,persist_choice=False,battle_after=None,trace_resource=None):
+def run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fresh_cache=False,pad_events=None,scene='battle',hub_character=None,live_sequence=None,persist_choice=False,battle_after=None,trace_resource=None,save_when_hl=None):
     if trace_resource is not None and (type(trace_resource) is not int or not 0<trace_resource<100000):
         raise ValueError('Trace resource requires a positive five-digit file ID')
     if scene not in ('battle','hub','normal'):raise ValueError('Scene must be battle, hub or normal')
@@ -75,10 +75,10 @@ def run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fres
     parse_live_sequence(live_sequence,duration,scene)
     stage,*_=validate_profile(stage,runner,elf)
     with profile_lock(stage) as descriptor:
-        return _run(stage,runner,elf,output,duration,frame_every,pad_script,fresh_cache,pad_events,descriptor,scene,hub_character,live_sequence,persist_choice,battle_after,trace_resource)
+        return _run(stage,runner,elf,output,duration,frame_every,pad_script,fresh_cache,pad_events,descriptor,scene,hub_character,live_sequence,persist_choice,battle_after,trace_resource,save_when_hl)
 
 
-def _run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fresh_cache=False,pad_events=None,lock_fd=None,scene='battle',hub_character=None,live_sequence=None,persist_choice=False,battle_after=None,trace_resource=None):
+def _run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fresh_cache=False,pad_events=None,lock_fd=None,scene='battle',hub_character=None,live_sequence=None,persist_choice=False,battle_after=None,trace_resource=None,save_when_hl=None):
     stage,data,roots,slot,elf,runner=validate_profile(stage,runner,elf)
     with runner.open('rb') as stream:runner_sha256=hashlib.file_digest(stream,'sha256').hexdigest()
     if not 1<=duration<=600 or not 1<=frame_every<=3600:raise ValueError('Invalid duration or frame interval')
@@ -90,6 +90,12 @@ def _run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fre
     if battle_after is not None and (scene!='hub' or type(battle_after) is not int or not 1<=battle_after<duration-10):
         raise ValueError('Delayed battle requires hub scene and1..duration-11 seconds')
     live_events=parse_live_sequence(live_sequence,duration,scene)
+    if save_when_hl is not None:
+        # The native save hook only ever runs against an explicitly named
+        # AS-/AF- copy; refuse here too so a normal profile is never written.
+        hdd0=str(roots['PS3_HDD0_ROOT'])
+        if type(save_when_hl) is not int or not 0<=save_when_hl<10**13 or scene=='battle' or ('AS-' not in hdd0 and 'AF-' not in hdd0):
+            raise ValueError('Save test needs a castle scene, an HL value and a disposable AS-/AF- profile copy')
     events=[]
     if pad_events:
         for item in pad_events.split(','):
@@ -136,6 +142,7 @@ def _run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fre
     if hub_character is not None:env['D2_HUB_CHARACTER']=str(hub_character)
     if persist_choice:env.update(D2_APPEARANCE_PERSIST='1',D2_APPEARANCE_PERSIST_PATH=str(stage))
     if live_events:env['D2_APPEARANCE_TEST_SEQUENCE']=json.dumps(live_events)
+    if save_when_hl is not None:env['D2_CHEATS_TEST_SAVE_WHEN_HL']=str(save_when_hl)
     try:
         scripted_times=[float(item.split(':',1)[0]) for item in env['PAD_SCRIPT'].split(',') if item]
         cutoff=max(scripted_times+[e[0] for e in events]+[0])
@@ -168,7 +175,7 @@ def _run(stage,runner,elf,output,duration=90,frame_every=120,pad_script=None,fre
     result=dict(exit_code=code,intentional_timeout=timed,elapsed=time.time()-start,
                 gameplay_validated=False,stage=str(stage),runner=str(runner),runner_sha256=runner_sha256,elf_sha256=ELF_140_SHA256,
                 manifest_snapshot=str(snapshot),manifest_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
-                fresh_cache=fresh_cache,scene=scene,hub_character=hub_character,live_sequence=live_events,persist_choice=persist_choice,battle_after=battle_after,trace_resource=int(env['D2_APPEARANCE_TRACE']))
+                fresh_cache=fresh_cache,scene=scene,hub_character=hub_character,live_sequence=live_events,persist_choice=persist_choice,battle_after=battle_after,trace_resource=int(env['D2_APPEARANCE_TRACE']),save_when_hl=save_when_hl)
     (output/'result.json').write_text(json.dumps(result,indent=2)+'\n')
     return result
 
@@ -187,5 +194,6 @@ if __name__=='__main__':
     parser.add_argument('--persist-choice',action='store_true',help='Explicitly remember tested live choices in the private profile')
     parser.add_argument('--battle-after',type=int,help='Hub-only diagnostic: transition to battle101 after this many launch seconds')
     parser.add_argument('--trace-resource',type=int,help='Read-only resource trace override for secondary/portrait asset investigation; binding remains unchanged')
+    parser.add_argument('--save-when-hl',type=int,help='Save-reload acceptance on a disposable AS-/AF- profile copy: write the private slot through the game once the loaded HL equals this value')
     args=parser.parse_args()
     print(json.dumps(run(**vars(args)),indent=2))

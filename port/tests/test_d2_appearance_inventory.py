@@ -1,4 +1,5 @@
 """Multi-costume authoring, overlay precedence, choice and rollback fixtures."""
+import os
 import json
 from pathlib import Path
 import struct
@@ -20,7 +21,7 @@ from test_d2_asset_pack import archive
 
 class InventoryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='d2-inventory-',dir='/Volumes/Data/ai-tmp/codex')
+        self.tmp=tempfile.TemporaryDirectory(prefix='d2-inventory-',dir=os.path.realpath(tempfile.gettempdir()))
         self.root=Path(self.tmp.name);self.source=self.root/'source';self.source.mkdir()
         for name in ('content','hdd0','hdd1'):(self.source/name).mkdir()
         self.data=self.source/'content/PS3_GAME/USRDIR/Data';self.data.mkdir(parents=True)

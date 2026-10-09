@@ -1,4 +1,5 @@
 """Original archive controls preserve inputs and cannot become costume profiles."""
+import os
 import hashlib
 import json
 from pathlib import Path
@@ -16,7 +17,7 @@ from test_d2_asset_pack import archive
 
 class BaselineTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='d2-baseline-',dir='/Volumes/Data/ai-tmp/codex')
+        self.tmp=tempfile.TemporaryDirectory(prefix='d2-baseline-',dir=os.path.realpath(tempfile.gettempdir()))
         self.root=Path(self.tmp.name);self.repo=self.root/'repo'
         self.game=self.repo/'Disgaea D2 A Brighter Darkness - [BLUS31313]'
         self.assets=self.game/'PS3_GAME/USRDIR/Data';self.assets.mkdir(parents=True)

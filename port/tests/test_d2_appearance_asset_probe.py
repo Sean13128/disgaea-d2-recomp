@@ -1,4 +1,5 @@
 """Marker probes preserve animation/alpha/indices, saves and source archives."""
+import os
 import hashlib
 import json
 from pathlib import Path
@@ -61,7 +62,7 @@ class MarkerTests(unittest.TestCase):
         for args in [(31,(255,0,255)),(True,(255,0,255)),(30,(256,0,0)),(30,(True,0,0)),(30,(0,0))]:
             with self.assertRaises(ValueError):mark(bytes(raw),*args)
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='d2-marker-',dir='/Volumes/Data/ai-tmp/codex');self.addCleanup(self.tmp.cleanup)
+        self.tmp=tempfile.TemporaryDirectory(prefix='d2-marker-',dir=os.path.realpath(tempfile.gettempdir()));self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.profile=self.root/'profile';self.profile.mkdir()
         for name in ('content','hdd0','hdd1'):(self.profile/name).mkdir()
         self.assets=self.profile/'content/PS3_GAME/USRDIR/Data';self.assets.mkdir(parents=True)

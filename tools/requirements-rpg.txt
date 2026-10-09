@@ -1,0 +1,3 @@
+# Versions used by the verified extraction and source-color authoring pipeline.
+UnityPy==1.25.4
+Pillow==12.2.0

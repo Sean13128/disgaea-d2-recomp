@@ -4,6 +4,7 @@
 Requires Pillow and clang++. d2_character_export.py supplies the bounded readers.
 Generated assets/lift excerpts are proprietary local research, not distributable.
 """
+import os
 import argparse
 import hashlib
 import io
@@ -229,5 +230,5 @@ if __name__ == '__main__':
     parser.add_argument('--sheet',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix='d2-rpg-',dir='/Volumes/Data/ai-tmp/codex') as scratch:
+    with tempfile.TemporaryDirectory(prefix='d2-rpg-',dir=os.path.realpath(tempfile.gettempdir())) as scratch:
         run(args.repo.absolute(),args.sheet.absolute(),args.output.absolute(),Path(scratch))

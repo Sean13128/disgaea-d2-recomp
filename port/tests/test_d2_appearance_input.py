@@ -11,7 +11,7 @@ from d2_appearance_input import press
 
 class InputTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='d2-input-',dir='/Volumes/Data/ai-tmp/codex');self.addCleanup(self.tmp.cleanup)
+        self.tmp=tempfile.TemporaryDirectory(prefix='d2-input-',dir=os.path.realpath(tempfile.gettempdir()));self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
         (self.root/'process.json').write_text(json.dumps(dict(pid=os.getpid(),started=time.time()-1)))
         (self.root/'stage-snapshot.json').write_text(json.dumps(dict(mode='isolated-runtime-experiment')))

@@ -1,0 +1,3 @@
+#!/bin/zsh
+cd "${0:A:h}" || exit 1
+exec .venv-rpg/bin/python tools/d2_sprite_workbench.py

@@ -105,6 +105,36 @@ class AppearanceRunTests(unittest.TestCase):
         self.assertEqual(self.stage.read_bytes(),before)
         self.assertEqual(json.loads((self.root/'portrait-trace/stage-snapshot.json').read_text())['new_resource'],900)
 
+    def test_save_check_needs_castle_scene_and_disposable_copy(self):
+        # An ordinary private profile is refused, as is a battle scene or a bad value.
+        verified=patch.object(runner,'ELF_140_SHA256',hashlib.sha256(self.elf.read_bytes()).hexdigest())
+        with verified:
+            for scene,value in [('hub',993701506631),('normal',993701506631)]:
+                with self.assertRaisesRegex(ValueError,'Save test'):
+                    runner.run(self.stage,self.exe,self.elf,self.root/'refused-save',scene=scene,save_when_hl=value)
+        self.assertFalse((self.root/'refused-save').exists())
+        copy=self.root/'AS-copy';roots={}
+        for key,name in [('PS3_VFS_ROOT','content'),('PS3_HDD0_ROOT','hdd0'),('PS3_HDD1_ROOT','hdd1')]:
+            (copy/name).mkdir(parents=True);roots[key]=str(copy/name)
+        stage=copy/'stage.json'
+        stage.write_text(json.dumps(dict(mode='isolated-runtime-experiment',new_resource=900,
+            runtime_environment=roots,save_patch=dict(slot='private-slot'))))
+        with verified:
+            for scene,value in [('battle',1),('hub',-1),('hub',True),('hub',10**13),('hub','5')]:
+                with self.assertRaisesRegex(ValueError,'Save test'):
+                    runner.run(stage,self.exe,self.elf,self.root/'bad-save',scene=scene,save_when_hl=value)
+        self.assertFalse((self.root/'bad-save').exists())
+        proc=MagicMock(pid=12345);proc.wait.return_value=0
+        with patch.object(runner,'ELF_140_SHA256',hashlib.sha256(self.elf.read_bytes()).hexdigest()), \
+             patch.dict(runner.os.environ,{'D2_CHEATS_TEST_SAVE_WHEN_HL':'1'}), \
+             patch.object(runner.subprocess,'Popen',return_value=proc) as spawn:
+            plain=runner.run(stage,self.exe,self.elf,self.root/'no-save',scene='hub')
+            self.assertNotIn('D2_CHEATS_TEST_SAVE_WHEN_HL',spawn.call_args.kwargs['env'])
+            result=runner.run(stage,self.exe,self.elf,self.root/'save',scene='hub',save_when_hl=993701506631)
+        self.assertIsNone(plain['save_when_hl'])
+        self.assertEqual(spawn.call_args.kwargs['env']['D2_CHEATS_TEST_SAVE_WHEN_HL'],'993701506631')
+        self.assertEqual(result['save_when_hl'],993701506631)
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='d2-run-test-')
         self.addCleanup(self.temp.cleanup)

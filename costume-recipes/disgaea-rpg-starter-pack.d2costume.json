@@ -1,0 +1,207 @@
+{
+  "format": "d2-costume-recipe",
+  "version": 1,
+  "name": "Disgaea RPG starter pack",
+  "created": "2026-10-09",
+  "game": {
+    "title_id": "BLUS31313",
+    "version": "1.40"
+  },
+  "note": "Contains no artwork or game data. Rebuild with your own Disgaea D2 dump and Disgaea RPG assets: tools/costume import <this file>",
+  "costumes": [
+    {
+      "character": "Etna",
+      "class_id": 30,
+      "costume_id": "liones-princess-etna",
+      "display_name": "Liones Princess Etna",
+      "rpg_character": 84,
+      "face": {
+        "crop": [
+          19,
+          28,
+          106,
+          115
+        ]
+      },
+      "story_character": 13201,
+      "illustration": {
+        "crop": [
+          155,
+          280,
+          285,
+          680
+        ],
+        "matte": null
+      },
+      "grow": "yes",
+      "color": 1,
+      "sources": {
+        "prefabs/characters/84": "aaa354cb068379a9c550ff57161d8eea3f26e955a6740daebc27d72ef6a099a0",
+        "atlas/chara/battle/front/front84": "4073f491ea279967cb53c620a9778669587cc4f3ec8d7b11598a06aa9101f602",
+        "atlas/chara/battle/back/back84": "5ad97e0ce09b6b56fb16dfd4078a36e0ef34b38bf551d1b021c62736696e0e96",
+        "atlas/chara/battle/wait_front/front84": "97701d189a138c79e6b4d6a484a2d4050868da121f85a609bfcccf7cb4cb0258",
+        "atlas/chara/battle/wait_back/back84": "bb61c55a4ea4b18c7d409431f1ff4d39c1c814c38d3ca9592148b282f92be7e5",
+        "atlas/chara/story/132": "ed086c1efbb38898ffa2182b5db9687a2a6179f63c72dd5d2d5725f8ccb83b34"
+      },
+      "d2_body_sha256": "e3e304ffd76c5580273ed39bf4362c76c85a053f9ad9ab33caa4d82600806f41"
+    },
+    {
+      "character": "Etna",
+      "class_id": 30,
+      "costume_id": "standard-rpg-etna",
+      "display_name": "Standard RPG Etna",
+      "rpg_character": 6,
+      "face": {
+        "crop": [
+          21,
+          18,
+          114,
+          111
+        ]
+      },
+      "grow": "yes",
+      "color": 2,
+      "sources": {
+        "prefabs/characters/6": "ae2326ea3a01eb73b5e8d2401a8bef37497b5c6426cae37822baceb3dadd004a",
+        "atlas/chara/battle/front/front6": "b66d284fe53227ec310bfe87b46cf1df75d47bf1f86af7e4e735708e2759445c",
+        "atlas/chara/battle/back/back6": "9ff9f8d5aebcb4de5d35f95ea0cf3de4a0a457ea10bbcd1bca877600686a5129",
+        "atlas/chara/battle/wait_front/front6": "8f428d87705de18e1614d69c537891b0fa1ff186dfd5030fd614972f8b0af8c8",
+        "atlas/chara/battle/wait_back/back6": "0b9b17a1778a582fcbd585c13564fc016f6318c66f7808eed0d9aef19cb198dc"
+      },
+      "d2_body_sha256": "e3e304ffd76c5580273ed39bf4362c76c85a053f9ad9ab33caa4d82600806f41"
+    },
+    {
+      "character": "Laharl",
+      "class_id": 10,
+      "costume_id": "dark-santa-laharl",
+      "display_name": "Dark Santa Laharl",
+      "rpg_character": 54,
+      "face": {
+        "crop": [
+          24,
+          13,
+          120,
+          109
+        ]
+      },
+      "story_character": 7901,
+      "illustration": {
+        "crop": [
+          175,
+          272,
+          269,
+          680
+        ],
+        "matte": null
+      },
+      "grow": "yes",
+      "color": 1,
+      "sources": {
+        "prefabs/characters/54": "2539254ba76c1af0cbeacde386a5a1e36660361482fb9ba7e5fce732c6e57ecd",
+        "atlas/chara/battle/front/front54": "f40700bf55bd290871d869b0ef4c0709b60a12de7a1ccf41fc2d297656c59102",
+        "atlas/chara/battle/back/back54": "5fe123c90ff939ceee0681bf306f1acefd4b5689af5884326034f1900d81652b",
+        "atlas/chara/battle/wait_front/front54": "099c80922ec7da1a88a2a65ae9e76f02d5c341455d57558c54acd270ffb3dfaf",
+        "atlas/chara/battle/wait_back/back54": "ab77cbf1a149d3af31aca6018cd19e6ada8de8f2c7aab182ff8ba3aa3e1071e3",
+        "atlas/chara/story/79": "616d7e1c066eeb9ea808abddba6cb6921e0ac4251e8c81cc07f5af2c26c42931"
+      },
+      "d2_body_sha256": "25ea0b911f6cf363b3658c3bf13d9bebaabb2939e3d34e580c71ff669276794e"
+    },
+    {
+      "character": "Flonne",
+      "class_id": 50,
+      "costume_id": "apprentice-angel-flonne",
+      "display_name": "Apprentice Angel Flonne",
+      "rpg_character": 32,
+      "face": {
+        "crop": [
+          13,
+          16,
+          108,
+          111
+        ]
+      },
+      "story_character": 2501,
+      "illustration": {
+        "crop": [
+          183,
+          200,
+          277,
+          608
+        ],
+        "matte": null
+      },
+      "grow": "yes",
+      "color": 1,
+      "sources": {
+        "prefabs/characters/32": "be6a0e908c8fac2521b424abbd99cb031f130bcb71be38211b4527450fd5b1d9",
+        "atlas/chara/battle/front/front32": "d312e45a1fe03781958a6ba9e29b479df2bccb969eb08104049d46287f80d6b6",
+        "atlas/chara/battle/back/back32": "470773f8719e5152cbc5c1152276be28c3288dc8891920d0ef21f101434a1410",
+        "atlas/chara/battle/wait_front/front32": "aca57578df586a0b293b7b560f133a771d43aedd80ce89cd058cf765481574ca",
+        "atlas/chara/battle/wait_back/back32": "f6f8d428394af29905beab1d844b37b5f5a0a8c02ebf4575df216c34c7a7ad74",
+        "atlas/chara/story/25": "5ea2135fd611896d30dce9ef8539d18a74eaf66c3b8eb92f81e6db2d9119475a"
+      },
+      "d2_body_sha256": "e89a6d09e9b74e0894fb1b54461a1d99b5fb323237e23324d7fbff99f96ce485"
+    },
+    {
+      "character": "Valvatorez",
+      "class_id": 230,
+      "costume_id": "yukata-valvatorez",
+      "display_name": "Yukata Valvatorez",
+      "rpg_character": 75,
+      "face": {
+        "crop": [
+          16,
+          21,
+          108,
+          113
+        ]
+      },
+      "story_character": 12801,
+      "illustration": {
+        "crop": [
+          191,
+          106,
+          285,
+          514
+        ],
+        "matte": null
+      },
+      "grow": "yes",
+      "color": 1,
+      "sources": {
+        "prefabs/characters/75": "dea2cf0aaa0be284c320fa802e90f31e9c62cc2c9676fe5bbc01cb9cf114771f",
+        "atlas/chara/battle/front/front75": "e6ace703fa502499b2603f1fe62dd0e794c3ee70993dc96333691e479967ad77",
+        "atlas/chara/battle/back/back75": "61644cb3eaa2de8442f7054e2b1328129fc53d9f665d422db7c7fb643607e372",
+        "atlas/chara/battle/wait_front/front75": "eb11ef3db5f613f0618188a5ea73421a3f0fbf6a48aa5db5371dc14fdae235b8",
+        "atlas/chara/battle/wait_back/back75": "19597d78fdbe6c8fa152d42249a27d443bc6c03fc3f414cf0ed1f55510b42858",
+        "atlas/chara/story/128": "fa790d21d38351d3bfb0d1f488b6487d1429c5db6e724791dd7187a4df8e5590"
+      },
+      "d2_body_sha256": "0084db8101b5571d4387a8621e8075294f1f2fd8be57c458ecffb44610c2af62"
+    },
+    {
+      "character": "Fuka",
+      "class_id": 340,
+      "costume_id": "rpg-fuka",
+      "display_name": "RPG Fuka",
+      "rpg_character": 9,
+      "face": {
+        "crop": [
+          20,
+          23,
+          112,
+          115
+        ]
+      },
+      "grow": "yes",
+      "color": 1,
+      "sources": {
+        "prefabs/characters/9": "e421480c766a93f6407a10716edd6d7eaa8e289772d8a6f12aefbdb22040598f",
+        "atlas/chara/battle/front/front9": "00a1fa02337275fd63265334c9788d2bc16220dd12d7331d4691800ece4f518d",
+        "atlas/chara/battle/back/back9": "3de63dd799e9ed3ae3dd09c10a507348be86d66b40a0cf3d4a13b8b3929e4235",
+        "atlas/chara/battle/wait_front/front9": "4bc3333003290696ab7ff7b65d31ad417c46edeffd40428a2f24ecab3f505a1a",
+        "atlas/chara/battle/wait_back/back9": "960f081d25dd5621106210f66b05924f585de5e561e0cf1b320ead5d8013c1ed"
+      },
+      "d2_body_sha256": "745b29e4ab31d0f20f4c0a00433935e8183e6d45e22c3e66853d1d0c949ad253"
+    }
+  ]
+}

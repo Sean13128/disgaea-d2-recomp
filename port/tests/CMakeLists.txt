@@ -51,6 +51,14 @@ add_test(NAME d2.appearance-asset-trace COMMAND "${Python3_EXECUTABLE}" "${CMAKE
 set_tests_properties(d2.appearance-asset-trace PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60)
 add_test(NAME d2.appearance-transition COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_d2_appearance_transition.py")
 set_tests_properties(d2.appearance-transition PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60)
+add_test(NAME d2.sprite-workbench COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_d2_sprite_workbench.py")
+set_tests_properties(d2.sprite-workbench PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60 SKIP_RETURN_CODE 77)
+add_test(NAME d2.costume-recipe COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_d2_costume_recipe.py")
+set_tests_properties(d2.costume-recipe PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60)
+add_test(NAME d2.costume-pack COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_d2_costume_pack.py")
+set_tests_properties(d2.costume-pack PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60 SKIP_RETURN_CODE 77)
+add_test(NAME d2.appearance-auto COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_d2_appearance_auto.py")
+set_tests_properties(d2.appearance-auto PROPERTIES LABELS "asset-free;cpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
 add_test(NAME d2.native-lzs COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_d2_native_lzs.py")
 set_tests_properties(d2.native-lzs PROPERTIES LABELS "asset-free;cpu" TIMEOUT 60)
 foreach(test IN ITEMS AN-summary AN-flags AN-metal AN-location-100 AN-location-140)
@@ -225,3 +233,14 @@ if(NOT WIN32)
     set_tests_properties(d2.AZ-audio-wait PROPERTIES LABELS "asset-free;cpu" TIMEOUT 30
         ENVIRONMENT "PS3_AUDIO_CLOCK_POLL=0;PS3_AUDIO_ROOM_POLL=0")
 endif()
+
+# macOS temp folders sit behind symlinks (/tmp, /var/folders), which the asset
+# tools' path guards refuse. Give every test a plain scratch folder inside the
+# build tree so the suite passes without a hand-set TMPDIR.
+file(REAL_PATH "${CMAKE_CURRENT_BINARY_DIR}" D2_TEST_REAL_BINARY_DIR)
+set(D2_TEST_SCRATCH "${D2_TEST_REAL_BINARY_DIR}/test-tmp")
+file(MAKE_DIRECTORY "${D2_TEST_SCRATCH}")
+get_property(d2_all_tests DIRECTORY PROPERTY TESTS)
+foreach(d2_test IN LISTS d2_all_tests)
+    set_property(TEST ${d2_test} APPEND PROPERTY ENVIRONMENT "TMPDIR=${D2_TEST_SCRATCH}")
+endforeach()

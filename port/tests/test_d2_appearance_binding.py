@@ -32,11 +32,16 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t,uint32_t,uint64_t,uint64_t,uint64
 constexpr unsigned unit=0x80000,manager=0x20000,table=0x30000,descriptor=0x40000;
 unsigned expected_alias=0;
 void d2_appearance_original_illustration(ppu_context* c){c->gpr[3]=10030;}
-void d2_appearance_original_face_coordinates(ppu_context* c){vm_write32(c->gpr[6],0);vm_write32(c->gpr[7],192);c->gpr[3]=0;}
+void d2_appearance_original_color_preview(ppu_context*){}
+void d2_appearance_original_face_coordinates(ppu_context* c){vm_write32(c->gpr[6],96*c->gpr[5]);vm_write32(c->gpr[7],192);c->gpr[3]=0;}
 void d2_appearance_original_unit_face(ppu_context* c){
- ppu_context inner;inner.gpr[3]=0;inner.gpr[4]=30;inner.gpr[6]=0x5f000;inner.gpr[7]=0x5f004;
+ ppu_context inner;inner.gpr[3]=0;inner.gpr[4]=30;inner.gpr[5]=c->gpr[10];inner.gpr[6]=0x5f000;inner.gpr[7]=0x5f004;
  func_00149E80(&inner);c->gpr[3]=vm_read32(0x5f000);c->gpr[4]=vm_read32(0x5f004);
 }
+void d2_appearance_original_class_face(ppu_context* c){d2_appearance_original_unit_face(c);}
+void d2_appearance_original_class_face_alt(ppu_context* c){d2_appearance_original_unit_face(c);}
+void d2_appearance_original_class_small_face(ppu_context* c){d2_appearance_original_unit_face(c);}
+void d2_appearance_original_class_small_face_alt(ppu_context* c){d2_appearance_original_unit_face(c);}
 void d2_appearance_original_unit_face_large(ppu_context* c){d2_appearance_original_unit_face(c);}
 void d2_appearance_original_unit_panel_face(ppu_context* c){d2_appearance_original_unit_face(c);}
 void d2_appearance_original_ui_face_draw(ppu_context* c){d2_appearance_original_unit_face(c);}
@@ -94,6 +99,14 @@ int main(int argc,char** argv){
  vm_write32(descriptor+0x1bc,0);c.gpr[29]=unit;c.lr=0xa8fe0;
  c.gpr[3]=descriptor;c.gpr[4]=30;func_00029804(&c);
  assert(std::memcmp(snapshot,memory+unit,sizeof(snapshot))==0);
+ // The temporary actor is reused: a link left by the previous actor (another
+ // class) must not hide the saved source unit, nor be trusted elsewhere.
+ constexpr unsigned other=0x90000;vm_write16(other+0x1158,31);vm_write16(other+0x1202,1);
+ vm_write32(descriptor+0x1bc,other);
+ c.gpr[3]=descriptor;c.gpr[4]=30;func_00029804(&c);
+ assert(std::memcmp(snapshot,memory+unit,sizeof(snapshot))==0);
+ expected_alias=0;c.lr=0xa8fb4;c.gpr[3]=descriptor;c.gpr[4]=30;func_00029804(&c);
+ vm_write32(descriptor+0x1bc,0);
  expected_alias=0;c.lr=0xa8fb4;c.gpr[3]=descriptor;c.gpr[4]=30;func_00029804(&c);
  // The controlled castle actor can recover its source only along E83BC.
  constexpr unsigned game=unit-0x598,control=game-0x10,stack=0x50000;
@@ -179,12 +192,36 @@ int main(int argc,char**){
   assert(std::memcmp(library_before.gpr,library.gpr,sizeof(library.gpr))==0);
  }
  construct(30000);
+ // Assembly/color preview actors have no unit, but an explicit requested class.
+ vm_write32(descriptor+0x1bc,0);
+ for(unsigned caller:{0x36108u,0x382b8u,0x2a274u}) {
+  expected_resource=30000;ppu_context preview;preview.gpr[3]=descriptor;preview.gpr[4]=30;preview.lr=caller;
+  func_00029804(&preview);assert(active_visual.resource==0);
+  vm_write16(table+676+0x1bc,30001);expected_resource=0;
+  preview.gpr[3]=descriptor;preview.gpr[4]=30;func_00029804(&preview);
+  vm_write16(table+676+0x1bc,30000);
+ }
+ {expected_resource=0;ppu_context preview;preview.gpr[3]=descriptor;preview.gpr[4]=30;preview.lr=0x1234;func_00029804(&preview);}
+ vm_write32(descriptor+0x1bc,unit);
  auto picture=[&](){uint8_t before[0x1a60];std::memcpy(before,memory+unit,sizeof(before));ppu_context p;p.gpr[3]=unit;func_00109350(&p);assert(std::memcmp(before,memory+unit,sizeof(before))==0);return p.gpr[3];};
  assert(picture()==10901);
  vm_write16(table+0x19e,30);vm_write32(0x47df98-0x47f0,0x60000);vm_write32(0x60000,0x61000);
  vm_write16(0x61000+0x2c,480);vm_write16(0x61000+0x2e,192);
  auto face=[&](bool expected){uint8_t before[0x1a60];std::memcpy(before,memory+unit,sizeof(before));ppu_context f;f.gpr[9]=unit;func_0015ACDC(&f);assert(f.gpr[3]==(expected?384:0));assert(f.gpr[4]==(expected?0:192));assert(face_unit==0);assert(std::memcmp(before,memory+unit,sizeof(before))==0);};
- face(true);{ppu_context panel;panel.gpr[6]=unit;func_0015CCAC(&panel);assert(panel.gpr[3]==384 && panel.gpr[4]==0 && face_unit==0);}
+ face(true);
+ // All five native colors route by explicit class. Extra color 4 cannot
+ // accidentally display the costume at x=384 in another character's row.
+ for(auto draw:{func_0015B22C,func_0015B390,func_0015B4EC,func_0015B5E0}) {
+  for(unsigned color=0;color<=4;++color) {
+   ppu_context f;f.gpr[9]=30;f.gpr[10]=color;draw(&f);
+   assert(f.gpr[3]==384 && f.gpr[4]==0 && face_class==0 && face_unit==0);
+  }
+  ppu_context f;f.gpr[9]=31;f.gpr[10]=4;draw(&f);assert(f.gpr[3]==0 && f.gpr[4]==192);
+ }
+ auto raw_color=[&](unsigned group){ppu_context f;f.gpr[3]=group;f.gpr[4]=31;f.gpr[5]=4;f.gpr[6]=0x5f000;f.gpr[7]=0x5f004;func_00149E80(&f);return vm_read32(0x5f000);};
+ assert(raw_color(0)==0);assert(raw_color(1)==384);
+ vm_write16(0x61000+0x2c,384);assert(raw_color(0)==384);vm_write16(0x61000+0x2c,480);
+ {ppu_context panel;panel.gpr[6]=unit;func_0015CCAC(&panel);assert(panel.gpr[3]==384 && panel.gpr[4]==0 && face_unit==0);}
  {ppu_context f;f.gpr[7]=unit;func_0007C550(&f);assert(f.gpr[3]==384 && f.gpr[4]==0 && face_unit==0);}
  vm_write32(0x64000,0x001964c0);
  {ppu_context queue;queue.gpr[9]=30;func_0019E544(&queue);assert(face_class==0);}
@@ -363,7 +400,7 @@ class NativeBindingTests(unittest.TestCase):
             env.update(roots);env['D2_APPEARANCE_MANIFEST']=str(manifest)
             subprocess.run([str(p/'disabled'),'disabled'],env=env,check=True,capture_output=True)
 
-    def check_session_harness(self,harness,invalid_catalogs=True):
+    def check_session_harness(self,harness,invalid_catalogs=True,color_slots=None):
         compiler=shutil.which('clang++') or shutil.which('c++')
         includes=[Path('/opt/homebrew/include'),Path('/usr/local/include'),Path('/usr/include')]
         include=next((p for p in includes if (p/'nlohmann/json.hpp').exists()),None)
@@ -384,6 +421,7 @@ class NativeBindingTests(unittest.TestCase):
             second=dict(first,new_resource=30001,visual_class_id=30001,costume_id='second');second.pop('illustration_resource',None);second.pop('illustration_donor',None);second.pop('face_cell',None)
             data=dict(mode='isolated-runtime-experiment',runtime_environment=roots,
                       appearances=[first],costumes=[first,second])
+            if color_slots is not None:data['color_slots']=color_slots
             manifest=p/'stage.json';manifest.write_text(json.dumps(data))
             before=manifest.read_bytes()
             env=dict(os.environ,**roots,D2_APPEARANCE_MANIFEST=str(manifest));env.pop('D2_APPEARANCE_TRACE',None)
@@ -413,6 +451,48 @@ class NativeBindingTests(unittest.TestCase):
                 manifest.write_text(json.dumps(dict(data,costumes=catalog)))
                 subprocess.run([str(p/'test'),'rejected'],env=env,check=True,capture_output=True)
 
+    def test_native_colors_select_independent_costumes_without_unit_writes(self):
+        harness=SESSION_HARNESS.split('int main')[0]+r'''
+int main(){
+ vm_write32(0x47df98-0x7e68,manager);vm_write16(manager,3);vm_write32(manager+4,table);
+ vm_write16(table+0x194,30);vm_write16(table+0x196,30);vm_write16(table+0x19e,30);
+ for(unsigned i=1;i<3;++i){unsigned row=table+i*676,id=29999+i;vm_write16(row+0x194,id);vm_write16(row+0x196,id);vm_write16(row+0x1bc,id);}
+ vm_write16(unit+0x1158,30);vm_write32(descriptor+0x1bc,unit);
+ vm_write32(0x47df98-0x47f0,0x60000);vm_write32(0x60000,0x61000);
+ vm_write16(0x61000+0x2c,480);vm_write16(0x61000+0x2e,192);
+ for(unsigned color=0;color<6;++color){
+  memory[unit+0x1183]=color;uint8_t before[0x1a60];memcpy(before,memory+unit,sizeof(before));
+  unsigned expected=color==1?30000:color==2?30001:0;
+  expected_resource=expected;ppu_context c;c.gpr[3]=descriptor;c.gpr[4]=30;c.lr=0x1234;func_00029804(&c);
+  assert(illustration_for(unit,10030)==(color==1?10901:10030));
+  assert(face_for(unit,0,30)[2]==(color==1?480:0));
+  assert(memcmp(before,memory+unit,sizeof(before))==0);
+  // Explicit menu color must beat a descriptor linked to a different saved color.
+  for(unsigned preview=0;preview<5;++preview){
+   expected_resource=preview==1?30000:preview==2?30001:0;
+   c.gpr[3]=descriptor;c.gpr[4]=30;c.gpr[5]=preview;c.lr=0x2a274;func_00029804(&c);
+   assert(face_for_class(30,0,30,preview)[2]==(preview==1?480:0));
+  }
+ }
+ // Generic list rows (Choose Color) look a face up with no unit or class: the
+ // face identity and color alone select the slot's icon, and nothing else does.
+ auto bare=[&](unsigned group,unsigned face,unsigned color){ppu_context f;f.gpr[3]=group;f.gpr[4]=face;f.gpr[5]=color;f.gpr[6]=0x5f000;f.gpr[7]=0x5f004;f.lr=0x15ae54;
+  vm_write32(0x5f000,0xdead);vm_write32(0x5f004,0xdead);func_00149E80(&f);return std::pair<unsigned,unsigned>(vm_read32(0x5f000),vm_read32(0x5f004));};
+ using cell=std::pair<unsigned,unsigned>;
+ assert(bare(0,30,1)==cell(384,0));
+ // Unassigned choices, a costume without an icon, other groups and other faces stay retail.
+ assert(bare(0,30,0)==cell(0,192) && bare(0,30,2)==cell(192,192) && bare(0,30,3)==cell(288,192) && bare(0,30,4)==cell(0,192));
+ assert(bare(1,30,1)==cell(96,192) && bare(0,31,1)==cell(96,192));
+ assert(color_slot_class_for_face(0,30)==30 && !color_slot_class_for_face(1,30) && !color_slot_class_for_face(0,31));
+ // An appended costume row copies its donor's face; it is not slot-managed and must not make the face ambiguous.
+ vm_write16(table+2*676+0x19e,30);assert(color_slot_class_for_face(0,30)==30);
+ assert(!binding_for_color(31,1));
+ assert(select_session_costume(30,"",binding_generation()));
+ assert(binding_for_color(30,1)->resource==30000); // Interim picker cannot override native slots.
+}
+'''
+        self.check_session_harness(harness,False,[dict(class_id=30,color=1,costume_id='first'),dict(class_id=30,color=2,costume_id='second')])
+
     def test_session_catalog_switches_stale_requests_and_constructor_snapshot(self):
         self.check_session_harness(SESSION_HARNESS)
 
@@ -423,7 +503,7 @@ class NativeBindingTests(unittest.TestCase):
         compiler=shutil.which('clang++') or shutil.which('c++')
         include=Path('/opt/homebrew/include')
         if not compiler or not (include/'nlohmann/json.hpp').exists():self.skipTest('Existing C++ dependencies unavailable')
-        with tempfile.TemporaryDirectory(prefix='d2-persist-binding-',dir='/Volumes/Data/ai-tmp/codex') as tmp:
+        with tempfile.TemporaryDirectory(prefix='d2-persist-binding-',dir=os.path.realpath(tempfile.gettempdir())) as tmp:
             p=Path(tmp)
             (p/'ppu_recomp.h').write_text(HEADER)
             for name in ('d2_appearance.h','d2_appearance_live.inc','d2_appearance_persist.inc'):

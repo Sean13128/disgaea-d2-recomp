@@ -48,6 +48,10 @@ void d2_appearance_original_texture_bind(ppu_context*);
 void d2_appearance_original_unit_face(ppu_context*);
 void d2_appearance_original_unit_face_large(ppu_context*);
 void d2_appearance_original_unit_panel_face(ppu_context*);
+void d2_appearance_original_class_face(ppu_context*);
+void d2_appearance_original_class_face_alt(ppu_context*);
+void d2_appearance_original_class_small_face(ppu_context*);
+void d2_appearance_original_class_small_face_alt(ppu_context*);
 void d2_appearance_original_class_queued_face(ppu_context*);
 void d2_appearance_original_class_queued_face_alt(ppu_context*);
 void d2_appearance_original_ui_face_record(ppu_context*);
@@ -57,6 +61,7 @@ void d2_appearance_original_unit_list_face_alt(ppu_context*);
 void d2_appearance_original_unit_small_face(ppu_context*);
 void d2_appearance_original_unit_small_face_alt(ppu_context*);
 void d2_appearance_original_face_coordinates(ppu_context*);
+void d2_appearance_original_color_preview(ppu_context*);
 
 namespace {
 struct VisualScope { unsigned resource=0,donor=0; };
@@ -98,6 +103,8 @@ struct Binding {
 struct BindingState {
     nlohmann::json manifest;
     std::map<unsigned,Binding> active;
+    std::set<unsigned> color_classes;
+    std::map<std::pair<unsigned,unsigned>,Binding> color_slots;
     std::map<std::pair<unsigned,std::string>,Binding> costumes;
     std::map<std::pair<unsigned,std::string>,std::string> labels;
 };
@@ -209,6 +216,19 @@ BindingState load_bindings()
                     if (!matched) throw std::runtime_error("Active appearance absent from catalog");
                 }
             }
+            if(data.contains("color_slots")) {
+                const auto& slots=data.at("color_slots");
+                if(!slots.is_array() || slots.empty() || slots.size()>128) throw std::runtime_error("Invalid color slots");
+                for(const auto& slot:slots) {
+                    unsigned cls=checked_binding_integer(slot,"class_id",1,32767);
+                    unsigned color=checked_binding_integer(slot,"color",1,4);
+                    std::string token=slot.at("costume_id");
+                    auto costume=result.costumes.find({cls,token});
+                    if(costume==result.costumes.end() || !result.color_slots.emplace(std::make_pair(cls,color),costume->second).second)
+                        throw std::runtime_error("Unknown costume or duplicate color slot");
+                    result.color_classes.emplace(cls);
+                }
+            }
             result.manifest=data;
             std::fprintf(stderr,"[D2 appearance] loaded %zu staged binding(s) from %s\n",result.active.size(),path);
         } catch (const std::exception& error) {
@@ -230,6 +250,30 @@ std::optional<Binding> binding_for(unsigned cls)
     auto found=value.state.active.find(cls);
     if (found==value.state.active.end()) return std::nullopt;
     return found->second;
+}
+// Native color is stored on each unit. Slot profiles bypass the interim
+// class-wide active choice; an unassigned slot retains its retail appearance.
+std::optional<Binding> binding_for_color(unsigned cls,unsigned color)
+{
+    auto& value=registry();
+    std::lock_guard<std::mutex> hold(value.lock);
+    if(value.state.color_classes.contains(cls)) {
+        auto found=value.state.color_slots.find({cls,color});
+        if(found==value.state.color_slots.end()) return std::nullopt;
+        Binding result=found->second;result.enabled=true;return result;
+    }
+    auto found=value.state.active.find(cls);
+    return found==value.state.active.end()?std::nullopt:std::optional<Binding>(found->second);
+}
+std::optional<Binding> binding_for_unit(uint64_t unit,unsigned cls)
+{
+    if(!readable(unit,0x11FE) || vm_read16(unit+0x1158)!=cls) return std::nullopt;
+    return binding_for_color(cls,vm_read8(unit+0x1183));
+}
+bool uses_color_slots(unsigned cls)
+{
+    auto& value=registry();std::lock_guard<std::mutex> hold(value.lock);
+    return value.state.color_classes.contains(cls);
 }
 [[maybe_unused]] uint64_t binding_generation()
 {
@@ -261,7 +305,7 @@ unsigned alternate_body(uint64_t unit,unsigned index,bool renderer=false)
 {
     if (index || !readable(unit,0x11FE)) return 0;
     const unsigned cls=vm_read16(unit+0x1158);
-    auto found=binding_for(cls);
+    auto found=binding_for_unit(unit,cls);
     if (!found || !found->enabled) return 0;
     if (found->renderer_only) {
         if (!renderer) return 0;
@@ -306,13 +350,51 @@ unsigned validated_visual(uint64_t unit,unsigned requested,const Binding& bindin
 }
 unsigned visual_class(uint64_t unit,unsigned requested,unsigned& resource)
 {
-    auto entry=binding_for(requested);
+    auto entry=binding_for_unit(unit,requested);
     return entry?validated_visual(unit,requested,*entry,resource):0;
+}
+unsigned preview_visual(unsigned cls,unsigned& resource,unsigned& donor,unsigned color=0)
+{
+    auto entry=binding_for_color(cls,color);
+    if(!entry || !entry->enabled || !entry->renderer_only) return 0;
+    uint32_t manager=vm_read32(0x47DF98-0x7E68);
+    if(!readable(manager,8)) return 0;
+    unsigned count=vm_read16(manager),donors=0,visuals=0;
+    uint32_t first=vm_read32(manager+4);
+    if(!count || count>4096 || !readable(first,count*676)) return 0;
+    for(unsigned i=0;i<count;++i) {
+        uint32_t row=first+i*676;
+        unsigned id=vm_read16(row+0x194);
+        if(id==cls) { donor=vm_read16(row+0x196); ++donors; }
+        if(id==entry->visual_class) {
+            if(vm_read16(row+0x196)!=entry->resource || vm_read16(row+0x1BC)!=entry->resource) return 0;
+            ++visuals;
+        }
+    }
+    if(donors!=1 || visuals!=1) return 0;
+    resource=entry->resource;
+    return entry->visual_class;
+}
+bool expanded_face_bank()
+{
+    uint32_t bank=vm_read32(0x47DF98-0x47F0);
+    if(!readable(bank,4)) return false;
+    uint32_t texture=vm_read32(bank);
+    if(!readable(texture,0x30)) return false;
+    unsigned width=vm_read16(texture+0x2C),height=vm_read16(texture+0x2E);
+    if(width<=384) return false;
+    auto& value=registry();
+    std::lock_guard<std::mutex> hold(value.lock);
+    for(const auto& [key,entry]:value.state.costumes)
+        if(entry.face[2]==width && entry.face[3]==height) return true;
+    for(const auto& [cls,entry]:value.state.active)
+        if(entry.face[2]==width && entry.face[3]==height) return true;
+    return false;
 }
 unsigned illustration_for(uint64_t unit,unsigned original)
 {
     if(!readable(unit,0x11FE)) return original;
-    unsigned cls=vm_read16(unit+0x1158);auto entry=binding_for(cls);
+    unsigned cls=vm_read16(unit+0x1158);auto entry=binding_for_unit(unit,cls);
     if(!entry || !entry->enabled || !entry->renderer_only || !entry->illustration_resource ||
        entry->illustration_donor!=original) return original;
     unsigned body=0;
@@ -321,7 +403,7 @@ unsigned illustration_for(uint64_t unit,unsigned original)
 uint32_t hub_source_unit(uint64_t descriptor,uint64_t stack,unsigned requested,unsigned caller)
 {
     auto entry=binding_for(requested);
-    if (!entry || !entry->enabled || !entry->renderer_only ||
+    if (!entry || (!entry->enabled && !uses_color_slots(requested)) || !entry->renderer_only ||
         caller!=0x000E836C || !readable(stack+0xA0,8) ||
         vm_read32(stack+0xA0)!=0 || vm_read32(stack+0xA4)!=0x000E83F8 ||
         !readable(descriptor,0x3DC) || vm_read32(descriptor+0x3D8)!=2 ||
@@ -344,7 +426,7 @@ uint32_t hub_source_unit(uint64_t descriptor,uint64_t stack,unsigned requested,u
 std::array<unsigned,6> face_for(uint64_t unit,unsigned group,unsigned original)
 {
     if(group || !readable(unit,0x11FE)) return {};
-    unsigned cls=vm_read16(unit+0x1158);auto entry=binding_for(cls);
+    unsigned cls=vm_read16(unit+0x1158);auto entry=binding_for_unit(unit,cls);
     if(!entry || !entry->renderer_only || !entry->face[2] || entry->face[4]!=original) return {};
     unsigned body=0;
     if(!validated_visual(unit,cls,*entry,body)) return {};
@@ -357,10 +439,10 @@ std::array<unsigned,6> face_for(uint64_t unit,unsigned group,unsigned original)
     if(!readable(texture,0x30) || vm_read16(texture+0x2C)!=entry->face[2] || vm_read16(texture+0x2E)!=entry->face[3]) return {};
     return {entry->face[0],entry->face[1],entry->face[2],entry->face[3],entry->face[4],entry->resource};
 }
-std::array<unsigned,6> face_for_class(unsigned cls,unsigned group,unsigned original)
+std::array<unsigned,6> face_for_class(unsigned cls,unsigned group,unsigned original,unsigned color=0)
 {
     if(!cls || cls>=32768 || group) return {};
-    auto entry=binding_for(cls);
+    auto entry=binding_for_color(cls,color);
     if(!entry || !entry->enabled || !entry->renderer_only || !entry->face[2] || entry->face[4]!=original) return {};
     uint32_t manager=vm_read32(0x47DF98-0x7E68);
     if(!readable(manager,8)) return {};
@@ -381,13 +463,34 @@ std::array<unsigned,6> face_for_class(unsigned cls,unsigned group,unsigned origi
     if(!readable(texture,0x30) || vm_read16(texture+0x2C)!=entry->face[2] || vm_read16(texture+0x2E)!=entry->face[3]) return {};
     return {entry->face[0],entry->face[1],entry->face[2],entry->face[3],entry->face[4],entry->resource};
 }
+// Generic list icons (for example the rows of Choose Color) reach the face
+// lookup with only a face identity and a color, no unit or class. In a
+// color-slot profile that pair names a costume when exactly one slot-managed
+// class owns the face; anything ambiguous keeps the retail icon.
+unsigned color_slot_class_for_face(unsigned group,unsigned original)
+{
+    if(group) return 0;
+    uint32_t manager=vm_read32(0x47DF98-0x7E68);
+    if(!readable(manager,8)) return 0;
+    uint32_t first=vm_read32(manager+4);unsigned count=vm_read16(manager),found=0,matches=0;
+    if(!count || count>4096 || !readable(first,count*676)) return 0;
+    for(unsigned i=0;i<count;++i) {
+        uint32_t row=first+i*676;unsigned id=vm_read16(row+0x194);
+        if(vm_read16(row+0x19E)!=original || !uses_color_slots(id)) continue;
+        found=id;++matches;
+    }
+    return matches==1?found:0;
+}
 
 #else
+unsigned color_slot_class_for_face(unsigned,unsigned) { return 0; }
 std::array<unsigned,6> face_for(uint64_t,unsigned,unsigned) { return {}; }
-std::array<unsigned,6> face_for_class(unsigned,unsigned,unsigned) { return {}; }
+std::array<unsigned,6> face_for_class(unsigned,unsigned,unsigned,unsigned=0) { return {}; }
 unsigned illustration_for(uint64_t,unsigned original) { return original; }
 unsigned alternate_body(uint64_t,unsigned,bool=false) { return 0; }
 unsigned visual_class(uint64_t,unsigned,unsigned&) { return 0; }
+unsigned preview_visual(unsigned,unsigned&,unsigned&,unsigned=0) { return 0; }
+bool expanded_face_bank() { return false; }
 uint32_t hub_source_unit(uint64_t,uint64_t,unsigned,unsigned) { return 0; }
 #endif
 std::mutex trace_lock;
@@ -441,12 +544,17 @@ void func_00029804(ppu_context* ctx)
     uint64_t descriptor=ctx->gpr[3];
     unsigned requested=unsigned(ctx->gpr[4]),caller=unsigned(ctx->lr);
     uint32_t unit=readable(descriptor,0x1c0)?vm_read32(descriptor+0x1bc):0;
-    // 1.40 func_000A8F00 builds a temporary skill actor before copying the
-    // source descriptor. At this exact callsite its saved r29 holds the
-    // source unit; the new descriptor's unit link is still zero.
-    if (!unit && caller==0x000A8FE0 && readable(ctx->gpr[29],0x11FE) &&
+    // 1.40 func_000A8F00 builds a temporary attack/skill actor before copying
+    // the source descriptor. At this exact callsite its saved r29 holds the
+    // source unit. The temporary descriptor is reused for successive actors
+    // (attacker, then target) and can still carry the previous actor's unit
+    // link, so r29 is authoritative here and a link to a unit of another
+    // class is never trusted.
+    if (caller==0x000A8FE0 && readable(ctx->gpr[29],0x11FE) &&
         vm_read16(ctx->gpr[29]+0x1158)==requested)
         unit=uint32_t(ctx->gpr[29]);
+    else if (unit && (!readable(unit,0x11FE) || vm_read16(unit+0x1158)!=requested))
+        unit=0;
     if (!unit) unit=hub_source_unit(descriptor,ctx->gpr[1],requested,caller);
     if (resource_filter() && requested==30 && caller==0x000E836C) {
         uint64_t stack=ctx->gpr[1];uint32_t control=vm_read32(0x47DF98-0x7CA4),party=vm_read32(0x47DF98-0x4F48);
@@ -458,7 +566,33 @@ void func_00029804(ppu_context* ctx)
             readable(party,0x1507EE)?unsigned(vm_read16(party+0x1507EC)):0,
             readable(control,0x150AA8)?unsigned(vm_read16(control+0x150AA6)):0,unit);
     }
-    unsigned resource=0,alias=visual_class(unit,requested,resource);
+    unsigned resource=0,donor=0,alias=visual_class(unit,requested,resource);
+    // 35Fxx/37Fxx construct menu preview actors from an explicit class, not
+    // a party unit. Scope the class-only route to their verified callsites.
+    if((!unit || caller==0x0002A274) && (caller==0x00036108 || caller==0x000382B8 || caller==0x0002A274))
+        alias=preview_visual(requested,resource,donor,unsigned(ctx->gpr[5]));
+    if(caller==0x0002A274) unit=0; // Explicit preview color, not a stale descriptor unit link.
+#if D2_APPEARANCE_IMPORTER
+    // Diagnostic only: a bound class built without a resolvable unit keeps
+    // donor art. Report each distinct construction site once, with any saved
+    // register that holds a gameplay unit of the requested class.
+    if (!alias && resource_filter()) {
+        auto bound=binding_for(requested);
+        if (bound && bound->enabled) {
+            std::lock_guard<std::mutex> lock(trace_lock);
+            static std::set<std::pair<unsigned,unsigned>> unbound;
+            if (unbound.emplace(requested,caller).second) {
+                std::fprintf(stderr,"[D2 appearance] unbound visual class=%u caller=%08x descriptor=%08x unit_link=%08x holders=",
+                             requested,caller,uint32_t(descriptor),unit);
+                for (unsigned r=14;r<32;++r)
+                    if (readable(ctx->gpr[r],0x11FE) && ctx->gpr[r]<0x100000000ull &&
+                        vm_read16(ctx->gpr[r]+0x1158)==requested)
+                        std::fprintf(stderr,"r%u=%08x ",r,uint32_t(ctx->gpr[r]));
+                std::fprintf(stderr,"\n");
+            }
+        }
+    }
+#endif
     if (resource_filter() && (requested==30 || alias)) {
         std::lock_guard<std::mutex> lock(trace_lock);
         if (visual_calls.emplace(uint32_t(descriptor),requested,alias).second)
@@ -470,9 +604,11 @@ void func_00029804(ppu_context* ctx)
     if (alias) ctx->gpr[4]=alias;
     const VisualScope previous=active_visual;
     if (alias) {
-        uint32_t manager=vm_read32(0x47DF98-0x7E68),first=vm_read32(manager+4);
-        uint32_t row=first+vm_read16(unit+0x115C)*676;
-        active_visual={resource,unsigned(vm_read16(row+0x196))};
+        if(unit) {
+            uint32_t manager=vm_read32(0x47DF98-0x7E68),first=vm_read32(manager+4);
+            donor=vm_read16(first+vm_read16(unit+0x115C)*676+0x196);
+        }
+        active_visual={resource,donor};
     }
     d2_appearance_original_visual(ctx);
     active_visual=previous;
@@ -484,6 +620,27 @@ void func_00029804(ppu_context* ctx)
                      uint32_t(descriptor),model,int32_t(vm_read32(descriptor+0x1ac)),
                      unsigned(vm_read16(descriptor+0x250)),unsigned(vm_read16(descriptor+0x252)));
     }
+}
+
+// Choose Color used to update only the existing model palette. Rebind its
+// visual definition before that update so moving the cursor previews a costume.
+void func_0026C044(ppu_context* ctx)
+{
+#if D2_APPEARANCE_IMPORTER
+    uint64_t menu=ctx->gpr[3];unsigned color=unsigned(ctx->gpr[4]);
+    uint32_t unit=readable(menu,0x28)?vm_read32(menu+0x20):0;
+    unsigned cls=readable(unit,0x11FE)?vm_read16(unit+0x1158):0;
+    uint32_t descriptor=vm_read32(0x47DF98-0x1768);
+    if(uses_color_slots(cls) && color<=4 && readable(descriptor,0x3DC)) {
+        unsigned resource=0,donor=0;
+        auto binding=binding_for_color(cls,color);
+        // Validate imported aliases before changing a live preview. Unassigned
+        // choices use the native donor and their original palette.
+        if(!binding || preview_visual(cls,resource,donor,color))
+            ppu_guest_call_ct(0x0002A25C,0x47DF98,descriptor,cls,color,0,1,0,0,0);
+    }
+#endif
+    d2_appearance_original_color_preview(ctx);
 }
 
 void func_002E89D8(ppu_context* ctx)
@@ -519,7 +676,7 @@ unsigned queued_face_class(uint64_t parameter)
     if(count>128 || link.slot<link.owner || link.slot>=link.owner+count*16 || (link.slot-link.owner)%16 ||
        vm_read32(parameter)!=link.owner || vm_read32(link.slot+8)!=parameter ||
        vm_read32(link.slot+4)!=link.callback || vm_read32(link.callback)!=0x001964C0 ||
-       vm_read32(parameter+0x3C)>255 || !face_for_class(link.cls,0,vm_read32(parameter+0x38))[2]) return 0;
+       vm_read32(parameter+0x3C)>255 || !face_for_class(link.cls,0,vm_read32(parameter+0x38),vm_read32(parameter+0x3C))[2]) return 0;
     return link.cls;
 }
 }
@@ -575,6 +732,26 @@ void func_0015CCAC(ppu_context* ctx)
     FaceScope scope(ctx->gpr[6]);
     d2_appearance_original_unit_panel_face(ctx);
 }
+void func_0015B22C(ppu_context* ctx)
+{
+    FaceClassScope scope(unsigned(ctx->gpr[9]));
+    d2_appearance_original_class_face(ctx);
+}
+void func_0015B390(ppu_context* ctx)
+{
+    FaceClassScope scope(unsigned(ctx->gpr[9]));
+    d2_appearance_original_class_face_alt(ctx);
+}
+void func_0015B4EC(ppu_context* ctx)
+{
+    FaceClassScope scope(unsigned(ctx->gpr[9]));
+    d2_appearance_original_class_small_face(ctx);
+}
+void func_0015B5E0(ppu_context* ctx)
+{
+    FaceClassScope scope(unsigned(ctx->gpr[9]));
+    d2_appearance_original_class_small_face_alt(ctx);
+}
 void func_0007C11C(ppu_context* ctx)
 {
     FaceScope scope(ctx->gpr[8]);
@@ -600,6 +777,14 @@ void func_00149E80(ppu_context* ctx)
     unsigned group=unsigned(ctx->gpr[3]),original=unsigned(ctx->gpr[4]),color=unsigned(ctx->gpr[5]),caller=unsigned(ctx->lr);
     uint64_t x=ctx->gpr[6],y=ctx->gpr[7];
     d2_appearance_original_face_coordinates(ctx);
+    // Extra color 4 produces x=384. Widening the retail four-column bank
+    // made that formerly out-of-bank request address an unrelated costume.
+    // Keep unbound retail icons in their own row; only validated bindings
+    // below may address the appended columns.
+    if(!group && readable(x,4) && readable(y,4) &&
+       vm_read32(x)>=384 && expanded_face_bank() &&
+       !(face_unit && x<face_unit+0x1A60 && x+4>face_unit))
+        vm_write32(x,0);
     if(resource_filter() && readable(x,4) && readable(y,4)) {
         std::lock_guard<std::mutex> lock(trace_lock);
         if(face_lookups.emplace(uint32_t(face_unit),group,original,caller).second) {
@@ -617,7 +802,9 @@ void func_00149E80(ppu_context* ctx)
                 uint32_t(face_unit),original,group,texture,width,height,vm_read32(x),vm_read32(y),caller,parents[0],parents[1],parents[2],parents[3]);
         }
     }
-    auto cell=face_unit?face_for(face_unit,group,original):face_for_class(face_class,group,original);
+    unsigned cls=face_class;
+    if(!face_unit && !cls) cls=color_slot_class_for_face(group,original);
+    auto cell=face_unit?face_for(face_unit,group,original):face_for_class(cls,group,original,color);
     if(!cell[2] || !readable(x,4) || !readable(y,4) ||
        (x<face_unit+0x1A60 && x+4>face_unit) || (y<face_unit+0x1A60 && y+4>face_unit)) return;
     vm_write32(x,cell[0]);vm_write32(y,cell[1]);
@@ -625,7 +812,7 @@ void func_00149E80(ppu_context* ctx)
         std::lock_guard<std::mutex> lock(trace_lock);
         if(face_routes.emplace(uint32_t(face_unit),original,color,cell[0],cell[1],caller).second)
             std::fprintf(stderr,"[D2 appearance] face_cell unit=%08x class=%u donor=%u resource=%u color=%u x=%u y=%u atlas=%ux%u caller=%08x\n",
-                uint32_t(face_unit),face_class,original,cell[5],color,cell[0],cell[1],cell[2],cell[3],caller);
+                uint32_t(face_unit),cls,original,cell[5],color,cell[0],cell[1],cell[2],cell[3],caller);
     }
 }
 

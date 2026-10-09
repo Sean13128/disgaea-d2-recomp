@@ -101,7 +101,7 @@ extern "C" void d2_appearance_frame(void* context,int save_ready)
         cls=unit?vm_read16(unit+0x1158):0;
         auto binding=binding_for(cls);
         unsigned actor_cls=vm_read16(actor+0x21C);
-        ready=binding && binding->renderer_only && live_donor_valid(unit,cls) && vm_read32(actor+0x3D8)==2 &&
+        ready=!uses_color_slots(cls) && binding && binding->renderer_only && live_donor_valid(unit,cls) && vm_read32(actor+0x3D8)==2 &&
             vm_read32(actor+0x1A4)!=0 && (actor_cls==cls || actor_cls==binding->visual_class);
         if(ready && native_call(0x00033C48)) ready=false;
     }
