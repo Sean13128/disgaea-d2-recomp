@@ -6,4 +6,5 @@ if [[ $# != 2 ]]; then echo 'Usage: port/tests/run.sh <sdk-directory> <new-test-
 sdk=$(cd "$1" && pwd)
 work=$2
 cmake -S "$root/port/tests" -B "$work" -G Ninja -DPS3RECOMP_DIR="$sdk" -DPython3_EXECUTABLE="${PYTHON:-$(command -v python3)}"
+cmake --build "$work"
 ctest --test-dir "$work" --output-on-failure

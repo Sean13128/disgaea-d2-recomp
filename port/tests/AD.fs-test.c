@@ -1,4 +1,5 @@
-/* Shared update overlay and hdd0 translation, without any game assets. */
+/* Shared update overlay, hdd0 translation, parent-traversal rejection and the
+ * read-only disc mount, without any game assets. */
 #include "runtime/syscalls/sys_fs.c"
 #undef st_atime
 #undef st_mtime
@@ -40,5 +41,32 @@ int main(int argc, char** argv)
     assert(!strcmp(path, expected));
     assert(cellfs_translate_path("/dev_hdd0", path, sizeof path) == 0);
     snprintf(expected, sizeof expected, "%s/", hdd); assert(!strcmp(path, expected));
+
+    /* ".." components never resolve, whichever translator sees them. */
+    assert(!ps3_vfs_guest_path_safe("/dev_hdd0/game/../../etc/passwd"));
+    assert(!ps3_vfs_guest_path_safe(".."));
+    assert(!ps3_vfs_guest_path_safe("/app_home/USRDIR/.."));
+    assert(!ps3_vfs_guest_path_safe("/dev_bdvd\\..\\x"));
+    assert(ps3_vfs_guest_path_safe("/dev_hdd0/game/a..b/..c/d.."));
+    assert(cellfs_translate_path("/dev_hdd0/game/../../etc/passwd", path, sizeof path) == -1);
+    assert(cellfs_translate_path("/dev_bdvd/../outside", path, sizeof path) == -1);
+    path[0] = 'x';
+    sys_fs_translate_path("/app_home/../../outside", path, (int)sizeof path);
+    assert(path[0] == '\0');
+
+    /* The disc mount is read-only by guest prefix and by host location; hdd0
+     * stays writable and a sibling of the dump root is not mistaken for it. */
+    assert(ps3_vfs_write_denied("/dev_bdvd/PS3_GAME/USRDIR/x", "", NULL));
+    assert(ps3_vfs_write_denied("/dev_bdvd", NULL, NULL));
+    assert(!ps3_vfs_write_denied("/dev_bdvdx/y", "", NULL));
+    snprintf(path, sizeof path, "%s/USRDIR/Data/new.dat", disc);
+    assert(ps3_vfs_write_denied("/app_home/USRDIR/Data/new.dat", path, "."));
+    snprintf(path, sizeof path, "%s/game/TEST00000/USRDIR/save.dat", hdd);
+    assert(!ps3_vfs_write_denied("/dev_hdd0/game/TEST00000/USRDIR/save.dat", path, "."));
+    snprintf(path, sizeof path, "%s2/x", disc);
+    assert(!ps3_vfs_write_denied("/host_root/x", path, "."));
+    snprintf(path, sizeof path, "%s/x", argv[1]);
+    assert(ps3_vfs_write_denied("/host_root/x", path, argv[1]));
     puts("PASS: shared overlay precedence, disc fallback, version-100 isolation, DLC/bare hdd0 paths");
+    puts("PASS: parent traversal rejected, disc mount read-only, hdd0 writable");
 }

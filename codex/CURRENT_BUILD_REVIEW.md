@@ -2,13 +2,61 @@
 
 The core rendering, FIFO, audio timing, and editor work has useful regression coverage. The main weaknesses are failure handling, recovery of persistent data, and reproduction of the build outside this working directory. Fix R01–R04 first; retain the existing synchronization and cache correctness checks while doing so.
 
-This review documents findings and recommendations only. No implementation, build configuration, game dump, installed content, or personal saves were changed by this review.
+The 2026-10-05 review documented findings only. The 2026-10-11 status audit below records which ones the current tree fixes. Each finding's original text follows the audit unchanged.
 
 **Reviewed build.** Project HEAD `270982a` plus the current uncommitted port changes; SDK HEAD `f1d2b5c` plus its local changes, based on upstream `a679051`. `port/build` is Release, game version `140`, host sanitizers disabled. The tested runner and bundled runner were built at 15:18 CDT. A source snapshot was taken at 16:00:45 CDT to keep regression checks consistent during concurrent development. The completed AI investigation and later warp, Metal fixture, and loader diagnostic changes were also inspected; the prioritized findings below remain applicable. References name functions where concurrent edits may move line numbers.
 
 **Coverage.** Reviewed all handwritten port entry points, game overrides, cheats/editor, settings, launcher, scripts, CMake and packaging files, and the save importer. Reviewed local SDK changes and the relevant memory/ELF, filesystem/save, FIFO/RESC, draw engine/Metal/overlay, audio, input, polling, and SPU paths. Checked generated-code hook matching and both version profiles. The thousands of lifted game functions and unrelated upstream SDK modules received targeted inspection, rather than a complete semantic revalidation.
 
 Priority meanings: **P1** = address first because it can strand data, crash startup, or prevent reproduction of this build; **P2** = functional/reliability defect with a specific trigger. Findings marked “reproduced” were exercised during this review. Static findings have an identified code path but lack a fresh UI/GPU reproduction.
+
+## Status audit — 2026-10-11
+
+Re-checked every finding against the current tree (project `main` plus this change; SDK bootstrapped from `patches/SDK.lock`), not against the historical prose below. Statuses: **Resolved** = fix present in source and covered by a test that ran here; **Resolved (source)** = fix present in source, but its test needs macOS/Metal/AppKit or game data and was not executed on this Linux VM; **Partial** / **Open** as stated.
+
+| ID | Status | Evidence |
+|---|---|---|
+| R01 | Resolved (source) | `ppu_load_elf` validates the whole program-header table before writing guest memory. It checks `filesz > memsz`, overflow-checked file ranges, VM bounds for the copied and in-memory ranges, and LOAD/TLS alignment. The malformed-segment regression is `runtime/ppu/tests/test_loader_validation.cpp` (`d2.loader-validation`). That test is registered only on Apple and needs a built game target, so it was not run here. |
+| R02 | Resolved | `commit_save` writes a transaction record and fsyncs before each rename; `recover_save_transactions` runs at startup and rolls back or completes an interrupted commit. Covered by `d2.savedata-transaction` / `d2.savedata-io` (pass). |
+| R03 | Resolved | `edat_decrypt_file_key` writes a unique sibling temp file, checks write/`ferror`/flush/decoded length/fsync/`fclose`, then atomically renames; `edat_resolve_key` rejects empty or short caches. `d2.edat` passes. |
+| R04 | Resolved | `patches/ps3recomp-d2-macos.diff` contains `cellGcm_fifo_enable_snapshot`, `rsx_metal_backend_configure`, `cellAudioHostSetGain`, `ps3_guest_frame_hook`. `tools/bootstrap_sdk.sh` into a disposable directory prints `SDK bootstrap PASS` and the tree matches `SDK.lock`; the lock was re-exported for this change. |
+| R05 | Resolved (source) | Window close and Quit both call `ps3_host_request_stop`; `main` stops guest workers and joins the frame thread; frame-thread creation failure is handled. Not exercised against a real window here. |
+| R06 | Resolved (source) | `main` returns the `sys_process_exit` code if set, otherwise `1` when `ppu_run` fails. |
+| R07 | Resolved (source) | `capture.sh` / `run.sh` use the shared `d2_prepare` version selection, fail on missing saves or failed copies, and return the runner status. `d2.AL-scripts` covers this but needs `work/EBOOT.elf` (absent here). |
+| R08 | Resolved (source) | The engine submit path encodes recorded guest work whether or not `nextDrawable` returns a drawable and only skips the display blit. `AL.metal-test.m` injects `PS3RECOMP_METAL_NIL_DRAWABLE`; Metal-only, not run here. |
+| R09 | Resolved (source) | `DisgaeaD2Dist` is not `ALL`; packaging stages in the binary dir, signs/verifies, then publishes through `DisgaeaD2Publish` as one exchange. |
+| R10 | Resolved | The fixtures named above are tracked under `port/tests` (82 tracked files). A clean configure registers 70 tests before this change and 72 after it. `port/tests/run.sh` now builds the CMake test executables before running CTest; without that step, `d2.guest-poll-filter` and both `d2.AY-compat*` tests reported *Not Run*. |
+| R11 | Resolved (source) | The launcher checks `TITLE_ID == BLUS31313`, requires the update/DLC content, and offers explicit Install/Migrate into Application Support hdd0. Not run under Finder here. |
+| R12 | Resolved (source) | `PS3RECOMP_DIR` defaults to `port/../ps3recomp`; explicit `-DRECOMP_DIR/D2_OUT_DIR/SPU_DIR` take precedence; `d2_cheats.cpp` includes SDK headers through configured include paths only. |
+
+**Further improvements**
+
+| Item | Status | Evidence |
+|---|---|---|
+| Shared-state ownership | Partial | `ppu_fs.cpp`: one mutex covers fd/dir slot allocation, lookup and close. `FsFileRef` pins a `FILE*` during I/O, so a close that races with I/O defers `fclose` until the last user releases it. Read diagnostics counters and env knobs are atomic or initialized once. `cellAudio.c`: mixer start/stop/join are serialized by a lifecycle mutex, and the stop flag is `_Atomic`. `port/main.cpp`: `g_frames_presented` is `std::atomic<unsigned>`. New ThreadSanitizer fixtures `d2.tsan-ppu-fs` (open/read/fstat/close/dir traffic racing foreign closes) and `d2.tsan-audio-lifecycle` pass. Its first run reported real races in the unsynchronized `cellFsRead` diagnostic counters and env caches, which are fixed here. **Still open:** guest control-word publication (plain `memcpy` + fence) was not changed; `cellAudioInit`/`Quit` are not serialized against each other. |
+| Bound caches | Partial | Draw-engine pipelines are capped at `RSX_DRAW_ENGINE_PIPELINE_CACHE` (4096, matching Metal's `ENG_MAX_PIPES`). Failed builds go into a bounded cooldown table instead of a live slot. A full table evicts the LRU pipeline and calls `pipeline_release`, and eviction or backend exhaustion is logged. The Metal backend recycles released pipeline slots through its deferred-retirement path. `test_pipeline_cache_bounds` in the SDK draw test covers failure, retry, fill, reuse, LRU eviction, rebuild and shutdown release (`d2.draw` passes). **Still open:** surface/depth table capacities were not measured over long sessions. OPERATIONS.md checkpoint #14 (60-minute session) needs a rerun on a Mac. |
+| Displayed vs guest rates | Resolved (source) | The presenter reports guest-submission and display rates separately via `ps3_host_frame_rates`. |
+| Debounce settings | Resolved (source) | Geometry changes reschedule a 0.35 s timer; `d2_settings_flush` persists at shutdown; save failure is shown in the UI. |
+| Version identity / dependencies | Open | Per-version entry/TOC/defaults live in `port/CMakeLists.txt` and Python dependencies are pinned in `tools/requirements-lifts.txt`. There is still no generated manifest with ELF hashes/hook profiles and no `CMakePresets.json` for 100/140 and sanitizers. |
+| Filesystem boundaries | Partial | `sys_fs.c` exports `ps3_vfs_guest_path_safe` (rejects `..` path components), `ps3_vfs_resolve_device` (`/dev_hdd0`, `/dev_hdd1`, `/dev_flash`) and `ps3_vfs_write_denied`. `ppu_fs.cpp`, raw `sys_fs` and `cellFs.c` all use these before building a host path. Write/create/truncate opens, mkdir, rmdir, unlink, rename and path truncate on `/dev_bdvd` or under the dump root return `0x80010026`. fd-based ftruncate relies on the open-mode check, because a disc fd can only be read-only. `d2.filesystem` covers traversal, read-only disc and writable hdd0. **Still open:** app_home/overlay mount logic is still per-translator, and save import/export is not coordinated with active saves. |
+
+**Commands and results (Linux x86_64, clang 14, Python 3.11 `.venv`).**
+
+```sh
+./tools/bootstrap_sdk.sh "$PWD/ps3recomp"           # SDK bootstrap PASS, tree matches SDK.lock
+cmake -S port/tests -B port/build -G Ninja -DPS3RECOMP_DIR="$PWD/ps3recomp" \
+      -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
+cmake --build port/build
+ctest --test-dir port/build --output-on-failure      # or: PYTHON=.venv/bin/python port/tests/run.sh ps3recomp <dir>
+```
+
+- Baseline (before this change): 70 tests registered. 55 passed and 15 failed. The failures came from missing toolchain packages, CMake test executables that were never built (*Not Run*), and random sanitizer crashes. Clang 14's ASan/TSan runtimes segfault at random under the kernel's high mmap ASLR entropy. `run.py` now launches sanitized fixtures under `setarch -R` on Linux.
+- After: 72 registered, **70 passed, 2 failed**. Both failures need game-derived inputs that cannot be committed: `d2.native-lzs` needs lifted `port/src/recomp-140/ppu_recomp_008.cpp`, and `d2.AL-scripts` needs `work/EBOOT.elf`. `d2.AG2-fifo` once failed an assertion under `-j4` load. It passed in three serial reruns and in the final parallel run, so it is timing-sensitive.
+- Not verifiable on this VM: Metal/AppKit fixtures (AL-metal, AN-metal, hotkey, UI), Finder launch, red-button close, and any full-game or 60-minute session.
+
+---
+
+## Original review (2026-10-05)
 
 | ID | Priority | Finding | Evidence |
 |---|---|---|---|
