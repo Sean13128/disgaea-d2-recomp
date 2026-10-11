@@ -75,7 +75,7 @@ index 4ef4dfa..015a95a 100644
      # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
      #
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index b51fb7c..b751471 100644
+index b51fb7c..b8d6600 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -20,6 +20,25 @@
@@ -597,9 +597,49 @@ index b51fb7c..b751471 100644
      }
  
      printf("[cellAudio] Mixing thread stopped\n");
-@@ -650,6 +947,13 @@ static int audio_start_mix_thread(void)
+@@ -626,8 +923,26 @@ static void* audio_mix_thread_func(void* arg)
+ }
+ #endif
+ 
+-static int audio_start_mix_thread(void)
++/* Init/Quit may race from different guest threads: s_mix_thread and its
++ * live flag change only under this lock, so a thread is never created twice
++ * or joined twice. The mixer itself polls the atomic s_mix_thread_running. */
++#ifdef _WIN32
++static SRWLOCK s_mix_lifecycle = SRWLOCK_INIT;
++#define MIX_LIFECYCLE_LOCK()   AcquireSRWLockExclusive(&s_mix_lifecycle)
++#define MIX_LIFECYCLE_UNLOCK() ReleaseSRWLockExclusive(&s_mix_lifecycle)
++#else
++static pthread_mutex_t s_mix_lifecycle = PTHREAD_MUTEX_INITIALIZER;
++#define MIX_LIFECYCLE_LOCK()   pthread_mutex_lock(&s_mix_lifecycle)
++#define MIX_LIFECYCLE_UNLOCK() pthread_mutex_unlock(&s_mix_lifecycle)
++#endif
++
++static int audio_start_mix_thread_locked(void)
+ {
++#ifdef _WIN32
++    if (s_mix_thread) return 0;
++#else
++    if (s_mix_thread_live) return 0;
++#endif
+     s_mix_thread_running = 1;
+ 
+ #ifdef _WIN32
+@@ -647,9 +962,25 @@ static int audio_start_mix_thread(void)
+     return 0;
+ }
+ 
++static int audio_start_mix_thread(void)
++{
++    MIX_LIFECYCLE_LOCK();
++    int rc = audio_start_mix_thread_locked();
++    MIX_LIFECYCLE_UNLOCK();
++    return rc;
++}
++
  static void audio_stop_mix_thread(void)
  {
++    MIX_LIFECYCLE_LOCK();
      s_mix_thread_running = 0;
 +#if AUDIO_BACKEND_SDL2
 +    if (s_sdl_room) {
@@ -611,7 +651,15 @@ index b51fb7c..b751471 100644
  #ifdef _WIN32
      if (s_mix_thread) {
          WaitForSingleObject(s_mix_thread, 2000);
-@@ -999,8 +1303,16 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
+@@ -668,6 +999,7 @@ static void audio_stop_mix_thread(void)
+         s_mix_thread_live = 0;
+     }
+ #endif
++    MIX_LIFECYCLE_UNLOCK();
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -999,8 +1331,16 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
      if (!s_audio_initialized)
          return CELL_AUDIO_ERROR_NOT_INIT;
  
@@ -6046,7 +6094,7 @@ index 0000000..401fc8f
 +#endif
 +#endif
 diff --git a/libs/filesystem/cellFs.c b/libs/filesystem/cellFs.c
-index 5166a47..0607f88 100644
+index 5166a47..60e8838 100644
 --- a/libs/filesystem/cellFs.c
 +++ b/libs/filesystem/cellFs.c
 @@ -6,6 +6,7 @@
@@ -6065,37 +6113,61 @@ index 5166a47..0607f88 100644
  #  define HOST_MKDIR(p)   mkdir(p, 0755)
  #  define HOST_STAT       stat
  #  define HOST_STAT_T     struct stat
-@@ -126,6 +128,15 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
+@@ -119,6 +121,13 @@ void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path)
+ 
+ /* Translate a PS3 path to a host path. Returns 0 on success, -1 if no mapping found.
+  * Also exposed publicly as cellfs_translate_path() for use by other modules. */
++int ps3_vfs_guest_path_safe(const char* ps3_path);
++int ps3_vfs_resolve_device(const char* ps3_path, char* host_path, size_t cap,
++                           const char* flash_default);
++int ps3_vfs_write_denied(const char* ps3_path, const char* host_path,
++                         const char* disc_root);
++#define CELLFS_EROFS ((s32)0x80010026u)
++
+ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
+ {
+     init_default_mappings();
+@@ -126,6 +135,12 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
      if (!ps3_path || !host_buf || buf_size == 0)
          return -1;
  
-+    extern int ps3_vfs_hdd1_path(const char* path, char* out, size_t cap);
-+    if (ps3_vfs_hdd1_path(ps3_path, host_buf, buf_size)) return 0;
-+
-+    const char* hdd0 = getenv("PS3_HDD0_ROOT");
-+    if (hdd0 && (!strcmp(ps3_path, "/dev_hdd0") || !strncmp(ps3_path, "/dev_hdd0/", 10))) {
-+        snprintf(host_buf, buf_size, "%s/%s", hdd0, ps3_path + (ps3_path[9] ? 10 : 9));
-+        return 0;
++    if (!ps3_vfs_guest_path_safe(ps3_path)) {
++        printf("[cellFs] rejected parent traversal: '%s'\n", ps3_path);
++        return -1;
 +    }
++    if (ps3_vfs_resolve_device(ps3_path, host_buf, buf_size, NULL)) return 0;
 +
      /* Find longest matching prefix */
      int best = -1;
      size_t best_len = 0;
-@@ -422,6 +433,13 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
+@@ -421,6 +436,17 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
+         printf("[cellFs] Open: no path mapping for '%s'\n", gpath(path));
          return (s32)CELL_ENOENT;
      }
- 
++    if (((flags & CELL_FS_O_ACCMODE) != CELL_FS_O_RDONLY ||
++         (flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND))) &&
++        ps3_vfs_write_denied(gpath(path), host_path, s_root_path))
++        return CELLFS_EROFS;
++
 +    if ((flags & CELL_FS_O_ACCMODE) == CELL_FS_O_RDONLY) {
 +        char cache[CELL_FS_MAX_FS_PATH_LENGTH];
 +        const char* use = edat_resolve(host_path, cache, sizeof cache);
 +        if (!use) return (s32)CELL_EIO;
 +        if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use);
 +    }
-+
+ 
      /* If creating, ensure parent directories exist */
      if (flags & CELL_FS_O_CREAT) {
-         ensure_parent_dirs(host_path);
-@@ -733,6 +751,16 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
+@@ -654,6 +680,8 @@ s32 cellFsTruncate(const char* path, u64 size)
+     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+         return (s32)CELL_ENOENT;
++    if (ps3_vfs_write_denied(gpath(path), host_path, s_root_path))
++        return CELLFS_EROFS;
+ 
+ #ifdef _WIN32
+     HANDLE hFile = CreateFileA(host_path, GENERIC_WRITE, 0, NULL,
+@@ -733,6 +761,16 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
              }
          }
      }
@@ -6112,6 +6184,34 @@ index 5166a47..0607f88 100644
  #endif
  
      if (free_block_count) vm_write64((u32)(uintptr_t)free_block_count, free_blocks);
+@@ -899,6 +937,8 @@ s32 cellFsMkdir(const char* path, s32 mode)
+     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+         return (s32)CELL_ENOENT;
++    if (ps3_vfs_write_denied(gpath(path), host_path, s_root_path))
++        return CELLFS_EROFS;
+ 
+     ensure_parent_dirs(host_path);
+ 
+@@ -930,6 +970,9 @@ s32 cellFsRename(const char* from, const char* to)
+         return (s32)CELL_ENOENT;
+     if (translate_path(gpath(to), host_to, sizeof(host_to)) != 0)
+         return (s32)CELL_ENOENT;
++    if (ps3_vfs_write_denied(gpath(from), host_from, s_root_path) ||
++        ps3_vfs_write_denied(gpath(to), host_to, s_root_path))
++        return CELLFS_EROFS;
+ 
+     ensure_parent_dirs(host_to);
+ 
+@@ -953,6 +996,8 @@ s32 cellFsUnlink(const char* path)
+     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+         return (s32)CELL_ENOENT;
++    if (ps3_vfs_write_denied(gpath(path), host_path, s_root_path))
++        return CELLFS_EROFS;
+ 
+     if (remove(host_path) != 0) {
+         printf("[cellFs] Unlink: remove('%s') failed: %s\n", host_path, strerror(errno));
 diff --git a/libs/filesystem/edat.c b/libs/filesystem/edat.c
 index 64f0ff5..b5845f8 100644
 --- a/libs/filesystem/edat.c
@@ -14549,18 +14649,46 @@ index d105230..33168b9 100644
      mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
      mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 5c50e4a..c563a8e 100644
+index 5c50e4a..2e5a9a2 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -135,6 +135,7 @@ static struct {
+@@ -39,7 +39,11 @@ extern u32 ppu_vm_size;
+ #define ENG_MAX_ZDEPTHS    64
+ #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
+ #define ENG_MAX_VTEXTURES  64
+-#define ENG_MAX_PIPELINES  8192
++#define ENG_MAX_PIPELINES  RSX_DRAW_ENGINE_PIPELINE_CACHE
++/* Keys whose translation or creation failed, kept apart from the pipeline
++ * table so a failure holds no backend slot, and retried after a cooldown. */
++#define ENG_MAX_PIPELINE_FAILURES 256
++#define ENG_PIPELINE_RETRY_FRAMES 120u
+ #define ENG_MAX_BATCHES    256
+ #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
+ #define ENG_INVALID        0xFFFFFFFFu
+@@ -109,7 +113,8 @@ typedef struct {
+     u64 last_use_serial;
+ } eng_texture;
+ 
+-typedef struct { u64 key; u32 handle; u8 fixed; } eng_pipeline;
++typedef struct { u64 key; u64 last_use; u32 handle; u8 fixed; } eng_pipeline;
++typedef struct { u64 key; u32 retry_frame; } eng_pipeline_failure;
+ 
+ typedef struct { u32 first, count; } eng_batch;
+ 
+@@ -134,7 +139,12 @@ static struct {
+     u32 n_textures;
      eng_pipeline pipelines[ENG_MAX_PIPELINES];
      u32 n_pipelines;
++    u64 pipeline_use_serial;
++    u32 pipeline_evictions;
++    eng_pipeline_failure pipeline_failures[ENG_MAX_PIPELINE_FAILURES];
++    u32 n_pipeline_failures, next_pipeline_failure;
      eng_display_buffer display_buffers[8];
 +    u32 resc_copy[6];
  
      u32 frames;
      u64 texture_use_serial;
-@@ -203,17 +204,72 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
+@@ -203,17 +213,72 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
      s_guest_user = user;
  }
  
@@ -14639,7 +14767,7 @@ index 5c50e4a..c563a8e 100644
  }
  
  static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
-@@ -708,23 +764,44 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
+@@ -708,23 +773,44 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
      return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
  }
  
@@ -14692,7 +14820,7 @@ index 5c50e4a..c563a8e 100644
      *readable = 1;
      return hash;
  }
-@@ -754,6 +831,13 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -754,6 +840,13 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
      const u8* src = eng_guest_ptr(NULL, location, offset, span);
      if (!src) return 0;
  
@@ -14706,7 +14834,7 @@ index 5c50e4a..c563a8e 100644
      const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                              w, h, nlv, faces, remap, fmt);
      if (!handle) return 0;
-@@ -934,6 +1018,32 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+@@ -934,6 +1027,32 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
      return vp_instrs && fp_size;
  }
  
@@ -14739,7 +14867,7 @@ index 5c50e4a..c563a8e 100644
  /* The layout the active vertex program actually reads. An uncertain analysis
   * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
  static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
-@@ -941,12 +1051,8 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
+@@ -941,12 +1060,8 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
      u32 mask = 0xFFFFu;
      const u8* uc = NULL;
      u32 instrs = 0;
@@ -14754,7 +14882,22 @@ index 5c50e4a..c563a8e 100644
      rsx_vertex_layout_plan_init(layout, mask);
  }
  
-@@ -1023,6 +1129,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1006,9 +1121,11 @@ static const char* const kEngFixedPS =
+ "};\n"
+ "float4 main(PSInput input) : SV_TARGET { return input.col0; }\n";
+ 
+-/* The pipeline for this draw, built once per distinct key. A negative result
+- * is cached too (handle 0), so a program pair that will not translate is not
+- * retried on every draw of every frame. */
++/* The pipeline for this draw, built once per distinct key. A failed build is
++ * not cached as a pipeline: it is remembered in a small side table so the
++ * pair is not re-translated on every draw, then retried after a cooldown.
++ * A full table evicts its least recently used pipeline; the backend defers
++ * the release until recorded commands have resolved their handles. */
+ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                             const rsx_be_render_state* rs,
+                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+@@ -1023,6 +1140,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
      const u32 cube_mask = eng_cube_mask();
      const u32 vtex_mask = eng_vtex_mask();
@@ -14773,7 +14916,7 @@ index 5c50e4a..c563a8e 100644
  
      memset(&g.fp_constants, 0, sizeof g.fp_constants);
      if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
-@@ -1038,13 +1156,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1038,13 +1167,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
          key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
      } else {
@@ -14790,7 +14933,30 @@ index 5c50e4a..c563a8e 100644
      }
      key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
      key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
-@@ -1074,6 +1194,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1056,10 +1187,21 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+ 
+     for (u32 i = 0; i < g.n_pipelines; i++)
+         if (g.pipelines[i].key == key) {
++            g.pipelines[i].last_use = ++g.pipeline_use_serial;
+             *out_fixed = g.pipelines[i].fixed;
+             return g.pipelines[i].handle;
+         }
+-    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
++    for (u32 i = 0; i < g.n_pipeline_failures; i++)
++        if (g.pipeline_failures[i].key == key) {
++            if ((s32)(g.frames - g.pipeline_failures[i].retry_frame) < 0) {
++                *out_fixed = fixed;
++                return 0;
++            }
++            g.pipeline_failures[i] = g.pipeline_failures[--g.n_pipeline_failures];
++            if (g.next_pipeline_failure > g.n_pipeline_failures)
++                g.next_pipeline_failure = g.n_pipeline_failures;
++            break;
++        }
+ 
+     u32 handle = 0;
+     int vi = 1, fi = 1;
+@@ -1074,6 +1216,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                            s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
          if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
@@ -14799,7 +14965,50 @@ index 5c50e4a..c563a8e 100644
          if (fi > 0 && rs->alpha_test_enable &&
              rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                               rs->alpha_func) < 0)
-@@ -1148,6 +1270,146 @@ static int dc_reserve_indices(u32 count)
+@@ -1088,11 +1232,38 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                 (unsigned long long)key, fixed ? "built-in" : "guest",
+                 vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)"); }
+ 
+-    g.pipelines[g.n_pipelines].key = key;
+-    g.pipelines[g.n_pipelines].handle = handle;
+-    g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+-    g.n_pipelines++;
+     *out_fixed = fixed;
++    if (!handle) {
++        eng_pipeline_failure* f;
++        if (g.n_pipeline_failures < ENG_MAX_PIPELINE_FAILURES) {
++            f = &g.pipeline_failures[g.n_pipeline_failures++];
++        } else {
++            f = &g.pipeline_failures[g.next_pipeline_failure];
++            g.next_pipeline_failure = (g.next_pipeline_failure + 1) % ENG_MAX_PIPELINE_FAILURES;
++        }
++        f->key = key;
++        f->retry_frame = g.frames + ENG_PIPELINE_RETRY_FRAMES;
++        return 0;
++    }
++
++    u32 index;
++    if (g.n_pipelines < ENG_MAX_PIPELINES) {
++        index = g.n_pipelines++;
++    } else {
++        index = 0;
++        for (u32 i = 1; i < g.n_pipelines; i++)
++            if (g.pipelines[i].last_use < g.pipelines[index].last_use) index = i;
++        g.be->pipeline_release(g.be->user, g.pipelines[index].handle);
++        g.pipeline_evictions++;
++        if (g.pipeline_evictions == 1 || g.pipeline_evictions % 1024 == 0)
++            fprintf(stderr, "[rsx engine] pipeline cache full (%u live): evicted "
++                            "least recently used, %u evictions so far\n",
++                    (unsigned)ENG_MAX_PIPELINES, g.pipeline_evictions);
++    }
++    g.pipelines[index].key = key;
++    g.pipelines[index].handle = handle;
++    g.pipelines[index].fixed = (u8)fixed;
++    g.pipelines[index].last_use = ++g.pipeline_use_serial;
+     return handle;
+ }
+ 
+@@ -1148,6 +1319,146 @@ static int dc_reserve_indices(u32 count)
      return 1;
  }
  
@@ -14946,7 +15155,7 @@ index 5c50e4a..c563a8e 100644
  /* Turn this group's batches into a reference list, recording a CUT rather
   * than fetching a phantom vertex wherever the restart sentinel appears, then
   * collapse repeated references and fetch each unique vertex once.
-@@ -1216,12 +1478,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -1216,12 +1527,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
          dc.fetch_ok = 0;
          return;
      }
@@ -14962,7 +15171,7 @@ index 5c50e4a..c563a8e 100644
      }
      dc.n_verts = dc.n_refs;
  }
-@@ -1587,16 +1846,15 @@ static u32 eng_present_surface(u32 buffer_id)
+@@ -1587,16 +1895,15 @@ static u32 eng_present_surface(u32 buffer_id)
  {
      if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
          const eng_display_buffer* d = &g.display_buffers[buffer_id];
@@ -14982,7 +15191,7 @@ index 5c50e4a..c563a8e 100644
      if (!g.ready) return;
      const u32 target = eng_present_surface(buffer_id);
      if (target == ENG_INVALID) return;
-@@ -1623,6 +1881,101 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+@@ -1623,6 +1930,101 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
      eng_present(g.last_flip_buffer);
  }
  
@@ -15084,7 +15293,7 @@ index 5c50e4a..c563a8e 100644
  /* ---- public API ---------------------------------------------------------- */
  
  void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
-@@ -1635,6 +1988,11 @@ void rsx_draw_engine_set_default(int on)
+@@ -1635,6 +2037,11 @@ void rsx_draw_engine_set_default(int on)
      g.default_on = on;
  }
  
@@ -15096,7 +15305,7 @@ index 5c50e4a..c563a8e 100644
  int rsx_draw_engine_enabled(void)
  {
      static int cached = -1;
-@@ -1697,6 +2055,7 @@ void rsx_draw_engine_shutdown(void)
+@@ -1697,6 +2104,7 @@ void rsx_draw_engine_shutdown(void)
      if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
  
      rsx_draw_engine_set_guest_memory(NULL, NULL);
@@ -15104,7 +15313,7 @@ index 5c50e4a..c563a8e 100644
      free(dc.refs); free(dc.cuts); free(dc.verts);
      rsx_vertex_remap_destroy(&dc.ref_remap);
      memset(&dc, 0, sizeof dc);
-@@ -1709,6 +2068,18 @@ void rsx_draw_engine_shutdown(void)
+@@ -1709,6 +2117,18 @@ void rsx_draw_engine_shutdown(void)
  void rsx_draw_engine_method(u32 method, u32 arg)
  {
      if (!g.ready) return;
@@ -15124,10 +15333,22 @@ index 5c50e4a..c563a8e 100644
       * whose SPU-built command lists bind NV4097 elsewhere would otherwise
       * store its state in the wrong register bank.  Standard NV4097 methods
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index fa8b57d..716fc98 100644
+index fa8b57d..48083f8 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -199,6 +199,12 @@ typedef struct rsx_draw_backend {
+@@ -104,6 +104,11 @@ typedef struct rsx_be_render_state {
+  * where the boundary is rather than assuming a number. */
+ #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+ 
++/* Live pipelines the engine keeps before evicting the least recently used
++ * one. Matches the Metal backend's pipeline table, so the engine never asks
++ * a backend for a slot it cannot have. */
++#define RSX_DRAW_ENGINE_PIPELINE_CACHE 4096
++
+ /* ---- the backend interface ---------------------------------------------- */
+ 
+ typedef struct rsx_draw_backend {
+@@ -199,6 +204,12 @@ typedef struct rsx_draw_backend {
      void (*clear_depth_stencil)(void* user, u32 depth, u32 flags,
                                  float depth_value, u8 stencil);
  
@@ -15140,7 +15361,7 @@ index fa8b57d..716fc98 100644
      /* Present the named surface, and read a rectangle of one back. The rows
       * come back in the format the target was created with, so R,G,B,A for an
       * ordinary colour surface. */
-@@ -210,7 +216,13 @@ typedef struct rsx_draw_backend {
+@@ -210,7 +221,13 @@ typedef struct rsx_draw_backend {
  /* ---- the engine --------------------------------------------------------- */
  
  /* Register the backend the engine drives. Passing NULL unregisters it. */
@@ -15154,7 +15375,7 @@ index fa8b57d..716fc98 100644
  
  /* Is the engine the path this run takes? True when PS3RECOMP_RSX_ENGINE names
   * "dispatch" (or the backend asked for it by default) and a backend has been
-@@ -239,6 +251,16 @@ void rsx_draw_engine_method(u32 method, u32 arg);
+@@ -239,6 +256,16 @@ void rsx_draw_engine_method(u32 method, u32 arg);
  void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                          u32 pitch, u32 width, u32 height);
  
@@ -15238,7 +15459,7 @@ index aee795c..d767a85 100644
  /* --- test hooks ---------------------------------------------------------- */
  
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index d04b34e..fbe4fee 100644
+index d04b34e..b1da7b9 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
 @@ -46,13 +46,16 @@
@@ -15468,7 +15689,18 @@ index d04b34e..fbe4fee 100644
  
  typedef struct {
      id<MTLRenderPipelineState> pso;
-@@ -2086,7 +2227,7 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
+@@ -2069,6 +2210,10 @@ typedef struct {
+ } EngPipeline;
+ static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
+ static u32 s_eng_pipe_count;
++/* Released pipeline slots, recycled on the same deferred schedule as objects. */
++static u8  s_eng_pipe_retired[ENG_MAX_PIPES];
++static u32 s_eng_pipe_free[ENG_MAX_PIPES];
++static u32 s_eng_pipe_free_count;
+ 
+ /* Compiled MSL functions, keyed on the HLSL the decompilers emitted: one
+  * program is translated and compiled once however many pipeline variants
+@@ -2086,7 +2231,7 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
  static u32 s_eng_view_count;
  
  typedef enum {
@@ -15477,7 +15709,7 @@ index d04b34e..fbe4fee 100644
  } EngRecKind;
  
  typedef struct {
-@@ -2099,6 +2240,7 @@ typedef struct {
+@@ -2099,6 +2244,7 @@ typedef struct {
      u32 pipeline;
      MTLPrimitiveType topology;
      u32 vb_off, stride, vertex_count;
@@ -15485,7 +15717,7 @@ index d04b34e..fbe4fee 100644
      u32 ib_off, index_count;
      u32 vs_cb_off, vs_cb_bytes;
      u32 ps_cb_off, ps_cb_bytes;
-@@ -2114,6 +2256,7 @@ typedef struct {
+@@ -2114,6 +2260,7 @@ typedef struct {
      float clear_depth;
      u8    clear_stencil;
      u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
@@ -15493,7 +15725,7 @@ index d04b34e..fbe4fee 100644
  } EngRecord;
  
  static EngRecord s_eng_rec[ENG_MAX_RECORDS];
-@@ -2132,11 +2275,20 @@ static id<MTLRenderPipelineState> s_eng_blit_pso;
+@@ -2132,11 +2279,20 @@ static id<MTLRenderPipelineState> s_eng_blit_pso;
  static MTLPixelFormat             s_eng_blit_pso_fmt;
  static id<MTLRenderPipelineState> s_eng_depth_pso;
  static id<MTLSamplerState>        s_eng_point_sampler;
@@ -15514,7 +15746,7 @@ index d04b34e..fbe4fee 100644
  "vertex BOut eng_fullscreen_vs(uint vid [[vertex_id]]) {\n"
  "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
  "    BOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
-@@ -2148,6 +2300,15 @@ static NSString* const kEngHelperMSL = @
+@@ -2148,6 +2304,15 @@ static NSString* const kEngHelperMSL = @
  "                            sampler s [[sampler(0)]]) {\n"
  "    return src.sample(s, i.uv);\n"
  "}\n"
@@ -15530,7 +15762,7 @@ index d04b34e..fbe4fee 100644
  "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
  "                            depth2d<float> src [[texture(0)]],\n"
  "                            sampler s [[sampler(0)]]) {\n"
-@@ -2164,6 +2325,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
+@@ -2164,6 +2329,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
          if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
          slot = s_eng_obj_count++;
      }
@@ -15538,7 +15770,21 @@ index d04b34e..fbe4fee 100644
      s_eng_obj[slot] = t;
      return slot + 1;
  }
-@@ -2193,6 +2355,8 @@ static void eng_obj_release(void* user, u32 handle)
+@@ -2185,6 +2351,13 @@ static void eng_collect_retired_objects(void)
+         s_eng_obj[i] = nil;
+         s_eng_obj_free[s_eng_obj_free_count++] = i;
+     }
++    for (u32 i = 0; i < s_eng_pipe_count; ++i) {
++        if (!s_eng_pipe_retired[i]) continue;
++        s_eng_pipe_retired[i] = 0;
++        s_eng_pipe[i].pso = nil;
++        s_eng_pipe[i].ds  = nil;
++        s_eng_pipe_free[s_eng_pipe_free_count++] = i;
++    }
+ }
+ 
+ static void eng_obj_release(void* user, u32 handle)
+@@ -2193,6 +2366,8 @@ static void eng_obj_release(void* user, u32 handle)
      if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1] ||
          s_eng_obj_retired[handle - 1]) return;
      s_eng_obj_retired[handle - 1] = 1;
@@ -15547,7 +15793,7 @@ index d04b34e..fbe4fee 100644
      /* Any view cut from this object stops being valid with it. */
      for (u32 i = 0; i < s_eng_view_count; i++)
          if (s_eng_view[i].surface == handle) {
-@@ -2224,7 +2388,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+@@ -2224,7 +2399,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
  
  /* ---- staging ------------------------------------------------------------- */
  
@@ -15556,7 +15802,7 @@ index d04b34e..fbe4fee 100644
  
  static int eng_stage_reserve(u32 bytes, u32* out_off)
  {
-@@ -2262,6 +2426,9 @@ static int eng_init(void* user, u32 width, u32 height)
+@@ -2262,6 +2437,9 @@ static int eng_init(void* user, u32 width, u32 height)
  {
      (void)user; (void)width; (void)height;
      if (!s_dev) return -1;
@@ -15566,7 +15812,7 @@ index d04b34e..fbe4fee 100644
      NSError* err = nil;
      s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
      if (!s_eng_helper_lib) {
-@@ -2275,9 +2442,13 @@ static int eng_init(void* user, u32 width, u32 height)
+@@ -2275,9 +2453,13 @@ static int eng_init(void* user, u32 width, u32 height)
      sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
      sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
      s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
@@ -15581,8 +15827,12 @@ index d04b34e..fbe4fee 100644
  static void eng_shutdown(void* user)
  {
      (void)user;
-@@ -2292,13 +2463,17 @@ static void eng_shutdown(void* user)
+@@ -2290,15 +2472,21 @@ static void eng_shutdown(void* user)
+     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
+     s_eng_obj_count = s_eng_obj_free_count = 0;
      memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
++    memset(s_eng_pipe_retired, 0, sizeof s_eng_pipe_retired);
++    s_eng_pipe_free_count = 0;
      s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
      s_eng_rec_count = 0;
 +    eng_vertex_buffers_clear();
@@ -15599,7 +15849,7 @@ index d04b34e..fbe4fee 100644
  }
  
  static void eng_submit_and_wait(void* user, u32 reason)
-@@ -2353,7 +2528,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+@@ -2353,7 +2541,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
      if (!s_dev || !w || !h) return 0;
      MTLTextureDescriptor* td =
          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:eng_pixel_format(fmt)
@@ -15608,7 +15858,7 @@ index d04b34e..fbe4fee 100644
                                                         mipmapped:NO];
      /* PixelFormatView because a unit sampling this target wears its own
       * TEXTURE_CONTROL1 crossbar as a view swizzle. */
-@@ -2361,10 +2536,25 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+@@ -2361,10 +2549,25 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                 MTLTextureUsagePixelFormatView;
      id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
      if (!t) return 0;
@@ -15638,7 +15888,7 @@ index d04b34e..fbe4fee 100644
  }
  
  static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
-@@ -2403,13 +2593,15 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -2403,13 +2606,15 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
      if (!s_dev || !w || !h) return 0;
      MTLTextureDescriptor* td =
          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
@@ -15657,7 +15907,7 @@ index d04b34e..fbe4fee 100644
  }
  
  /* The sampleable copy of a depth target. The copy is a record in the stream,
-@@ -2435,14 +2627,15 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2435,14 +2640,15 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
      }
      MTLTextureDescriptor* td =
          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
@@ -15675,7 +15925,7 @@ index d04b34e..fbe4fee 100644
      r->kind = ENG_REC_DEPTH_RESOLVE;
      r->depth = depth;
      r->resolve_dst = dst;
-@@ -2463,7 +2656,28 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
+@@ -2463,7 +2669,28 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
      char name[64];
      snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
      dump_shader(name, hlsl);
@@ -15705,7 +15955,47 @@ index d04b34e..fbe4fee 100644
          fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
                  (unsigned long long)hash, s_log);
      } else {
-@@ -2709,6 +2923,70 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+@@ -2488,7 +2715,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+     if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
+     if (!rt_count) rt_count = 1;
+     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+-    if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
++    if (s_eng_pipe_count >= ENG_MAX_PIPES && !s_eng_pipe_free_count) {
++        static u32 reported;
++        if (reported++ % 1024 == 0)
++            fprintf(stderr, "[rsx engine/metal] pipeline table exhausted (%d live)\n",
++                    ENG_MAX_PIPES);
++        return 0;
++    }
+     id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
+     if (!vs) return 0;
+     id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");
+@@ -2583,7 +2816,8 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+     id<MTLDepthStencilState> ds = [s_dev newDepthStencilStateWithDescriptor:dd];
+     if (!ds) return 0;
+ 
+-    const u32 slot = s_eng_pipe_count++;
++    const u32 slot = s_eng_pipe_free_count ? s_eng_pipe_free[--s_eng_pipe_free_count]
++                                           : s_eng_pipe_count++;
+     s_eng_pipe[slot].pso = pso;
+     s_eng_pipe[slot].ds  = ds;
+     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
+@@ -2603,9 +2837,11 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+ static void eng_pipeline_release(void* user, u32 pipeline)
+ {
+     (void)user;
+-    if (pipeline && pipeline <= s_eng_pipe_count) {
+-        s_eng_pipe[pipeline - 1].pso = nil;
+-        s_eng_pipe[pipeline - 1].ds  = nil;
++    /* Recorded draws resolve the slot at encode time; recycle it afterwards. */
++    if (pipeline && pipeline <= s_eng_pipe_count && s_eng_pipe[pipeline - 1].pso &&
++        !s_eng_pipe_retired[pipeline - 1]) {
++        s_eng_pipe_retired[pipeline - 1] = 1;
++        eng_collect_retired_objects();
+     }
+ }
+ 
+@@ -2709,6 +2945,70 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
  static void eng_set_stencil_ref(void* user, u32 ref)
  { (void)user; s_eng_pending.stencil_ref = ref; }
  
@@ -15776,7 +16066,7 @@ index d04b34e..fbe4fee 100644
  static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                       u32 vertex_count, u32 stride, const u32* indices,
                       u32 index_count)
-@@ -2717,7 +2995,8 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -2717,7 +3017,8 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      if (!vertex_count || !stride) return;
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      u32 vb_off = 0, ib_off = 0;
@@ -15786,7 +16076,7 @@ index d04b34e..fbe4fee 100644
      if (indices && index_count &&
          !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
          return;
-@@ -2727,6 +3006,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -2727,6 +3028,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      r->kind         = ENG_REC_DRAW;
      r->topology     = topo_to_metal(topology);
      r->vb_off       = vb_off;
@@ -15794,7 +16084,7 @@ index d04b34e..fbe4fee 100644
      r->stride       = stride;
      r->vertex_count = vertex_count;
      r->ib_off       = ib_off;
-@@ -2744,7 +3024,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
+@@ -2744,7 +3046,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
                      (u32)(rgba[2] * 255.0f + 0.5f);
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -15803,7 +16093,7 @@ index d04b34e..fbe4fee 100644
      r->kind  = ENG_REC_CLEAR_COLOR;
      r->rt[0] = surface;
      r->nrt   = 1;
-@@ -2757,7 +3037,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2757,7 +3059,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
      (void)user;
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -15812,7 +16102,7 @@ index d04b34e..fbe4fee 100644
      r->kind = ENG_REC_CLEAR_DS;
      r->depth = depth;
      r->clear_flags = flags;
-@@ -2767,25 +3047,36 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2767,25 +3069,36 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
  
  /* ---- replay -------------------------------------------------------------- */
  
@@ -15863,7 +16153,7 @@ index d04b34e..fbe4fee 100644
          id<MTLTexture> t = eng_obj(r->tex[u]);
          [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
          [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
-@@ -2793,6 +3084,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -2793,6 +3106,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                               atIndex:(NSUInteger)u];
      }
      for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
@@ -15871,7 +16161,7 @@ index d04b34e..fbe4fee 100644
          id<MTLTexture> t = eng_obj(r->vtex[u]);
          [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
          [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
-@@ -2812,6 +3104,85 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -2812,6 +3126,85 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
      else
          [enc drawPrimitives:r->topology
                  vertexStart:0 vertexCount:r->vertex_count];
@@ -15957,7 +16247,7 @@ index d04b34e..fbe4fee 100644
  }
  
  /* Is this record aimed at exactly these colour attachments, in this order? */
-@@ -2830,6 +3201,19 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2830,6 +3223,19 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
  {
      u32 i = 0;
      while (i < s_eng_rec_count) {
@@ -15977,7 +16267,7 @@ index d04b34e..fbe4fee 100644
          if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
              const EngRecord* r = &s_eng_rec[i++];
              id<MTLTexture> src = eng_obj(r->depth);
-@@ -2861,13 +3245,20 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2861,13 +3267,20 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          float cdepth = 1.0f;
          u8 cstencil = 0;
          while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
@@ -15999,7 +16289,7 @@ index d04b34e..fbe4fee 100644
                      cc_surf[n_cc++] = r->rt[0];
                  }
                  memcpy(cc_rgba[k], r->clear_rgba, sizeof cc_rgba[k]);
-@@ -2922,10 +3313,21 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2922,10 +3335,21 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          }
          id<MTLTexture> zbuf = eng_obj(depth);
          if (!attach && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
@@ -16025,7 +16315,7 @@ index d04b34e..fbe4fee 100644
  
          MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
          for (u32 k = 0; k < attach; k++) {
-@@ -2947,15 +3349,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2947,15 +3371,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              rp.depthAttachment.texture       = zbuf;
              rp.depthAttachment.storeAction   = MTLStoreActionStore;
              rp.depthAttachment.loadAction    =
@@ -16045,7 +16335,7 @@ index d04b34e..fbe4fee 100644
          }
          if (!attach) {
              rp.renderTargetWidth  = [zbuf width];
-@@ -2972,11 +3374,12 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -2972,11 +3396,12 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                     eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
              continue;
          }
@@ -16061,7 +16351,7 @@ index d04b34e..fbe4fee 100644
              i++;
          }
          [enc endEncoding];
-@@ -3012,11 +3415,45 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -3012,11 +3437,45 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
      if (!e) return;
      [e setRenderPipelineState:s_eng_blit_pso];
      [e setFragmentTexture:src atIndex:0];
@@ -16108,7 +16398,7 @@ index d04b34e..fbe4fee 100644
  /* Encode everything recorded so far and commit it.
   *
   * The staging arena is recycled the moment this returns, which is safe
-@@ -3027,7 +3464,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -3027,7 +3486,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
   * in-flight semaphore instead, the same bound the vtable path uses, because
   * waiting on every frame is the one pattern where a driver cannot hide its
   * encoding work. */
@@ -16121,7 +16411,7 @@ index d04b34e..fbe4fee 100644
  {
      @autoreleasepool {
          id<CAMetalDrawable> drawable = nil;
-@@ -3038,11 +3479,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3038,11 +3501,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              if (s_headless) {
                  dst = s_offscreen;
              } else {
@@ -16134,7 +16424,7 @@ index d04b34e..fbe4fee 100644
                  dst = [drawable texture];
              }
          }
-@@ -3052,8 +3489,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3052,8 +3511,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
                                        options:MTLResourceStorageModeShared];
          id<MTLCommandBuffer> cb = [s_queue commandBuffer];
@@ -16157,7 +16447,7 @@ index d04b34e..fbe4fee 100644
          if (drawable) [cb presentDrawable:drawable];
          if (windowed_present) {
              dispatch_semaphore_t sem = s_inflight;
-@@ -3064,17 +3514,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3064,17 +3536,21 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              [cb commit];
          } else {
              [cb commit];
@@ -16180,7 +16470,7 @@ index d04b34e..fbe4fee 100644
      }
  }
  
-@@ -3085,7 +3539,10 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3085,7 +3561,10 @@ static void eng_dump_frame(id<MTLTexture> src)
      const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
      if (!path || !*path) return;
      static unsigned frame;
@@ -16192,7 +16482,7 @@ index d04b34e..fbe4fee 100644
      if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
          [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
      size_t w = [src width], h = [src height];
-@@ -3099,6 +3556,8 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3099,6 +3578,8 @@ static void eng_dump_frame(id<MTLTexture> src)
      }
      [src getBytes:rgba bytesPerRow:w * 4
        fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
@@ -16201,7 +16491,7 @@ index d04b34e..fbe4fee 100644
      FILE* f = fopen(path, "wb");
      if (f) {
          fprintf(f, "P6\n%zu %zu\n255\n", w, h);
-@@ -3114,13 +3573,135 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3114,13 +3595,135 @@ static void eng_dump_frame(id<MTLTexture> src)
      free(rgba);
  }
  
@@ -16340,7 +16630,7 @@ index d04b34e..fbe4fee 100644
  }
  
  static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-@@ -3129,6 +3710,19 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -3129,6 +3732,19 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
      (void)user;
      id<MTLTexture> t = eng_obj(surface);
      if (!t || !out || !out_pitch || !w || !h) return;
@@ -16360,7 +16650,7 @@ index d04b34e..fbe4fee 100644
      if (x + w > [t width] || y + h > [t height]) return;
      [t getBytes:out bytesPerRow:out_pitch
       fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
-@@ -3162,6 +3756,7 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -3162,6 +3778,7 @@ static const rsx_draw_backend s_engine_backend = {
      .draw                 = eng_draw,
      .clear_color          = eng_clear_color,
      .clear_depth_stencil  = eng_clear_depth_stencil,
@@ -16368,7 +16658,7 @@ index d04b34e..fbe4fee 100644
      .present              = eng_present,
      .readback             = eng_readback,
  };
-@@ -3171,6 +3766,12 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -3171,6 +3788,12 @@ static const rsx_draw_backend s_engine_backend = {
  int rsx_metal_backend_init(u32 width, u32 height, const char* title)
  {
      @autoreleasepool {
@@ -16381,7 +16671,7 @@ index d04b34e..fbe4fee 100644
          if (width)  s_width  = width;
          if (height) s_height = height;
  
-@@ -3238,16 +3839,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+@@ -3238,16 +3861,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
           * instead of the rsx_state vtable. The vtable stays registered only on
           * the path that uses it: the FIFO walker feeds both models, so leaving
           * both live would record every draw twice. */
@@ -16405,7 +16695,7 @@ index d04b34e..fbe4fee 100644
          } else {
              rsx_set_backend(&s_backend_vtable);
          }
-@@ -3263,6 +3866,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+@@ -3263,6 +3888,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
  void rsx_metal_backend_shutdown(void)
  {
      @autoreleasepool {
@@ -16419,7 +16709,7 @@ index d04b34e..fbe4fee 100644
          if (s_ready) rsx_set_backend(NULL);
          if (s_eng_active) rsx_draw_engine_shutdown();
          rsx_draw_engine_set_backend(NULL);
-@@ -3279,7 +3889,15 @@ void rsx_metal_backend_shutdown(void)
+@@ -3279,7 +3911,15 @@ void rsx_metal_backend_shutdown(void)
              s_inflight = nil;
          }
  #if !TARGET_OS_IPHONE
@@ -16436,7 +16726,7 @@ index d04b34e..fbe4fee 100644
  #endif
          free(s_verts); s_verts = NULL;
          free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
-@@ -3326,11 +3944,16 @@ int rsx_metal_backend_pump_messages(void)
+@@ -3326,11 +3966,16 @@ int rsx_metal_backend_pump_messages(void)
  #if !TARGET_OS_IPHONE
      if ([NSThread isMainThread])
          return pump_messages_impl();
@@ -16458,7 +16748,7 @@ index d04b34e..fbe4fee 100644
  #else
      return pump_messages_impl();
  #endif
-@@ -3339,10 +3962,9 @@ int rsx_metal_backend_pump_messages(void)
+@@ -3339,10 +3984,9 @@ int rsx_metal_backend_pump_messages(void)
  void rsx_metal_backend_present(void)
  {
      if (!s_ready) return;
@@ -16472,7 +16762,7 @@ index d04b34e..fbe4fee 100644
      /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
      if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
      @autoreleasepool {
-@@ -3420,6 +4042,7 @@ void rsx_metal_backend_present(void)
+@@ -3420,6 +4064,7 @@ void rsx_metal_backend_present(void)
              encode_draw(enc, &rec->u.draw, &ps);
          }
          if (enc) [enc endEncoding];
@@ -16480,7 +16770,7 @@ index d04b34e..fbe4fee 100644
  
          if (drawable) [cb presentDrawable:drawable];
  
-@@ -3436,6 +4059,8 @@ void rsx_metal_backend_present(void)
+@@ -3436,6 +4081,8 @@ void rsx_metal_backend_present(void)
              [cb commit];        /* no wait: the CPU goes on to the next frame */
          }
  
@@ -16489,7 +16779,7 @@ index d04b34e..fbe4fee 100644
          if (s_dropped_records) {
              fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
                      s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
-@@ -3478,3 +4103,6 @@ u32 rsx_metal_backend_guest_draws(void)
+@@ -3478,3 +4125,6 @@ u32 rsx_metal_backend_guest_draws(void)
  {
      return s_eng_active ? rsx_draw_engine_guest_draws() : s_last_guest_draws;
  }
@@ -17097,9 +17387,18 @@ index 0000000..85b6b4f
 +    }
 +}
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index 704ccef..d766563 100644
+index 704ccef..8c2d0a2 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -68,7 +68,7 @@ typedef struct {
+     int n_texture_create, n_texture_release, n_texture_upload;
+     int n_color_create, n_color_release, n_color_seeded;
+     int n_depth_create, n_depth_snapshot;
+-    int n_pipeline_create;
++    int n_pipeline_create, n_pipeline_release, fail_pipelines;
+     int n_draw, n_clear_color, n_clear_ds, n_present;
+     u32 cleared[STUB_MAX_CLEARED];
+ 
 @@ -84,6 +84,7 @@ typedef struct {
      rsx_topology draw_topology;
      u32 scissor[4];
@@ -17108,20 +17407,30 @@ index 704ccef..d766563 100644
      u32 last_created_texture, last_created_color;
      u32 last_released;
  } StubState;
-@@ -157,10 +158,11 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
+@@ -157,14 +158,19 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                  const rsx_vertex_layout_plan* layout,
                                  u32 stride, rsx_be_format rt, u32 rt_count)
  {
 -    (void)u; (void)rs; (void)layout; (void)stride; (void)rt;
+-    if (!vs || !ps || !*vs || !*ps) return 0;
 +    (void)u; (void)layout; (void)stride; (void)rt;
-     if (!vs || !ps || !*vs || !*ps) return 0;
++    if (!vs || !ps || !*vs || !*ps || stub.fail_pipelines) return 0;
      stub.n_pipeline_create++;
      stub.pipeline_rt_count = rt_count;
 +    stub.pipeline_state = *rs;
      return stub_handle();
  }
  
-@@ -577,6 +579,91 @@ static void test_texture_cache(void)
+-static void stub_pipeline_release(void* u, u32 p) { (void)u; (void)p; }
++static void stub_pipeline_release(void* u, u32 p)
++{
++    (void)u;
++    if (p && p < STUB_MAX_OBJECTS && stub.alive[p]) { stub.alive[p] = 0; stub.n_pipeline_release++; }
++}
+ 
+ static void stub_bind_targets(void* u, const u32* s, u32 count, u32 d)
+ {
+@@ -577,6 +583,91 @@ static void test_texture_cache(void)
      engine_down();
  }
  
@@ -17213,10 +17522,58 @@ index 704ccef..d766563 100644
  /* ---- 4. the pipeline key ------------------------------------------------- */
  
  static void test_pipeline_key(void)
-@@ -640,6 +727,39 @@ static void test_pipeline_key(void)
+@@ -640,6 +731,87 @@ static void test_pipeline_key(void)
      engine_down();
  }
  
++/* Long sessions: the pipeline table is bounded at the backend's cap, a failed
++ * build holds no slot and is retried after a cooldown, and a full table
++ * evicts its least recently used entry instead of refusing new draws. */
++static void test_pipeline_cache_bounds(void)
++{
++    printf("-- pipeline cache bounds\n");
++    engine_up();
++    stub.fail_pipelines = 1;
++    draw_triangle();
++    draw_triangle();
++    CHECK(stub.n_pipeline_create == 0 && stub.n_draw == 0,
++          "a failed pipeline drops the draw and is not rebuilt every draw");
++    stub.fail_pipelines = 0;
++    draw_triangle();
++    CHECK(stub.n_pipeline_create == 0, "the failure cools down before a retry");
++    const int presents = stub.n_present;
++    for (u32 i = 0; i < 130; i++) rsx_draw_engine_present();
++    CHECK(stub.n_present > presents, "frames advanced (%d presents)", stub.n_present - presents);
++    draw_triangle();
++    CHECK(stub.n_pipeline_create == 1 && stub.n_draw == 1,
++          "a failed key is retried after its cooldown and then draws");
++    engine_down();
++
++    engine_up();
++    const u32 cap = RSX_DRAW_ENGINE_PIPELINE_CACHE;
++    for (u32 i = 0; i < cap; i++) { m(0x0324, i + 1u); draw_triangle(); }
++    CHECK(stub.n_pipeline_create == (int)cap && stub.n_pipeline_release == 0,
++          "%u distinct states fill the cache without eviction (%d built)",
++          cap, stub.n_pipeline_create);
++    m(0x0324, 1u); draw_triangle();          /* touch the oldest entry */
++    CHECK(stub.n_pipeline_create == (int)cap, "a cached state is reused");
++    const int draws = stub.n_draw;
++    m(0x0324, cap + 1u); draw_triangle();
++    CHECK(stub.n_pipeline_create == (int)cap + 1 && stub.n_pipeline_release == 1 &&
++          stub.n_draw == draws + 1,
++          "past the cap one LRU pipeline is released and the draw still runs");
++    m(0x0324, 1u); draw_triangle();
++    CHECK(stub.n_pipeline_create == (int)cap + 1,
++          "the recently used entry survived eviction");
++    m(0x0324, 2u); draw_triangle();
++    CHECK(stub.n_pipeline_create == (int)cap + 2,
++          "the evicted least recently used state is rebuilt on demand");
++    engine_down();
++    CHECK(stub.n_pipeline_release == (int)cap + 2,
++          "shutdown releases every live pipeline exactly once (%d)",
++          stub.n_pipeline_release);
++}
++
 +static void test_stencil_reset(void)
 +{
 +    printf("-- stencil reset\n");
@@ -17253,12 +17610,13 @@ index 704ccef..d766563 100644
  /* ---- 5. restart cuts and topology expansion ------------------------------ */
  
  static void test_restart_expansion(void)
-@@ -979,7 +1099,9 @@ int main(void)
+@@ -979,7 +1151,10 @@ int main(void)
      test_surface_aliasing();
      test_mrt_set();
      test_texture_cache();
 +    test_texture_mutations();
      test_pipeline_key();
++    test_pipeline_cache_bounds();
 +    test_stencil_reset();
      test_restart_expansion();
      test_indexed_draws();
@@ -18607,7 +18965,7 @@ index 11a7480..e6b823c 100644
      if (result == WAIT_TIMEOUT) SetLastError(ERROR_TIMEOUT);
      return result;
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index e8f6c2b..6385820 100644
+index e8f6c2b..0fe037b 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
 @@ -17,6 +17,12 @@
@@ -18643,7 +19001,7 @@ index e8f6c2b..6385820 100644
  #define CELL_FS_SEEK_SET     0
  #define CELL_FS_SEEK_CUR     1
  #define CELL_FS_SEEK_END     2
-@@ -84,11 +90,14 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
+@@ -84,38 +90,30 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
  /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
   * translators. (extern "C" is ill-formed at block scope.) */
  extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
@@ -18652,13 +19010,154 @@ index e8f6c2b..6385820 100644
  
  /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
   * prefixes are stripped; the rest is appended to the root. */
++extern "C" int ps3_vfs_guest_path_safe(const char* ps3_path);
++extern "C" int ps3_vfs_resolve_device(const char* ps3_path, char* host_path, size_t cap,
++                                      const char* flash_default);
++extern "C" int ps3_vfs_write_denied(const char* ps3_path, const char* host_path,
++                                    const char* disc_root);
++#define FS_EROFS ((uint64_t)(int64_t)(int32_t)0x80010026u)
++
  static void host_path(char* out, size_t cap, const char* guest)
  {
-+    if (ps3_vfs_hdd1_path(guest, out, cap)) return;
-     const char* rel = guest;
-     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
-      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
-@@ -179,6 +188,9 @@ static void cellFsOpen(ppu_context* ctx)
+-    const char* rel = guest;
+-    /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+-     * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+-     * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
+-     * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
+-     * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
+-    static const char* hdd0_root = nullptr; static int hdd0_init = 0;
+-    if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+-    if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
+-        snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+-        return;
+-    }
+-
+-    /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
+-     * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
+-     * /dev_flash/sys/external/flashMP3.pic and, on a miss, prints "mp3 failed to
+-     * load MP3 codec (are you using the correct flash?)" and then crashes.
+-     * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
+-    if (strncmp(guest, "/dev_flash/", 11) == 0) {
+-        const char* fw = getenv("PS3_DEV_FLASH");
+-        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
+-        snprintf(out, cap, "%s/%s", fw, guest + 11);
+-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
++    /* ".." never resolves: an empty host path makes every host call fail. */
++    if (!ps3_vfs_guest_path_safe(guest)) {
++        fprintf(stderr, "[fs] rejected parent traversal: '%s'\n", guest);
++        if (cap) out[0] = '\0';
+         return;
+     }
+-
++    /* /dev_hdd1, /dev_hdd0 (the PS3_HDD0_ROOT update overlay) and /dev_flash
++     * (firmware: $PS3_DEV_FLASH, else RPCS3's tree) follow sys_fs.c's policy. */
++    if (ps3_vfs_resolve_device(guest, out, cap, "D:/recomp/tools/rpcs3/dev_flash")) return;
++    const char* rel = guest;
+     static const char* mounts[] = {
+         "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
+         "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
+@@ -155,17 +153,86 @@ static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */
+ static DIR*  g_dirs[FS_MAX];
+ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
+ 
+-static int fd_alloc_file(FILE* f)
++/* g_fd_lock guards slot ownership in both tables. FsFileRef pins a file slot
++ * while a call uses its FILE*: a concurrent close defers fclose to the last
++ * user, and the number is not reissued until then. Per-slot path/usm data is
++ * written only at allocation, so pinned readers need no lock. */
++static std::mutex g_fd_lock;
++static int   g_file_refs[FS_MAX];
++static FILE* g_file_closing[FS_MAX];
++
++static bool fd_slot_free(int i) { return !g_files[i] && !g_dirs[i] && !g_file_closing[i]; }
++
++static int fd_alloc_file(FILE* f, const char* gpath = "", uint8_t usm = 0)
+ {
+-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
++    std::lock_guard<std::mutex> lock(g_fd_lock);
++    for (int i = 3; i < FS_MAX; i++)
++        if (fd_slot_free(i)) {
++            g_files[i] = f;
++            g_fd_usm[i] = usm;
++            snprintf(g_fd_path[i], sizeof g_fd_path[i], "%s", gpath ? gpath : "");
++            return i;
++        }
+     return -1;
+ }
+-static int fd_alloc_dir(DIR* d)
++
++static int fd_alloc_dir(DIR* d, const char* hpath)
+ {
+-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
++    std::lock_guard<std::mutex> lock(g_fd_lock);
++    for (int i = 3; i < FS_MAX; i++)
++        if (fd_slot_free(i)) {
++            g_dirs[i] = d;
++            snprintf(g_dir_path[i], sizeof g_dir_path[i], "%s", hpath);
++            return i;
++        }
+     return -1;
+ }
+ 
++class FsFileRef {
++public:
++    explicit FsFileRef(int fd)
++    {
++        if (fd < 0 || fd >= FS_MAX) return;
++        std::lock_guard<std::mutex> lock(g_fd_lock);
++        if (g_files[fd]) { fd_ = fd; f_ = g_files[fd]; g_file_refs[fd]++; }
++    }
++    ~FsFileRef()
++    {
++        if (!f_) return;
++        FILE* done = nullptr;
++        {
++            std::lock_guard<std::mutex> lock(g_fd_lock);
++            if (--g_file_refs[fd_] == 0 && g_file_closing[fd_]) {
++                done = g_file_closing[fd_];
++                g_file_closing[fd_] = nullptr;
++            }
++        }
++        if (done) fclose(done);
++    }
++    FsFileRef(const FsFileRef&) = delete;
++    FsFileRef& operator=(const FsFileRef&) = delete;
++    FILE* get() const { return f_; }
++    explicit operator bool() const { return f_ != nullptr; }
++private:
++    int fd_ = -1;
++    FILE* f_ = nullptr;
++};
++
++static bool fd_close_file(int fd, bool* usm)
++{
++    FILE* f = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(g_fd_lock);
++        if (fd < 0 || fd >= FS_MAX || !g_files[fd]) return false;
++        *usm = g_fd_usm[fd] != 0;
++        if (g_file_refs[fd]) g_file_closing[fd] = g_files[fd];
++        else f = g_files[fd];
++        g_files[fd] = nullptr;
++    }
++    if (f) fclose(f);
++    return true;
++}
++
+ /* ---- handlers ---- */
+ static void cellFsOpen(ppu_context* ctx)
+ {
+@@ -174,11 +241,18 @@ static void cellFsOpen(ppu_context* ctx)
+     uint32_t flags  = (uint32_t)ctx->gpr[4];
+     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
+     host_path(hpath, sizeof hpath, gpath);
++    if (((flags & 0x3) || (flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND))) &&
++        ps3_vfs_write_denied(gpath, hpath, ppu_vfs_root)) {
++        ctx->gpr[3] = FS_EROFS; return;
++    }
+ 
+     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
       * file and that is opened in its place. */
      { char dec_path[1200];
        const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
@@ -18668,7 +19167,7 @@ index e8f6c2b..6385820 100644
        if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
  
      /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
-@@ -206,9 +218,12 @@ static void cellFsOpen(ppu_context* ctx)
+@@ -206,9 +280,12 @@ static void cellFsOpen(ppu_context* ctx)
              return;
          }
      }
@@ -18682,17 +19181,27 @@ index e8f6c2b..6385820 100644
          ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
      }
      const char* fmode = (acc == CELL_FS_O_RDWR)
-@@ -221,6 +236,9 @@ static void cellFsOpen(ppu_context* ctx)
+@@ -221,15 +298,16 @@ static void cellFsOpen(ppu_context* ctx)
          close(hfd);
          ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
      }
+-    int fd = fd_alloc_file(f);
 +    /* cellFs descriptors have no userspace stdio buffer: completed writes must
 +     * be visible to other descriptors and fstat, including cache headers. */
 +    setvbuf(f, nullptr, _IONBF, 0);
-     int fd = fd_alloc_file(f);
++    int fd = fd_alloc_file(f, gpath, strstr(gpath, ".usm") ? 1 : 0);
      if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
      if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-@@ -279,6 +297,9 @@ static void cellFsSdataOpen(ppu_context* ctx)
+-    g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
+     /* FS_CALLER=1: name the guest function that opened each file. A title whose
+      * streaming layer opens a file and never reads it (You Don't Know Jack's
+      * movies) is diagnosed from the opener: its sibling read path is the one
+      * that is not running. */
+-    if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
+     { char who[64] = "?";
+       if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
+           fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
+@@ -279,6 +357,9 @@ static void cellFsSdataOpen(ppu_context* ctx)
       * cellFsOpen. One decryptor, reached from both doors. */
      { char dec_path[1200];
        const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
@@ -18702,7 +19211,7 @@ index e8f6c2b..6385820 100644
        if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
  
      int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
-@@ -307,8 +328,8 @@ static void cellFsSdataOpen(ppu_context* ctx)
+@@ -307,8 +388,8 @@ static void cellFsSdataOpen(ppu_context* ctx)
          free(enc);
          if (!dec) {
              fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
@@ -18713,38 +19222,263 @@ index e8f6c2b..6385820 100644
          }
          char dmagic[4] = {0};
          if (dec_sz >= 4) memcpy(dmagic, dec, 4);
-@@ -329,6 +350,9 @@ static void cellFsSdataOpen(ppu_context* ctx)
+@@ -319,7 +400,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
+         }
+         free(dec);
+         rewind(tf);
+-        int fd = fd_alloc_file(tf);
++        int fd = fd_alloc_file(tf, gpath);
+         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
+@@ -329,7 +410,10 @@ static void cellFsSdataOpen(ppu_context* ctx)
          ctx->gpr[3] = CELL_OK;
          return;
      }
+-    int fd = fd_alloc_file(f);
 +    /* cellFs descriptors have no userspace stdio buffer: completed writes must
 +     * be visible to other descriptors and fstat, including cache headers. */
 +    setvbuf(f, nullptr, _IONBF, 0);
-     int fd = fd_alloc_file(f);
++    int fd = fd_alloc_file(f, gpath);
      if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
      if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-@@ -383,6 +407,8 @@ static void cellFsRead(ppu_context* ctx)
+     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
+@@ -342,10 +426,9 @@ static void cellFsClose(ppu_context* ctx)
+     int fd = (int)(uint32_t)ctx->gpr[3];
+     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
+-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+-        if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
+-        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+-    }
++    bool usm = false;
++    if (fd_close_file(fd, &usm) && usm && getenv("PS3_FSLOG_READS"))
++        fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+@@ -377,23 +460,30 @@ static void cellFsRead(ppu_context* ctx)
+     uint32_t buf    = (uint32_t)ctx->gpr[4];
+     uint64_t nbytes = ctx->gpr[5];
+     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
+-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    FsFileRef file(fd);
++    if (!file) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     uint64_t raw_nbytes = ctx->gpr[5];
+-    long fpos_before = ftell(g_files[fd]);
++    long fpos_before = ftell(file.get());
      if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
      fs_prefault(buf, nbytes);
-     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+-    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
++    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, file.get());   /* raw bytes, no swap */
 +    if (getenv("PS3_NPDRM_TRACE") && strstr(g_fd_path[fd], ".edat"))
 +        fprintf(stderr, "[NPDRM] read path='%s' offset=%ld bytes=%zu\n", g_fd_path[fd], fpos_before, n);
      /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
       * The intro cinematic is 28 seconds and this port renders it at a few frames
       * a second, so it cannot be watched to its end -- truncating the stream makes
-@@ -685,7 +711,21 @@ static void cellFsMkdir(ppu_context* ctx)
+      * the demuxer see EOF and the movie finish, which is what advances the title
+      * to whatever follows the intro. Deliberately a testing knob, not a fix. */
+-    { static int efd = -2; static long elim = 0;
+-      if (efd == -2) { const char* e = getenv("PS3_FSLOG_EOF");
+-          if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
+-          else efd = -1; }
++    { struct eof_knob { int fd; long limit; };
++      static const eof_knob knob = [] {
++          const char* e = getenv("PS3_FSLOG_EOF");
++          if (!e) return eof_knob{-1, 0};
++          const char* c = strchr(e, 44);
++          return eof_knob{atoi(e), c ? atol(c + 1) : 0};
++      }();
++      const int efd = knob.fd; const long elim = knob.limit;
+       if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
+-          static int once = 0;
++          static std::atomic<int> once{0};
+           if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
+           n = 0;
+       } }
+@@ -401,33 +491,40 @@ static void cellFsRead(ppu_context* ctx)
+     /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
+      * lines and they are all spent before a movie ever opens, so it cannot
+      * answer "is the streamer reading the .avi". */
+-    { static int wfd = -2;
+-      if (wfd == -2) { const char* e = getenv("PS3_FSLOG_READS"); wfd = e ? atoi(e) : -1; }
++    { static const int wfd = [] { const char* e = getenv("PS3_FSLOG_READS"); return e ? atoi(e) : -1; }();
+       if (wfd >= 0 && fd == wfd)
+           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
+                   fd, (unsigned long long)nbytes, n, fpos_before); }
+-    if (getenv("PS3_FSLOG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
++    if (getenv("PS3_FSLOG")) { static std::atomic<int> _fd{0}; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(file.get()),ferror(file.get())); }
+ #ifdef _WIN32
+-    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
++    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static std::atomic<int> _b{0}; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
+ #endif
+     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
+      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
+      * the end of the log and look identical to reads that never happen.
+      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
+      * periodic summary is enough to tell the two apart. */
+-    { static uint64_t tot=0; static int _n=0;
+-      static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
+-      tot+=n;
+-      if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
+-      int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
+-      if(_n++<50 || first_for_fd || getenv("FS_READ_ALL"))
++    { static std::atomic<uint64_t> tot{0}; static std::atomic<int> reads{0};
++      static std::atomic<uint64_t> per_fd[64]; static std::atomic<uint32_t> cnt_fd[64];
++      const uint64_t total = tot.fetch_add(n, std::memory_order_relaxed) + n;
++      uint32_t fd_count = 0;
++      if (fd>=0 && fd<64) {
++          per_fd[fd].fetch_add(n, std::memory_order_relaxed);
++          fd_count = cnt_fd[fd].fetch_add(1, std::memory_order_relaxed) + 1;
++      }
++      const int seq = reads.fetch_add(1, std::memory_order_relaxed);
++      int first_for_fd = fd_count == 1;
++      if(seq<50 || first_for_fd || getenv("FS_READ_ALL"))
+         fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
+                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
+-                (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
++                (unsigned long long)total, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
+           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
+-      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+-          for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
++      if (((seq + 1) % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",seq + 1);
++          for (int i=0;i<64;i++) {
++              const uint32_t c = cnt_fd[i].load(std::memory_order_relaxed);
++              if (c) fprintf(stderr," fd%d=%ux/%lluB",i,c,(unsigned long long)per_fd[i].load(std::memory_order_relaxed));
++          }
+           fprintf(stderr,"\n"); } }
+     if (getenv("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
+         fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
+@@ -447,9 +544,10 @@ static void cellFsWrite(ppu_context* ctx)
+     uint32_t buf    = (uint32_t)ctx->gpr[4];
+     uint64_t nbytes = ctx->gpr[5];
+     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
+-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    FsFileRef file(fd);
++    if (!file) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+-    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
++    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, file.get());
+     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
+      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
+     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
+@@ -507,7 +605,8 @@ static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t bl
+ static void cellFsFGetBlockSize(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
++    FsFileRef file(fd);
++    if (!file) {
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+         return;
+     }
+@@ -527,12 +626,13 @@ static void cellFsLseek(ppu_context* ctx)
+     int64_t off   = (int64_t)ctx->gpr[4];
+     uint32_t wh   = (uint32_t)ctx->gpr[5];
+     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
+-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    FsFileRef file(fd);
++    if (!file) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
+     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
+-    fseek(g_files[fd], (long)off, worigin);
+-    long p = ftell(g_files[fd]);
++    fseek(file.get(), (long)off, worigin);
++    long p = ftell(file.get());
+     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
+     ctx->gpr[3] = CELL_OK;
+ }
+@@ -580,13 +680,14 @@ static void cellFsFstat(ppu_context* ctx)
+ {
+     int fd      = (int)(uint32_t)ctx->gpr[3];
+     uint32_t sb = (uint32_t)ctx->gpr[4];
+-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    FsFileRef file(fd);
++    if (!file) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
+-    long cur = ftell(g_files[fd]);
+-    fseek(g_files[fd], 0, SEEK_END);
+-    long sz = ftell(g_files[fd]);
+-    fseek(g_files[fd], cur, SEEK_SET);
++    long cur = ftell(file.get());
++    fseek(file.get(), 0, SEEK_END);
++    long sz = ftell(file.get());
++    fseek(file.get(), cur, SEEK_SET);
+     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
+      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
+      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
+@@ -600,7 +701,7 @@ static void cellFsFstat(ppu_context* ctx)
+               fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+               sz = c; } } }
+     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
+-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
++    if (getenv("PS3_FSLOG")) { static std::atomic<int> _n{0}; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+@@ -613,9 +714,8 @@ static void cellFsOpendir(ppu_context* ctx)
+     DIR* d = opendir(hpath);
+     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
+     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+-    int fd = fd_alloc_dir(d);
++    int fd = fd_alloc_dir(d, hpath);
+     if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+-    strncpy(g_dir_path[fd], hpath, sizeof g_dir_path[fd] - 1);
+     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+     ctx->gpr[3] = CELL_OK;
+ }
+@@ -626,6 +726,7 @@ static void cellFsReaddir(ppu_context* ctx)
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+     uint32_t dirent = (uint32_t)ctx->gpr[4];
+     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
++    std::lock_guard<std::mutex> lock(g_fd_lock);
+     if (fd < 0 || fd >= FS_MAX || !g_dirs[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     struct dirent* e = readdir(g_dirs[fd]);
+     if (!e) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
+@@ -645,7 +746,12 @@ static void cellFsReaddir(ppu_context* ctx)
+ static void cellFsClosedir(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+-    if (fd >= 0 && fd < FS_MAX && g_dirs[fd]) { closedir(g_dirs[fd]); g_dirs[fd] = nullptr; }
++    DIR* d = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(g_fd_lock);
++        if (fd >= 0 && fd < FS_MAX) { d = g_dirs[fd]; g_dirs[fd] = nullptr; }
++    }
++    if (d) closedir(d);
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+@@ -680,16 +786,39 @@ static void cellFsMkdir(ppu_context* ctx)
+     char gpath[1024], hpath[1100];
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     host_path(hpath, sizeof hpath, gpath);
++    if (ps3_vfs_write_denied(gpath, hpath, ppu_vfs_root)) { ctx->gpr[3] = FS_EROFS; return; }
+     int r = host_mkdir_p(hpath);
+     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
      ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
  }
- static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+-static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
 -static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++static void cellFsRmdir(ppu_context* ctx)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    host_path(hpath, sizeof hpath, gpath);
++    /* Still a no-op on writable mounts, but never reports success on the disc. */
++    ctx->gpr[3] = ps3_vfs_write_denied(gpath, hpath, ppu_vfs_root) ? FS_EROFS : CELL_OK;
++}
 +static void cellFsUnlink(ppu_context* ctx)
 +{
 +    char gpath[1024], hpath[1100];
 +    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
 +    host_path(hpath, sizeof hpath, gpath);
 +    /* The disc mount is read-only, even when its host directory is writable. */
-+    if (strncmp(gpath, "/dev_bdvd", 9) == 0) {
-+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010026u;
++    if (ps3_vfs_write_denied(gpath, hpath, ppu_vfs_root)) {
++        ctx->gpr[3] = FS_EROFS;
 +        return;
 +    }
 +    int r = unlink(hpath);
@@ -18755,7 +19489,13 @@ index e8f6c2b..6385820 100644
  static void cellFsFsync(ppu_context* ctx)
  {
      int fd = (int)(uint32_t)ctx->gpr[3];
-@@ -736,43 +776,217 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
++    FsFileRef file(fd);
++    if (file) fflush(file.get());
+     ctx->gpr[3] = CELL_OK;
+ }
+ /* File-area preallocation (LBP cache warm-up spams this): host filesystems
+@@ -736,43 +865,218 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
   * done", which is exactly true here. */
  static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
  
@@ -18839,8 +19579,8 @@ index e8f6c2b..6385820 100644
 -        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
 +    int32_t err = (int32_t)0x8001002a; /* EBADF */
 +    if (size && !fs_guest_range(buf, size)) err = (int32_t)0x8001000d;
-+    else if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
-+        FILE* f = g_files[fd];
++    else if (FsFileRef file{fd}) {
++        FILE* f = file.get();
          fs_prefault(buf, size);
 -        /* AIO reads are absolute -- they do not disturb the fd's own file
 -         * position, and the guest interleaves them freely across threads. */
@@ -18892,10 +19632,11 @@ index e8f6c2b..6385820 100644
 +    if (!fs_guest_range(out, 4)) { ctx->gpr[3] = (uint64_t)(int64_t)err; return; }
 +    vm_write32(out, UINT32_MAX);
 +    err = (int32_t)0x8001002a; /* EBADF */
-+    if (fd >= 3 && fd < FS_MAX && g_files[fd]) {
++    FsFileRef file(fd >= 3 ? fd : -1);
++    if (file) {
 +        err = flags ? (int32_t)0x80010002 : (int32_t)0x80010038; /* EINVAL / EFSSPECIFIC */
 +        if (!flags) {
-+            FILE* f = g_files[fd];
++            FILE* f = file.get();
 +            HOST_FILE_LOCK(f);
 +            auto old = HOST_FTELL64(f);
 +#ifdef _WIN32
@@ -18918,10 +19659,9 @@ index e8f6c2b..6385820 100644
 +                err = CELL_FS_EIO;
 +                if (view && fwrite(plain, 1, plain_len, view) == plain_len) {
 +                    rewind(view);
-+                    int result = fd_alloc_file(view);
++                    int result = fd_alloc_file(view, g_fd_path[fd]);
 +                    if (result >= 0) {
 +                        vm_write32(out, (uint32_t)result);
-+                        snprintf(g_fd_path[result], sizeof g_fd_path[result], "%s", g_fd_path[fd]);
 +                        err = CELL_OK; view = nullptr;
 +                    } else err = (int32_t)0x8001002c; /* EMFILE */
 +                }
@@ -18950,7 +19690,8 @@ index e8f6c2b..6385820 100644
 +static void hle_prx_load_fd(ppu_context* ctx)
 +{
 +    int fd = (int)(uint32_t)ctx->gpr[3];
-+    if (fd < 3 || fd >= FS_MAX || !g_files[fd]) {
++    FsFileRef file(fd >= 3 ? fd : -1);
++    if (!file) {
 +        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001002a; return;
 +    }
 +    uint32_t id = ctx->gpr[4] ? 0 : prx_loaded_module_id(g_fd_path[fd]);
@@ -22844,7 +23585,7 @@ index 14c6425..fb79d59 100644
  uint32_t sys_event_find_queue_by_key(uint64_t key);
  
 diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
-index 489f8a5..a3bf157 100644
+index 489f8a5..b93f15f 100644
 --- a/runtime/syscalls/sys_fs.c
 +++ b/runtime/syscalls/sys_fs.c
 @@ -89,8 +89,33 @@ static void fs_normalize_sep(char* p) {
@@ -22881,7 +23622,7 @@ index 489f8a5..a3bf157 100644
      struct stat st;
      if (!path || !*path || stat(path, &st) == 0)
          return;
-@@ -122,8 +147,61 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+@@ -122,8 +147,123 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
      snprintf(path, cap, "%s", alt);
  }
  
@@ -22937,22 +23678,123 @@ index 489f8a5..a3bf157 100644
 +    return 1;
 +}
 +
++int ps3_vfs_guest_path_safe(const char* ps3_path)
++{
++    if (!ps3_path) return 0;
++    for (const char* p = ps3_path; *p;) {
++        while (*p == '/' || *p == '\\') p++;
++        const char* e = p;
++        while (*e && *e != '/' && *e != '\\') e++;
++        if (e - p == 2 && p[0] == '.' && p[1] == '.') return 0;
++        p = e;
++    }
++    return 1;
++}
++
++int ps3_vfs_resolve_device(const char* ps3_path, char* host_path, size_t cap,
++                           const char* flash_default)
++{
++    if (ps3_vfs_hdd1_path(ps3_path, host_path, cap)) return 1;
++    const char* root = NULL;
++    size_t skip = 0;
++    if (!strncmp(ps3_path, "/dev_hdd0", 9) && (ps3_path[9] == '/' || !ps3_path[9])) {
++        root = getenv("PS3_HDD0_ROOT");
++        skip = ps3_path[9] ? 10 : 9;
++    } else if (!strncmp(ps3_path, "/dev_flash/", 11)) {
++        root = getenv("PS3_DEV_FLASH");
++        if (!root || !*root) root = flash_default;
++        skip = 11;
++    }
++    if (!root || !*root) return 0;
++    snprintf(host_path, cap, "%s/%s", root, ps3_path + skip);
++    for (char* p = host_path; *p; p++) if (*p == '\\') *p = '/';
++    fs_normalize_sep(host_path);
++    return 1;
++}
++
++static int vfs_host_under(const char* host, const char* root)
++{
++    if (!root || !*root || !strcmp(root, ".")) return 0;
++    size_t n = strlen(root);
++    while (n > 1 && (root[n - 1] == '/' || root[n - 1] == '\\')) n--;
++    return !strncmp(host, root, n) &&
++           (host[n] == '/' || host[n] == '\\' || host[n] == '\0');
++}
++
++int ps3_vfs_write_denied(const char* ps3_path, const char* host_path,
++                         const char* disc_root)
++{
++    if (ps3_path && !strncmp(ps3_path, "/dev_bdvd", 9) &&
++        (ps3_path[9] == '/' || ps3_path[9] == '\0'))
++        return 1;
++    if (!host_path || !*host_path) return 0;
++    if (!vfs_host_under(host_path, disc_root) &&
++        !vfs_host_under(host_path, getenv("PS3_VFS_ROOT")))
++        return 0;
++    return !vfs_host_under(host_path, getenv("PS3_HDD0_ROOT")) &&
++           !vfs_host_under(host_path, getenv("PS3_HDD1_ROOT"));
++}
++
  void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
  {
-+    if (ps3_vfs_hdd1_path(ps3_path, host_path, (size_t)host_path_size)) return;
++    if (!ps3_vfs_guest_path_safe(ps3_path)) {
++        fprintf(stderr, "[sys_fs] rejected parent traversal: %s\n", ps3_path);
++        host_path[0] = '\0';
++        return;
++    }
++    if (ps3_vfs_resolve_device(ps3_path, host_path, (size_t)host_path_size, NULL)) return;
      /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
       * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
      if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
-@@ -284,6 +362,8 @@ int64_t sys_fs_open(ppu_context* ctx)
+@@ -131,34 +271,6 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
+         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+     }
+ 
+-    /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
+-     * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
+-     * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
+-    {
+-        static const char* hdd0_root = NULL; static int hdd0_init = 0;
+-        if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+-        if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
+-            fs_normalize_sep(host_path);
+-            return;
+-        }
+-    }
+-
+-    /* /dev_flash is FIRMWARE, not game data. ppu_fs.cpp serves it from a real
+-     * dev_flash tree ($PS3_DEV_FLASH); this layer was missing the same branch, so
+-     * a firmware path opened through the raw syscall resolved to <root>/... and
+-     * missed. ps1_netemu loads its PS1 BIOS as /dev_flash/ps1emu/ps1_rom.bin and
+-     * refuses to boot without it. Keep both halves of the split filesystem agreed. */
+-    {
+-        static const char* fw = NULL; static int fw_init = 0;
+-        if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
+-        if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
+-            snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
+-            fs_normalize_sep(host_path);
+-            return;
+-        }
+-    }
+-
+     /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
+      * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
+      * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
+@@ -284,6 +396,12 @@ int64_t sys_fs_open(ppu_context* ctx)
      const char* ps3_path = (const char*)vm_to_host(path_addr);
      char host_path[1024];
      sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
++    if ((flags & (CELL_FS_O_WRONLY | CELL_FS_O_RDWR | CELL_FS_O_CREAT |
++                  CELL_FS_O_TRUNC | CELL_FS_O_APPEND)) &&
++        ps3_vfs_write_denied(ps3_path, host_path, g_sys_fs_root))
++        return (int64_t)PS3_VFS_EROFS;
 +    if ((flags & CELL_FS_O_CREAT) && strncmp(ps3_path, "/dev_hdd1/", 10) == 0)
 +        ps3_vfs_ensure_parent_dirs(host_path);
  
      { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
          size_t _l = strlen(ps3_path);
-@@ -314,6 +394,7 @@ int64_t sys_fs_open(ppu_context* ctx)
+@@ -314,6 +432,7 @@ int64_t sys_fs_open(ppu_context* ctx)
       * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
      { char dec_path[1200];
        const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
@@ -22960,8 +23802,45 @@ index 489f8a5..a3bf157 100644
        if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
  
      /* Find free fd slot */
+@@ -893,6 +1012,8 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
+     const char* ps3_path = (const char*)vm_to_host(path_addr);
+     char host_path[1024];
+     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
++    if (ps3_vfs_write_denied(ps3_path, host_path, g_sys_fs_root))
++        return (int64_t)PS3_VFS_EROFS;
+ 
+ #ifdef _WIN32
+     int rc = _mkdir(host_path);
+@@ -935,6 +1056,9 @@ int64_t sys_fs_rename(ppu_context* ctx)
+     char old_host[1024], new_host[1024];
+     sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
+     sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
++    if (ps3_vfs_write_denied(old_ps3, old_host, g_sys_fs_root) ||
++        ps3_vfs_write_denied(new_ps3, new_host, g_sys_fs_root))
++        return (int64_t)PS3_VFS_EROFS;
+ 
+     if (rename(old_host, new_host) != 0)
+         return (int64_t)(int32_t)CELL_ENOENT;
+@@ -957,6 +1081,8 @@ int64_t sys_fs_unlink(ppu_context* ctx)
+     const char* ps3_path = (const char*)vm_to_host(path_addr);
+     char host_path[1024];
+     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
++    if (ps3_vfs_write_denied(ps3_path, host_path, g_sys_fs_root))
++        return (int64_t)PS3_VFS_EROFS;
+ 
+ #ifdef _WIN32
+     if (_unlink(host_path) != 0)
+@@ -983,6 +1109,8 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
+     const char* ps3_path = (const char*)vm_to_host(path_addr);
+     char host_path[1024];
+     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
++    if (ps3_vfs_write_denied(ps3_path, host_path, g_sys_fs_root))
++        return (int64_t)PS3_VFS_EROFS;
+ 
+ #ifdef _WIN32
+     if (_rmdir(host_path) != 0)
 diff --git a/runtime/syscalls/sys_fs.h b/runtime/syscalls/sys_fs.h
-index dbe84c4..d21a821 100644
+index dbe84c4..fa2b082 100644
 --- a/runtime/syscalls/sys_fs.h
 +++ b/runtime/syscalls/sys_fs.h
 @@ -70,10 +70,10 @@ extern "C" {
@@ -22979,13 +23858,25 @@ index dbe84c4..d21a821 100644
  
  /* Seek modes */
  #define CELL_FS_SEEK_SET   0
-@@ -111,6 +111,9 @@ extern char g_sys_fs_root[512];
+@@ -111,6 +111,21 @@ extern char g_sys_fs_root[512];
  
  /* Path translation: convert PS3 path to host path */
  void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 +/* Shared writable cache mount; returns 1 when ps3_path belongs to /dev_hdd1. */
 +int ps3_vfs_hdd1_path(const char* ps3_path, char* host_path, size_t cap);
 +void ps3_vfs_ensure_parent_dirs(const char* host_path);
++/* Shared mount policy for the sys_fs, cellFs and ppu_fs translators.
++ * guest_path_safe: 0 when any component is "..", which must not resolve.
++ * resolve_device: /dev_hdd1, /dev_hdd0 (with PS3_HDD0_ROOT) and /dev_flash
++ *   (PS3_DEV_FLASH, else flash_default); returns 1 when it wrote host_path.
++ * write_denied: 1 for the read-only disc mount, by guest prefix or by a host
++ *   path inside the dump root (disc_root or PS3_VFS_ROOT) outside hdd0/hdd1. */
++#define PS3_VFS_EROFS ((int32_t)0x80010026u)
++int ps3_vfs_guest_path_safe(const char* ps3_path);
++int ps3_vfs_resolve_device(const char* ps3_path, char* host_path, size_t cap,
++                           const char* flash_default);
++int ps3_vfs_write_denied(const char* ps3_path, const char* host_path,
++                         const char* disc_root);
  
  /* Syscall handlers */
  int64_t sys_fs_open(ppu_context* ctx);

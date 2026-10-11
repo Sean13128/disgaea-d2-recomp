@@ -92,7 +92,8 @@ endif()
 set(D2_CPU_TESTS Q-sync T-sync Y-sync AA-sync AB-sync AG2-fifo
     draw AG2-engine hash vertex cache audio-clock AP-atrac-stream AP-audio-gain AP-audio-init filesystem edat save-import
     savedata-io savedata-fixed overlay system-overlay editor-100 editor-140
-    guest-poll spu-vectors spu-shuffle spu-cache spu-lanes repro-guards)
+    guest-poll spu-vectors spu-shuffle spu-cache spu-lanes repro-guards
+    tsan-ppu-fs tsan-audio-lifecycle)
 foreach(test IN LISTS D2_CPU_TESTS)
     add_test(NAME d2.${test}
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run.py"

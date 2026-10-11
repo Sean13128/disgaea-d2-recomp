@@ -200,7 +200,7 @@ extern "C" void rsx_metal_backend_shutdown(void);
 extern "C" void rsx_null_backend_shutdown(void);
 #endif
 
-static volatile LONG g_frames_presented = 0;
+static std::atomic<unsigned> g_frames_presented{0};
 
 /* Frames handed to the backend at a guest FLIP boundary -- one per frame the
  * guest actually finished. The presents made before the guest's first flip, so
@@ -208,7 +208,7 @@ static volatile LONG g_frames_presented = 0;
  * and are deliberately not counted. */
 extern "C" unsigned ppu_boot_frames_presented(void)
 {
-    return (unsigned)g_frames_presented;
+    return g_frames_presented.load(std::memory_order_acquire);
 }
 
 static int present_guest_frame(void)
@@ -221,11 +221,11 @@ static int present_guest_frame(void)
 #ifdef __APPLE__
     if (!rsx_metal_backend_submission_ok()) return 0;
 #endif
-    /* This thread increments and guest threads read, so interlocked rather
-     * than a volatile ++, which on arm64 is neither atomic nor a fence. */
-    LONG frame = InterlockedIncrement(&g_frames_presented);
+    /* This thread increments and guest threads read: a release increment
+     * paired with the acquire load in ppu_boot_frames_presented. */
+    const unsigned frame = g_frames_presented.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (frame <= 3 || frame % 60 == 0)
-        fprintf(stderr, "[rsx] presented guest frame %ld\n", (long)frame);
+        fprintf(stderr, "[rsx] presented guest frame %u\n", frame);
     return 1;
 }
 

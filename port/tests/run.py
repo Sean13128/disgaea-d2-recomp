@@ -5,6 +5,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -36,9 +37,11 @@ if brew.exists():
     inc.append(brew/'include')
 flags = ['-O1', '-g', '-ffunction-sections', '-fdata-sections', '-pthread']
 flags += [f'-I{p}' for p in inc]
-flags += ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-lm']
+flags += ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-D_GNU_SOURCE', '-Wl,--gc-sections', '-lm']
 gpu = name in ('metal', 'metal-overlay', 'hotkey', 'AL-metal', 'AN-metal')
-if not gpu:
+if name.startswith('tsan-'):
+    flags += ['-fsanitize=thread', '-fno-omit-frame-pointer']
+elif not gpu:
     flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 video = [sdk/'libs/video'/f'{n}.c' for n in ('rsx_dispatch', 'rsx_vertex_compact', 'rsx_texture_layout', 'rsx_vp_decompiler', 'rsx_fp_decompiler')]
 platform = [sdk/'runtime/platform'/f'{n}.c' for n in ('win32_compat', 'guest_poll')]
@@ -103,6 +106,13 @@ elif name == 'AZ-audio-wait':
     cmd += [sdk/'libs/audio/tests/test_audio_wait.c', f'-L{brew}/lib', '-lSDL2']
 elif name == 'audio-clock':
     cmd += [source('Z.audio-clock.c'), f'-L{brew}/lib', '-lSDL2']
+elif name == 'tsan-ppu-fs':
+    emit_ppu_header()
+    run([cc, '-std=gnu17', *flags, '-c', sdk/'runtime/syscalls/sys_fs.c', '-o', work/'sys_fs.o'])
+    cmd = [cxx, '-std=c++20', *flags, source('AU.tsan-fs-test.cpp'), work/'sys_fs.o']
+    run_args = [work]
+elif name == 'tsan-audio-lifecycle':
+    cmd += [source('AU.tsan-audio-lifecycle.c'), f'-L{brew}/lib', '-lSDL2']
 elif name == 'filesystem':
     cmd += [source('AD.fs-test.c')]
     run_args = [work]
@@ -168,7 +178,9 @@ elif name == 'AR-shader':
 elif name == 'guest-poll':
     cmd += [sdk/'runtime/platform/tests/test_guest_poll.c', sdk/'runtime/platform/guest_poll.c']
 elif name == 'spu-cache':
-    sys.exit(subprocess.run([sys.executable, sdk/'runtime/spu/tests/test_spu_register_cache.py', '--work', work], env=env).returncode)
+    # The script launches its sanitized fixture; setarch's personality is inherited.
+    wrap = ['setarch', os.uname().machine, '-R'] if sys.platform.startswith('linux') and shutil.which('setarch') else []
+    sys.exit(subprocess.run([*wrap, sys.executable, sdk/'runtime/spu/tests/test_spu_register_cache.py', '--work', work], env=env).returncode)
 elif name == 'spu-lanes':
     cmd += [sdk/'runtime/spu/tests/test_spu_vector_lanes.c']
 elif name in ('spu-vectors', 'spu-shuffle'):
@@ -195,7 +207,13 @@ elif name == 'hotkey':
 else:
     parser.error(f'Unknown test: {name}')
 run([*cmd, '-o', exe])
-result = subprocess.run([str(exe), *map(str, run_args)], env=env, cwd=work)
+launch = [str(exe)]
+if sys.platform.startswith('linux') and not gpu and shutil.which('setarch'):
+    # Sanitizer runtimes (clang <= 15) cannot map their shadow under the high
+    # mmap ASLR entropy of current kernels and segfault at random.
+    launch = ['setarch', os.uname().machine, '-R', *launch]
+env.setdefault('TSAN_OPTIONS', 'halt_on_error=1')
+result = subprocess.run([*launch, *map(str, run_args)], env=env, cwd=work)
 if result.returncode == 77:
     print(f'SKIP: {name} requires an available Metal device')
 elif result.returncode == 0:
