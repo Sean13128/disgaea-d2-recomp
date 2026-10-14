@@ -6,6 +6,14 @@ This project was built almost entirely by AI coding agents (Anthropic's Claude a
 Performance: on an M4 Mac it holds about 60 fps in battles and while exploring. It's been through a few optimization passes, and more are planned, focused on lowering CPU use and heat rather than raising the frame rate.
 Do what you want with this, it's just for fun since everyone else is doing this stuff. Might try to get it on android. 
 
+**Status (October 2026): unmaintained.** I'm stepping back. I'm happy with the copy I have installed, and I'm no maintainer — I'm just a dude using AI. I might still push a fix if I hit something, but don't expect support.
+
+The **Windows port** of this project is under active development by
+[LUUKASR1](https://github.com/LUUKASR1/disgaea-d2-recomp-windows) — that's where
+the Windows launcher, Direct3D 12 renderer and direct-ISO work live. Issues and
+PRs about the Windows side belong there, not here. This repo stays the macOS
+port, MIT-licensed, as-is.
+
 An unofficial, fan-made **static recompilation** of *Disgaea D2: A Brighter
 Darkness* (PS3, North America, **BLUS31313**) into a native Apple Silicon macOS
 app, built on [ps3recomp](https://github.com/sp00nznet/ps3recomp) with a Metal
